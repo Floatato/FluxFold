@@ -82,6 +82,7 @@ dataset session
 → batch Subject linking             (one LLM output covering the whole episode batch)
 → atomic commit                     (memories, versions, provenance, embeddings, subjects, links, completion)
 → Subject split / Subject review    (split first when both are due)
+→ linked-existing Subject summary refresh (one full rewrite per local target not rewritten above)
 ```
 
 
@@ -109,4 +110,3 @@ in the same change. A code change without the matching doc update is incomplete.
 - Describe only the resulting current design. Delete superseded descriptions instead of
 recording that something is no longer used; git holds the history.
 - `AGENTS.md` and `AGENTS_CH.md` must always be updated together and stay equivalent.
-

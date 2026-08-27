@@ -22,6 +22,11 @@
 embedding、处理状态和 domain operation。
 - memory、subject 和 provenance 是正式数据；embedding 是可从对应文本重新生成的
 检索数据。
+- memory latest version、active subject–memory link 和 provenance 是事务性事实；subject
+summary 是由这些事实派生的**弱一致性**检索摘要。系统允许 summary 在相关事实变化后暂时
+过期，不维护持久化 dirty 标记，不做全空间扫描，也不承诺在固定时间内收敛。summary 只在
+当前写入直接链接已有 subject、该 subject 自身 review 或 split 时获得更新机会；共享 memory
+被其他 subject 的 review 修改或退役后，相关 summary 可以保持旧值，直到未来一次相关维护。
 - 实验版使用 SQLite 加 NumPy 完成精确向量扫描，不使用图数据库、向量数据库或 ANN
 索引。
 - Markdown 和 benchmark 输出是数据库状态的导出结果，不是可写事实源。
@@ -240,7 +245,7 @@ episode；prompt 与结构化校验使用相同上限，超过时不得截断。
 | `summary`                   | 当前 summary                            |
 | `lifecycle_status`          | `active` 或 `retired`                  |
 | `new_memory_count`          | 上次成功审核或分裂后新增的 memory 数量               |
-| `summary_revision`          | summary 每次 append 或重写时递增的 CAS version |
+| `summary_revision`          | summary 每次整体重写时递增的 CAS version          |
 | `created_at` / `updated_at` | 系统时间                                  |
 | `retired_at`                | subject 被替换的时间，可为空                    |
 | `retired_by_operation_id`   | 产生替换的 subject split operation，可为空     |
@@ -250,12 +255,12 @@ subject name 在一次 subject 生命周期内保持不变。Subject 关联记�
 Subject split 可以完整替换原 subject、从中拆出若干更具体的 subjects 并保留原 subject，
 或者明确推迟本次分裂。只有完整替换才退役原 subject；partial split 保留其 ID 和 name。
 
-每当新 memory 建立指向已有 subject 的 link，系统立即把 memory content append 到 summary，
-递增 `new_memory_count` 和 `summary_revision`。本批新建 subject 使用 Subject linking 给出的
-完整初始 summary，初始 `new_memory_count` 为零，不再重复 append 同批 memory。审核成功后，
-系统整体替换 summary，并把 `new_memory_count` 置零。共享 memory 被其他 subject 的 review
-修改或退役后，本 subject 的 summary 可以暂时包含旧信息；直到本 subject 以后因新增 link
-正常触发 review 时，才按届时的全部 active memories 重写。
+每当新 memory 建立指向已有 subject 的 link，原子 add 只递增 `new_memory_count`，不修改
+summary 或 `summary_revision`。完成本 episode 的 split/review 后，当前 linking 命中的已有
+subjects 才按 1.2.4 的规则获得一次局部 summary refresh 机会。本批 linking 新建的 subject
+直接使用其完整初始 summary，初始 `new_memory_count` 为零；full/partial split 产生或保留的
+active subjects 也使用 split 基于最终成员集合给出的 summary。review 修改或退役共享 memory
+时，不同步刷新链接这些 memories 的其他 subjects。
 
 Subject 审计的容量使用当前 active links 关联的 active memory 数量和 latest version
 `char_count` 之和计算，不额外保存容易失去一致性的累计容量字段。
@@ -368,7 +373,7 @@ byte_length(vector) = dimension * 4
 
 `terminal_failure` 不产生 memory、subject、link 或 domain operation。相同来源的安全重放
 返回已经记录的失败，不重复调用模型；benchmark 按来源顺序继续处理后续 session。临时传输、
-限流或服务不可用在 item retry 耗尽后不写入该状态，而是保留未完成 episode 供显式恢复。
+限流或服务不可用在所属操作内重试耗尽后不写入该状态，而是保留未完成 episode 供显式恢复。
 
 ##### `domain_operations`
 
@@ -378,6 +383,7 @@ byte_length(vector) = dimension * 4
 - `add_episode_memories`
 - `review_subject`
 - `split_subject`
+- `refresh_subject_summary`
 - `retire_memory`
 
 operation 保存 memory space、actor、规则或模型配置、简短 reason 和提交时间。
@@ -400,7 +406,11 @@ effect type。link row 同时通过 open/close operation ID 保留关系变化�
    summaries 和 embeddings，只关闭移出 memories 指向原 subject 的 links，建立新 links，
    更新原 subject summary 并保持其 active。两种成功结果都将涉及的 active subjects 的新增
    计数置零并记录 operation effects。
-4. **Switch embedding model**：新 signature 的全部必要 embeddings 准备完成后，切换对应
+4. **Refresh subject summary**：对本次 linking 命中且未由本轮 review/split 重写的已有
+   subject，以其全部当前 active memories 生成完整 summary；在成员集合、内容、link basis
+   和 revision 未变化时整体替换 summary 并更新 `name_summary` embedding，不重置
+   `new_memory_count`。
+5. **Switch embedding model**：新 signature 的全部必要 embeddings 准备完成后，切换对应
   用途的 active signature。
 
 LLM 运行期间不持有数据库事务。提交前必须重新验证 memory/subject IDs、memory space、
@@ -448,7 +458,6 @@ generation provider 的 context window 和 API 参数是外部约束，不转换
 | subject name 字符硬上限            | 120 字符                                 |
 | subject summary prompt 指导     | 建议不超过 200 words                        |
 | LLM 新生成 subject summary 字符硬上限 | 2,000 字符                               |
-| append 后存储的 subject summary   | 不校验总长度                                 |
 | memory content prompt 指导      | 建议不超过 50 words                         |
 | memory content 字符硬上限          | 1,000 字符                               |
 | search query                  | 不设应用层长度上限                              |
@@ -473,6 +482,7 @@ LLM 阶段参数如下：
 | subject linking   | 0.0         | 不传    |
 | Subject review    | 0.1         | 不传    |
 | Subject split     | 0.1         | 不传    |
+| Subject summary refresh | 0.1   | 不传    |
 
 
 所有阶段均不设置 `max_output_tokens`。普通运行不设置 seed；generation provider 支持 seed
@@ -484,8 +494,8 @@ requests-per-minute 或 tokens-per-minute；即默认不设置 `requests_per_min
 generation provider 的 transport 负责；timeout 归一化后在 provider 内执行下述 transport
 retry，耗尽后才把错误返回 Memory Engine。
 
-本文用 model provider 统称外部模型服务；调用 extraction、linking、review 和 split 的服务
-称为 generation provider，生成 retrieval 或 boundary vector 的服务称为 embedding provider。
+本文用 model provider 统称外部模型服务；调用 extraction、linking、review、split 和
+summary refresh 的服务称为 generation provider，生成 retrieval 或 boundary vector 的服务称为 embedding provider。
 SQLite 等数据库基础设施不属于 model provider。具体 provider adapter 必须先依据结构化错误
 码、finish reason、响应头和 HTTP status 将厂商错误归一化，再由 FluxFold 执行统一策略；
 不得只凭 HTTP status 决定错误类别。
@@ -550,7 +560,7 @@ Subject split 无法形成合法语义分组时使用明确的
 | `sqlite_transaction_retry_multiplier`       | 2           | SQLite transaction retry 每次增长的倍数                |
 | `sqlite_wal_autocheckpoint_pages`           | 1,000 pages | SQLite WAL 自动 checkpoint 的 page 阈值              |
 | `memory_space_write_concurrency`            | 1           | 同一 memory space 同时提交正式状态写入的数量上限                 |
-| `subject_maintenance_concurrency_per_space` | 1           | 同一 memory space 同时执行 Subject review/split 的数量上限 |
+| `subject_maintenance_concurrency_per_space` | 1           | 同一 memory space 同时执行 review/split/summary refresh 的数量上限 |
 
 
 memory 或 subject 创建、相关文本更新时立即计算对应 embedding。一个逻辑操作同时产生多个
@@ -561,7 +571,7 @@ provider 只有归一化为 `transient_transport`、`rate_limited` 或 `service_
 非法请求错误遵守上表的阻塞规则。
 
 SQLite 固定使用 WAL、`synchronous=NORMAL`。事务冲突最多额外重试 5 次，使用 full
-jitter，不设置退避最大时间。同一 memory space 的正式写入并发为 1，review/split 维护
+jitter，不设置退避最大时间。同一 memory space 的正式写入并发为 1，review/split/summary refresh 维护
 并发也为 1；事务 retry 不设置退避最大时间。不设置跨 space 的全局维护并发或单次 add
 的维护操作数量上限。
 
@@ -664,7 +674,8 @@ episode
 → 对每条新 memory 召回 subject/memory 候选
 → 把本 episode 的全部新 memories 作为一个组织批次执行 Subject linking
 → 原子写入 memory、provenance、embedding、subject、links 和 operation
-→ 触发并完成已排定的 Subject review / Subject split
+→ 先执行已触发的 Subject split / Subject review
+→ 对本次 linking 命中且未由 review/split 重写的已有 subjects 局部重写 summary
 ```
 
 LLM 与 embedding 在事务外运行。`episode_extractions` 以 episode input hash 和 extractor
@@ -727,29 +738,33 @@ Extraction 不设置每 episode 的建议 memory 数、硬数量上限、总 mem
 
 | 配置项                                        | 值    | 含义                                             |
 | ------------------------------------------ | ---- | ---------------------------------------------- |
-| `subject_top_k`                            | 12   | Subject 通道最多保留的 subject 数                      |
-| `subject_min_cosine_similarity`            | 0.25 | Subject 通道允许候选进入结果的最低 query-subject name 余弦相似度 |
-| `subject_attached_memory_k`                | 1    | 每个 Subject 通道候选附带的关联 memory 数                  |
-| `memory_top_k`                             | 24   | Memory 通道最多保留的 memory 数                        |
-| `association_memory_min_cosine_similarity` | 0.35 | Memory 通道允许候选进入结果的最低 query-memory 余弦相似度        |
-| `memory_attached_subject_k`                | 1    | 每个 Memory 通道候选附带的关联 subject 数                  |
+| `subject_candidate_top_k`                  | 8    | Subject 通道最多保留的 subject 数                      |
+| `subject_candidate_min_similarity`         | 0.25 | Subject 通道允许候选进入结果的最低 query-subject name 余弦相似度 |
+| `subject_candidate_attached_memory_k`      | 1    | 每个 Subject 通道候选附带的关联 memory 数                  |
+| `memory_candidate_top_k`                   | 16   | Memory 通道最多保留的 memory 数                        |
+| `memory_candidate_min_similarity`          | 0.35 | Memory 通道允许候选进入结果的最低 query-memory 余弦相似度        |
+| `memory_candidate_attached_subject_k`      | 1    | 每个 Memory 通道候选附带的关联 subject 数                  |
 | `association_search_max_calls`             | 1    | 一次关联决策中最多执行的主动 association search 次数           |
 | `memory_link_preferred_min`                | 1    | Prompt 建议一条 memory 通常至少链接的 subject 数           |
 | `memory_link_preferred_max`                | 4    | Prompt 建议一条 memory 通常最多链接的 subject 数           |
 | `memory_active_subject_link_max`           | 5    | 一条 memory 可以同时拥有的 active subject link 硬上限      |
 
 
-Subject 通道按 query 与 active subject name embedding 取前 12 个，再删除相似度低于 0.25
+Subject 通道按 query 与 active subject name embedding 取前 8 个，再删除相似度低于 0.25
 的 subject。每个保留 subject 附带其 active memories 中与 query 最相似的 1 条；没有
 linked memory 时只提供 subject。
 
-Memory 通道按 query 与 active memory content embedding 取前 24 条，再删除相似度低于
+Memory 通道按 query 与 active memory content embedding 取前 16 条，再删除相似度低于
 0.35 的 memory。每条保留 memory 附带其 active subjects 中 name embedding 与 query 最
 相似的 1 个；没有 subject 时只提供 memory。
 
-两个通道完成后按真实 subject-memory 关系去重和整理，不计算融合分数、不建立更大的中间
-候选池、不重排或再次淘汰。所有检索只使用向量相似度；第一版不使用 BM25、全文或关键词
-匹配。
+两个通道完成后按真实 subject-memory 关系组织成去重的 subject groups；先列 Subject 通道
+subjects，再列仅由 Memory 通道引入的 subjects，同一 subject 和同一组内的 memory 只展示
+一次。一个 linking 请求在本 episode 的全部 memory 候选间全局只展示相似度最高的 5 个
+不同 subjects 的 summary，其余只展示 name、命中 memory 和相似度；同一 summary 只出现
+一次。若发生主动 association search，最终请求在被动与主动结果之间共同执行该 5 个 summary
+上限。不计算融合分数、不建立更大的中间候选池、不重排或再次淘汰。所有检索只使用向量
+相似度；第一版不使用 BM25、全文或关键词匹配。
 
 程序在 extraction 后为本 episode 的全部新 memories 分配仅用于本次组织批次的临时
 `memory_ref`。各 memory 的候选可以分别召回，但 LLM 必须在一个最终输出中给出整个批次的
@@ -765,10 +780,11 @@ memory 会实质损害未来回答时才建立 `contextual`。宽泛常识联系
 全部 active links 不超过 5。已有 subject 与其语义具体化 subject 同时成为候选时，LLM 只
 选择语义正确且更具体的一个；程序不校验或持久化这种包含关系。
 
-每当新 memory 建立指向已有 subject 的新 active link，立即把 memory content append 到该
-subject summary，递增 `new_memory_count` 和 `summary_revision`，不调用 LLM 重写。本批新建
-subject 的初始 summary 由 Subject linking 输出，只能总结本批实际链接到它的 memories，
-其 `new_memory_count` 从零开始。已有 subject append 后的当前 summary 不执行长度校验。
+每当新 memory 建立指向已有 subject 的新 active link，原子 add 只递增
+`new_memory_count`，不 append memory content，也不立即更新 summary embedding；该 subject
+进入仅存在于本次 add 调用内的 refresh 目标集合。本批新建 subject 不进入该集合，其初始
+summary 由 Subject linking 输出，只能总结本批实际链接到它的 memories，且
+`new_memory_count` 从零开始。
 
 #### 1.2.4 Subject review
 
@@ -784,8 +800,8 @@ subject 的初始 summary 由 Subject linking 输出，只能总结本批实际�
 
 
 direct/contextual 使用同一计数；同一 memory-subject 对只计一次。review 读取该 subject
-当前全部 active memories，而非仅新增的 8 条。成功后计数清零，失败不清零。没有独立的
-summary review，也不按 summary 长度触发 review。
+当前全部 active memories，而非仅新增的 8 条。成功后计数清零，失败不清零。不按 summary
+长度触发 review；当前 linking 命中的已有 subject 的局部 summary refresh 见本节末尾。
 
 审核输入包含 subject name，以及每条 active memory 的 ID、content、相对当前 subject 的
 link basis 和时间等必要元数据。审核允许保留、修改和全局退役 memory，不允许新建、拆分
@@ -811,7 +827,20 @@ provenance 时，它表示包含 1--6 个不同有效 episode IDs 的完整替�
 LLM 先在逻辑上应用 updates 与 retirements，再根据最终 active memories 生成不超过 200
 words、字符硬上限 2,000 的 subject summary。系统整体替换当前 subject summary，不修改
 subject name。共享 memory 的内容或生命周期修改立即全局生效；其他 subjects 的 summary
-允许暂时陈旧，直到它们以后因新增 link 正常 review。
+不随之同步更新，符合 1.1.1 的弱一致性原则。
+
+完成本 episode 触发的 split 与 review 后，系统只处理本次 linking 新增 memory link 所指向
+的已有 subjects，不查询其他 subjects。每个目标 subject 单独调用一次 LLM，输入只包含
+subject name 和全部当前 active memories 的 ID、content、时间与 link basis，明确不提供旧
+summary；输出是基于这些 memories 的完整新 summary。提交时重新校验成员集合、memory
+content、link basis 和 `summary_revision`，随后整体替换 summary 并更新 `name_summary`
+embedding。refresh 不清零 `new_memory_count`，因此不会延后后续 review。
+
+本批 linking 新建的 subject，以及本轮已成功 review、full split 或 partial split 的原
+subject 不重复 refresh；split 新建的 subjects 也不属于 linking 的已有 subject 目标集合。
+`defer_split` 没有重写 summary，因此原 subject 若在目标集合中仍会 refresh。refresh 失败只
+记录当前局部维护失败并结束该次机会，不回滚已经提交的 add、不暂停 build，也不创建持久化
+待办；未来新 memory 再次链接该 subject 时会按当时全部 active memories 重新生成 summary。
 
 #### 1.2.5 Subject split
 
@@ -821,8 +850,8 @@ review 而更新或退役、或没有新增 link 的其他容量变化，不触�
 
 | 配置项                                          | 值         | 含义                                                                  |
 | -------------------------------------------- | --------- | ------------------------------------------------------------------- |
-| `subject_split_memory_count_threshold`       | 32        | subject 的 active memory 数量触发 split 的阈值                              |
-| `subject_split_total_memory_chars_threshold` | 20,000 字符 | subject 下 active memory latest content 总字符数触发 split 的阈值             |
+| `subject_split_memory_count_threshold`       | 24       | subject 的 active memory 数量触发 split 的阈值                              |
+| `subject_split_total_memory_chars_threshold` | 8,000 字符 | subject 下 active memory latest content 总字符数触发 split 的阈值             |
 | `subject_split_result_subject_min`           | 2         | full split 的新 subjects 数或 partial split 的原 subject 加新 subjects 总数下限 |
 | `subject_split_result_subject_max`           | 5         | full split 的新 subjects 数或 partial split 的原 subject 加新 subjects 总数上限 |
 | `subject_split_result_min_memories`          | 2         | 每个新建结果 subject 至少必须包含的 memory 数                                     |
@@ -830,7 +859,7 @@ review 而更新或退役、或没有新增 link 的其他容量变化，不触�
 | `subject_split_memory_membership_max`        | 2         | 一条输入 memory 最多可以归属的本次新建 subject 数                                   |
 
 
-active memory 数达到 32，或 latest contents 总字符数达到 20,000，即满足触发条件；字符
+active memory 数达到 24，或 latest contents 总字符数达到 8,000，即满足触发条件；字符
 条件不要求另一个最小 memory 数。两个数值都是触发整理的软阈值；实验版不限制单个 subject
 最终关联的 memory 数量或总字符数，不设置硬容量、动态阈值、冷却期或封存状态。每次又有
 memory link 到已达到任一阈值的 subject 时，都重新尝试 split。
@@ -887,7 +916,6 @@ link 或 membership 等业务不变量时也归入同类；不能静默改写为
 | `benchmark_seed`                               | 42      | generation provider 支持 seed 时 benchmark 使用的固定 seed                |
 | `benchmark_memory_space_build_timeout_seconds` | 7,200 秒 | 构建一个 memory space 的总 timeout                                      |
 | `benchmark_search_sample_timeout_seconds`      | 300 秒   | 一条 benchmark search/QA 样例的 timeout                                |
-| `benchmark_failure_max_retries`                | 2       | 单项操作内 transport/transaction retry 耗尽后，benchmark 对该完整 item 的额外重试次数 |
 | `benchmark_checkpoint_interval_items`          | 1       | 每完成多少个项目保存一次 checkpoint 和结果                                       |
 
 
@@ -899,16 +927,15 @@ LoCoMo 的 10 个 conversations 分别建立 10 个 memory spaces，可同时构
 `benchmark_extraction_prefetch_per_space`、等待队列长度或已完成但待提交结果上限。完成
 顺序可以不同，但后续候选召回、linking、正式
 写入、review 和 split 必须按 session `source_sequence` 串行提交；后序结果不能越过仍在
-处理或仍可重试的前序 session。前序 session 已成为终态单项失败后，记录失败并继续推进
+处理的前序 session。前序 session 已成为终态单项失败后，记录失败并继续推进
 来源顺序。不同 spaces 的有状态流程可以并行。
 
 不设置整次 benchmark 总 timeout。每完成 extraction、space ingestion 或一条 QA 都原子
-保存 checkpoint。只有 `transient_transport`、`rate_limited`、`service_unavailable` 或
-可重试的 SQLite transaction/连接错误，才在所属操作内重试耗尽后由 benchmark 额外重跑
-完整 item 2 次；这两次 item retry 不替代也不增加单次操作的 transport/transaction retry
-上限，并继续遵守 1.1.12 的退避和有效 `Retry-After`。模型给出的结构和业务均有效但错误的
-答案不重试。一次 full 或 sample 脚本只执行一个 run；需要重复实验时调用方使用不同 run
-目录手工重复执行。runner 不内置重复次数，也不跨 run 计算均值或标准差。
+保存 checkpoint。Benchmark runner 不提供完整 item 外层 retry；generation transport、
+embedding transport、structured-output repair 和 SQLite transaction 只执行各自所属操作内
+的有限重试。模型给出的结构和业务均有效但错误的答案不重试。一次 full 或 sample 脚本只
+执行一个 run；需要重复实验时调用方使用不同 run 目录手工重复执行。runner 不内置重复次数，
+也不跨 run 计算均值或标准差。
 
 每套数据集提供 `build`、`answer`、`score` 三个独立 stage，并分别提供 full 与 sample
 薄脚本，共六个可直接通过 `python -m benchmarks.scripts.<stage>_<mode>` 运行的模块。
@@ -937,7 +964,8 @@ LoCoMo_refined 输出 `qa_id`/`predicted_answer`，使用
 根据公开指标说明独立实现的严格 LLM judge、token F1 和 BLEU-1；多个合法 reference 取最佳
 匹配。本仓库不导入或调用 LoCoMo_refined 的非商业许可 evaluator 源码。
 
-上述临时错误在 item retry 耗尽后暂停整个 benchmark 记忆构建流水线；`rate_limited` 或
+除局部 Subject summary refresh 外，上述临时错误在所属操作内重试耗尽后暂停整个 benchmark
+记忆构建流水线；`rate_limited` 或
 `quota_exhausted` 给出明确恢复时间时暂停到该时间，否则进入临时暂停并等待下一次显式恢复
 探测，恢复后从最早未完成项目继续。`authentication_or_configuration`、没有恢复时间的
 `quota_exhausted`、`invalid_request` 或不可恢复的数据库配置/存储错误使 benchmark 进入
@@ -945,15 +973,27 @@ LoCoMo_refined 输出 `qa_id`/`predicted_answer`，使用
 `incomplete_output`、`context_overflow` 或 `policy_rejected` 只使对应 episode、维护任务或
 QA item 成为终态失败，不暂停其他 spaces，也不永久阻塞当前 space 的后续来源顺序。
 
-第一版先完整实现 extraction、Subject linking、Subject review、Subject split 和 search，
+Add 的 memory、links 和 episode completion 一旦原子提交即永久成功，后续 maintenance
+失败不回滚它们。显式恢复 build 时，同一 episode 的幂等重放跳过 extraction 与 linking，
+根据 add operation 找回仍 active 的关联 subjects，重新检查 split/review；如重放确实发生，
+也可根据该 operation 找回当时链接的已有 subjects，再次尝试局部 summary refresh。benchmark
+checkpoint 会直接跳过已记录完成的 source sequence，因此正常恢复不会重放所有已完成
+episodes。系统不保存 refresh 完成标记，极少数显式幂等重放可以重复刷新，但不会重跑
+extraction/linking 或产生重复 memory。
+
+第一版先完整实现 extraction、Subject linking、Subject review、Subject split、Subject summary
+refresh 和 search，
 再执行正式实验；ablation study 留到以后。实验按配置直接报告各项结果，不选择优胜配置，
 也不要求把模型因素与系统设计因素隔离。
 
 每个 benchmark question 使用原始问题文本直接执行一次 public search，不调用 LLM 改写
 query，也不执行迭代检索。除数据集官方 QA 指标外，实验只额外报告：
 
-- 记忆写入与整理过程的 LLM 调用总量；
-- 上述调用的 token 总量，只给出一个合计值，不拆分 prompt、completion、input、output
+- 记忆写入与整理过程分别报告 `successful_llm_call_count` 和
+`failed_llm_call_count`；只有通过 provider 调用及当前结构化校验的结果计为 success，provider
+错误或需要 structured-output repair 的响应计为 failed；
+- 上述成功和失败调用中 provider 已报告 usage 的 token 总量，只给出一个合计值，不拆分
+prompt、completion、input、output
 或 generation provider 使用的其他子类别；benchmark QA 回答和评测调用不计入该写入整理总量；
 - public search 检索延迟；
 - active memory 数和 active subject 数；
@@ -992,9 +1032,16 @@ source sequence、domain operation ID 及正式对象 ID，使同一事件可以
 - memory-space build 的开始、完成、暂停、恢复和失败；
 - episode 开始处理、extraction 完成、Subject linking 完成和原子提交；
 - 一次 episode 提取、创建和写入的 memory 数，新建 subject 数及新建 link 数；
-- 记忆写入与整理阶段每次 LLM 调用的阶段、attempt、结果、耗时和单一 `total_tokens`；不记录
+- 每个 Subject linking batch 进入最终决策 prompt 的唯一 candidate memory 数；该数量在
+Subject/Memory 双通道分别完成相似度过滤后跨通道、跨本 batch 的新 memories 去重。若调用
+association search，还记录 `association_search_called = true`，以及主动结果相对被动结果
+额外引入的唯一 candidate memory 数；
+- 记忆写入与整理阶段每次 LLM 调用的阶段、attempt、success/failed 结果、耗时和单一
+`total_tokens`；不记录
 prompt/completion/input/output 等 token 子类别；
 - Subject review 和 Subject split 的触发、开始、完成或失败，以及涉及的 subject ID；
+- Subject review 完成事件记录该次 review 是否请求并查看了 provenance；
+- link-local subject summary refresh 的开始、完成或失败，以及涉及的 subject ID；
 - split 的 `full_split`、`partial_split` 或 `defer_split` 结果；
 - review 导致的 memory 更新数、全局退役数和 summary 更新；
 - model provider `error_class`、structured-output retry、warning、终态单项失败、临时暂停、
@@ -1041,6 +1088,9 @@ memory unit 没有正式 name。日志为同一段落内的 memories 分配 `M1`
 原 subject 的新 summary；
 - defer split 的 warning 和后续仍会在新增 link 后重试的说明。
 
+每次 Subject summary refresh 展示 subject name、参与重写的全部当前 active memories 和
+link basis，以及生成的完整新 summary；审计输入不展示旧 summary。
+
 高可读性日志还按实际发生位置展示 model provider 错误类别、structured-output 修复重试、
 warning、error、终态单项失败、临时暂停、配置阻塞和恢复，使一次 memory-space build 可以
 仅凭该日志按时间顺序复盘。
@@ -1059,10 +1109,10 @@ warning、error、终态单项失败、临时暂停、配置阻塞和恢复，�
 | 配置项                                    | 值    | 含义                                                |
 | -------------------------------------- | ---- | ------------------------------------------------- |
 | `search_subject_top_k`                 | 5    | 公开 search 的 Subject 通道最多召回的 subject 数             |
-| `search_subject_min_cosine_similarity` | 0.25 | 公开 search 的 Subject 通道最低 query-subject name 余弦相似度 |
+| `search_subject_min_similarity`        | 0.25 | 公开 search 的 Subject 通道最低 query-subject name 余弦相似度 |
 | `search_subject_attached_memory_k`     | 1    | 每个公开 search Subject 通道结果附带的关联 memory 数            |
 | `search_memory_top_k`                  | 15   | 公开 search 的 Memory 通道最多召回的 memory 数               |
-| `search_memory_min_cosine_similarity`  | 0.35 | 公开 search 的 Memory 通道最低 query-memory 余弦相似度        |
+| `search_memory_min_similarity`         | 0.35 | 公开 search 的 Memory 通道最低 query-memory 余弦相似度        |
 | `search_memory_attached_subject_k`     | 1    | 每个公开 search Memory 通道结果附带的关联 subject 数            |
 
 
@@ -1071,14 +1121,17 @@ Subject 通道使用 subject name embedding，召回最多 5 个相似度不低�
 15 条相似度不低于 0.35 的 active memories；每条 memory 附带 active linked subjects 中
 name embedding 与 query 最相似的 1 个。
 
-通过各通道 top-k 和阈值的所有对象都进入最终结果。合并后只按照真实 links 去重并整理
-subject-memory 对应关系，不计算融合分数、不重新排序、不再次淘汰。direct/contextual links
-均参与，第一版不调整权重。由通道数量可派生出去重前最多 20 个 subjects 和 20 条 memories，
-不把该结果重复配置为另一个上限。
+通过各通道 top-k 和阈值的所有对象都进入最终结果。合并后按真实 links 组织为去重的
+subject groups：先保持 Subject 通道排名，再按 Memory 通道首次引入顺序追加其他 subjects；
+每个 subject 只展示一次，组内同一 memory 也只展示一次。只有 Subject 通道直接命中的最多
+5 个 subjects 携带 summary；仅由 Memory 通道引入的 subjects 只携带 name。结构化结果同样
+不暴露这些额外 subjects 的 summary，不只是文本 render 隐藏。不计算融合分数、不重新排序、
+不再次淘汰。direct/contextual links 均参与，第一版不调整权重。由通道数量可派生出去重前
+最多 20 个 subjects 和 20 条 memories，不把该结果重复配置为另一个上限。
 
-不设置最终 subject 数、memory 数、每 subject memory 数、返回文本总字符数、summary 返回
+不设置最终 subject 数、memory 数、每 subject memory 数、返回文本总字符数、单条 summary
 字符数、单条 memory 返回字符数或超限最小保留数量。Public library 返回结构化结果；面向
-主 Agent 的文本仅是该结果的确定性呈现。
+主 Agent 的文本仅是同一 subject-group 结构的确定性呈现。
 
 #### 1.3.2 NumPy 精确扫描
 
@@ -1090,7 +1143,7 @@ retrieval signature 和目标实体下的全部向量，每批最多 8,192 行�
 
 ### 1.4 LLM 结构化输出参考草图
 
-本节记录四个记忆构建阶段当前使用的精确结构化输出契约。它们不是 public API，但字段名、
+本节记录五个记忆构建阶段当前使用的精确结构化输出契约。它们不是 public API，但字段名、
 判别联合编码和枚举值必须与程序校验及 system prompt 一致；修改契约时三处同步修改。Prompt
 可以补充模型相关说明，但不得省略本节的完整结构和合法示例。
 
@@ -1272,6 +1325,21 @@ Partial split 只列出新 subjects 和要移走的 memories；原 subject 的�
 
 `defer_split` 是语义决定；full/partial split 中的非法 ID、不完整覆盖、数量越界或缺少
 direct link 仍是需要修复的输出错误。
+
+#### 1.4.5 Subject summary refresh
+
+输入仅包含 subject ID、name 和全部当前 active memories，不包含旧 summary。输出整体替换
+summary：
+
+```json
+{
+  "result": "summary_refresh",
+  "summary": "Complete summary supported by all supplied active memories."
+}
+```
+
+空白、超出字符硬上限或包含额外字段的结果按结构化输出规则修复；合法提交必须重新校验输入
+快照仍与当前 subject 成员和 memory 内容一致。
 
 ## 2. 第一版正式版补充设计
 

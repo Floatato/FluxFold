@@ -25,12 +25,14 @@ class FakeGenerationProvider:
         association_search_once: bool = False,
         review_mode: str = "keep",
         extraction_delay_seconds: float = 0.0,
+        always_new_subject: bool = False,
     ) -> None:
         self.benchmark_answer = benchmark_answer
         self.split_result = split_result
         self.association_search_once = association_search_once
         self.review_mode = review_mode
         self.extraction_delay_seconds = extraction_delay_seconds
+        self.always_new_subject = always_new_subject
         self.requests: list[GenerationRequest] = []
         self._association_requested = False
         self.active_extractions = 0
@@ -78,7 +80,7 @@ class FakeGenerationProvider:
                     request_id="fake-request",
                 )
             candidates = payload["candidates_by_memory"]["memory_1"]["subjects"]
-            if candidates:
+            if candidates and not self.always_new_subject:
                 subject = {
                     "kind": "existing",
                     "subject_id": candidates[0]["subject_id"],
@@ -146,6 +148,15 @@ class FakeGenerationProvider:
                         "summary": payload["subject"]["summary"],
                     }
                 )
+        elif request.stage == "subject_summary_refresh":
+            payload = _original_json(request.user_prompt)
+            memories = payload["subject"]["memories"]
+            text = json.dumps(
+                {
+                    "result": "summary_refresh",
+                    "summary": " ".join(memory["content"] for memory in memories),
+                }
+            )
         elif request.stage == "subject_split":
             payload = _original_json(request.user_prompt)
             subject = payload["subject"]

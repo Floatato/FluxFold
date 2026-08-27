@@ -23,10 +23,10 @@ class FluxFoldConfig:
     episode_chars_max: int = 96_000
     message_chars_max: int = 32_000
     longmemeval_message_chars_max: int = 80_000
-    subject_candidate_top_k: int = 12
+    subject_candidate_top_k: int = 8
     subject_candidate_min_similarity: float = 0.25
     subject_candidate_attached_memory_k: int = 1
-    memory_candidate_top_k: int = 24
+    memory_candidate_top_k: int = 16
     memory_candidate_min_similarity: float = 0.35
     memory_candidate_attached_subject_k: int = 1
     association_search_enabled: bool = True
@@ -37,8 +37,8 @@ class FluxFoldConfig:
     subject_review_new_memory_threshold: int = 8
     review_provenance_memory_max: int = 8
     memory_provenance_episode_max: int = 6
-    subject_split_memory_count_threshold: int = 32
-    subject_split_total_memory_chars_threshold: int = 20_000
+    subject_split_memory_count_threshold: int = 24
+    subject_split_total_memory_chars_threshold: int = 8_000
     subject_split_result_subject_min: int = 2
     subject_split_result_subject_max: int = 5
     subject_split_result_min_memories: int = 2
@@ -74,7 +74,6 @@ class FluxFoldConfig:
     benchmark_seed: int = 42
     benchmark_memory_space_build_timeout_seconds: float = 7_200
     benchmark_search_sample_timeout_seconds: float = 300
-    benchmark_failure_max_retries: int = 2
     benchmark_checkpoint_interval_items: int = 1
 
     def __post_init__(self) -> None:

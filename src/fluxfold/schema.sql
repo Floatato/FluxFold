@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS episode_blocks (
 CREATE TABLE IF NOT EXISTS domain_operations (
     operation_id TEXT PRIMARY KEY,
     memory_space_id TEXT NOT NULL REFERENCES memory_spaces(memory_space_id) ON DELETE RESTRICT,
-    operation_type TEXT NOT NULL CHECK (operation_type IN ('add_episode_memories', 'review_subject', 'split_subject', 'retire_memory')),
+    operation_type TEXT NOT NULL CHECK (operation_type IN ('add_episode_memories', 'review_subject', 'split_subject', 'refresh_subject_summary', 'retire_memory')),
     actor TEXT NOT NULL,
     config_signature TEXT NOT NULL,
     reason TEXT NOT NULL,

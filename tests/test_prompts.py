@@ -84,10 +84,12 @@ def test_repair_input_contains_only_the_supplied_previous_output() -> None:
 def test_structured_retry_does_not_accumulate_older_outputs(tmp_path) -> None:
     async def scenario() -> None:
         generation = RepairingGenerationProvider()
+        events: list[dict[str, object]] = []
         engine = await FluxFold.open(
             db_path=str(tmp_path / "repair.sqlite3"),
             generation_provider=generation,
             embedding_provider=FakeEmbeddingProvider(),
+            event_sink=events.append,
         )
         space = await engine.create_or_open_space("test:repair")
         episode = NormalizedEpisode(
@@ -109,6 +111,16 @@ def test_structured_retry_does_not_accumulate_older_outputs(tmp_path) -> None:
         assert "second_marker" in linking_requests[2].user_prompt
         assert "first_marker" not in linking_requests[2].user_prompt
         assert all(request.timeout_seconds is None for request in linking_requests)
+        linking_call_events = [
+            event
+            for event in events
+            if event["event_type"] == "llm_call" and event["stage"] == "subject_linking"
+        ]
+        assert [event["result"] for event in linking_call_events] == [
+            "failed",
+            "failed",
+            "success",
+        ]
         await engine.close()
 
     asyncio.run(scenario())

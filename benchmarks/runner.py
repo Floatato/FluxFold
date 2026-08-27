@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import random
 import time
 from collections.abc import Awaitable
 from dataclasses import asdict
@@ -114,12 +113,21 @@ async def build_run(
                             memory_space.memory_space_id, episode
                         )
 
+                last_completed_sequence = int(
+                    last_episode_by_space.get(space.source_id, -1)
+                )
+                pending_episodes = tuple(
+                    episode
+                    for episode in space.episodes
+                    if episode.source_sequence > last_completed_sequence
+                )
                 preparation_tasks = [
-                    asyncio.create_task(prepare(episode)) for episode in space.episodes
+                    asyncio.create_task(prepare(episode))
+                    for episode in pending_episodes
                 ]
                 try:
                     for episode, preparation_task in zip(
-                        space.episodes, preparation_tasks, strict=True
+                        pending_episodes, preparation_tasks, strict=True
                     ):
                         writer.event(
                             {
@@ -133,12 +141,11 @@ async def build_run(
                             }
                         )
                         first_attempt = _finish_prepared_add(engine, preparation_task)
-                        result, failure = await _add_with_item_retry(
+                        result, failure = await _finish_add_item(
                             engine=engine,
                             memory_space_id=memory_space.memory_space_id,
                             episode=episode,
                             writer=writer,
-                            config=config,
                             first_attempt=first_attempt,
                         )
                         if result is None:
@@ -389,13 +396,12 @@ def _load_predictions(path: Path, dataset: str) -> dict[str, str]:
     return output
 
 
-async def _add_with_item_retry(
+async def _finish_add_item(
     *,
     engine: FluxFold,
     memory_space_id: str,
     episode: NormalizedEpisode,
     writer: ArtifactWriter,
-    config: FluxFoldConfig,
     first_attempt: Awaitable[AddResult] | None = None,
 ) -> tuple[AddResult | None, StageFailure | None]:
     transient = {
@@ -409,79 +415,49 @@ async def _add_with_item_retry(
         ErrorClass.INVALID_STRUCTURED_OUTPUT,
         ErrorClass.INCOMPLETE_OUTPUT,
     }
-    for retry_index in range(config.benchmark_failure_max_retries + 1):
-        try:
-            if retry_index == 0 and first_attempt is not None:
-                return await first_attempt, None
-            return await engine.add(memory_space_id, episode), None
-        except (ProviderError, StageFailure) as error:
-            failure = (
-                error
-                if isinstance(error, StageFailure)
-                else StageFailure("embedding", error.error_class, error.message)
-            )
-            if failure.error_class in terminal_item:
-                engine.record_episode_terminal_failure(
-                    memory_space_id, episode, failure
-                )
-                writer.event(
-                    {
-                        "event_type": "episode_terminal_failure",
-                        "severity": "error",
-                        "timestamp_ms": int(time.time() * 1000),
-                        "memory_space_id": memory_space_id,
-                        "source_sequence": episode.source_sequence,
-                        "error_class": failure.error_class.value,
-                        "reason": failure.message,
-                    }
-                )
-                return None, failure
-            if failure.error_class not in transient:
-                writer.event(
-                    {
-                        "event_type": "memory_space_build_blocked",
-                        "severity": "error",
-                        "timestamp_ms": int(time.time() * 1000),
-                        "memory_space_id": memory_space_id,
-                        "source_sequence": episode.source_sequence,
-                        "error_class": failure.error_class.value,
-                        "reason": failure.message,
-                    }
-                )
-                if isinstance(error, StageFailure):
-                    raise
-                raise failure from error
-            if retry_index >= config.benchmark_failure_max_retries:
-                writer.event(
-                    {
-                        "event_type": "memory_space_build_paused",
-                        "severity": "error",
-                        "timestamp_ms": int(time.time() * 1000),
-                        "memory_space_id": memory_space_id,
-                        "source_sequence": episode.source_sequence,
-                        "error_class": failure.error_class.value,
-                        "reason": failure.message,
-                    }
-                )
-                raise
+    try:
+        if first_attempt is not None:
+            return await first_attempt, None
+        return await engine.add(memory_space_id, episode), None
+    except (ProviderError, StageFailure) as error:
+        failure = (
+            error
+            if isinstance(error, StageFailure)
+            else StageFailure("embedding", error.error_class, error.message)
+        )
+        if failure.error_class in terminal_item:
+            engine.record_episode_terminal_failure(memory_space_id, episode, failure)
             writer.event(
                 {
-                    "event_type": "benchmark_item_retry",
-                    "severity": "warning",
+                    "event_type": "episode_terminal_failure",
+                    "severity": "error",
                     "timestamp_ms": int(time.time() * 1000),
                     "memory_space_id": memory_space_id,
                     "source_sequence": episode.source_sequence,
-                    "attempt": retry_index + 2,
                     "error_class": failure.error_class.value,
+                    "reason": failure.message,
                 }
             )
-            await asyncio.sleep(
-                random.uniform(
-                    0,
-                    config.retry_initial_seconds * config.retry_multiplier**retry_index,
-                )
-            )
-    raise AssertionError("unreachable benchmark item retry state")
+            return None, failure
+        event_type = (
+            "memory_space_build_paused"
+            if failure.error_class in transient
+            else "memory_space_build_blocked"
+        )
+        writer.event(
+            {
+                "event_type": event_type,
+                "severity": "error",
+                "timestamp_ms": int(time.time() * 1000),
+                "memory_space_id": memory_space_id,
+                "source_sequence": episode.source_sequence,
+                "error_class": failure.error_class.value,
+                "reason": failure.message,
+            }
+        )
+        if isinstance(error, StageFailure):
+            raise
+        raise failure from error
 
 
 async def _finish_prepared_add(

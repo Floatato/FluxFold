@@ -67,7 +67,8 @@ class ArtifactWriter:
         self._lock = threading.Lock()
         self.run_id: str | None = None
         self._pending_audit: dict[str, list[dict[str, object]]] = {}
-        self._llm_calls = 0
+        self._successful_llm_calls = 0
+        self._failed_llm_calls = 0
         self._llm_tokens = 0
         self._terminal_failures = 0
         if paths.events.exists():
@@ -140,15 +141,19 @@ class ArtifactWriter:
     def build_metrics(self) -> dict[str, int]:
         with self._lock:
             return {
-                "write_llm_calls": self._llm_calls,
+                "successful_llm_call_count": self._successful_llm_calls,
+                "failed_llm_call_count": self._failed_llm_calls,
                 "write_llm_total_tokens": self._llm_tokens,
                 "terminal_failure_count": self._terminal_failures,
             }
 
     def _count_event(self, event: dict[str, object]) -> None:
-        if event.get("event_type") == "llm_call" and event.get("result") == "success":
-            self._llm_calls += 1
+        if event.get("event_type") == "llm_call":
             self._llm_tokens += int(event.get("total_tokens", 0))
+            if event.get("result") == "success":
+                self._successful_llm_calls += 1
+            elif event.get("result") == "failed":
+                self._failed_llm_calls += 1
         if event.get("event_type") in {
             "episode_terminal_failure",
             "maintenance_terminal_failure",

@@ -4,11 +4,30 @@ import asyncio
 import json
 
 from benchmarks.adapters import load_longmemeval
-from benchmarks.artifacts import RunPaths
+from benchmarks.artifacts import ArtifactWriter, RunPaths
 from benchmarks.runner import answer_run, build_run, score_run
 
 from fluxfold import FluxFoldConfig
 from tests.fakes import FakeEmbeddingProvider, FakeGenerationProvider
+
+
+def test_build_metrics_distinguish_successful_and_failed_llm_calls(tmp_path) -> None:
+    writer = ArtifactWriter(RunPaths(tmp_path / "metrics"))
+    writer.event(
+        {
+            "event_type": "llm_call",
+            "result": "success",
+            "total_tokens": 10,
+        }
+    )
+    writer.event({"event_type": "llm_call", "result": "failed", "total_tokens": 7})
+
+    assert writer.build_metrics() == {
+        "successful_llm_call_count": 1,
+        "failed_llm_call_count": 1,
+        "write_llm_total_tokens": 17,
+        "terminal_failure_count": 0,
+    }
 
 
 def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
@@ -63,6 +82,35 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
             mode="sample",
             config=config,
         )
+        event_count = len(paths.events.read_text(encoding="utf-8").splitlines())
+        paths.checkpoint.write_text(
+            json.dumps(
+                {
+                    "completed_space_ids": [],
+                    "last_episode_by_space": {spaces[0].source_id: 1},
+                }
+            ),
+            encoding="utf-8",
+        )
+        await build_run(
+            dataset="longmemeval",
+            spaces=spaces,
+            run_paths=paths,
+            data_paths=(str(dataset_path),),
+            mode="sample",
+            config=config,
+        )
+        resumed_events = [
+            json.loads(line)
+            for line in paths.events.read_text(encoding="utf-8").splitlines()[
+                event_count:
+            ]
+        ]
+        assert [
+            event["source_sequence"]
+            for event in resumed_events
+            if event["event_type"] == "episode_processing_started"
+        ] == [2]
         await answer_run(
             dataset="longmemeval", spaces=spaces, run_paths=paths, config=config
         )
@@ -81,3 +129,7 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
     assert summary["score_model"] == "fake-generation"
     assert paths.score_markdown.is_file()
     assert generation.max_active_extractions > 1
+    build_summary = json.loads(paths.build_summary.read_text(encoding="utf-8"))
+    assert build_summary["successful_llm_call_count"] > 0
+    assert build_summary["failed_llm_call_count"] == 0
+    assert "write_llm_calls" not in build_summary

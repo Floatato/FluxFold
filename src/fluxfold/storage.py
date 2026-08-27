@@ -39,7 +39,7 @@ from fluxfold.models import (
 )
 from fluxfold.providers import EmbeddingModelInfo
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,12 +77,10 @@ class PreparedLink:
 
 
 @dataclass(frozen=True, slots=True)
-class ExistingSubjectAppend:
+class ExistingSubjectTouch:
     subject_id: str
     expected_revision: int
-    summary: str
     new_memory_increment: int
-    name_summary_embedding: np.ndarray
 
 
 @dataclass(frozen=True, slots=True)
@@ -712,7 +710,7 @@ class Store:
         memories: Sequence[PreparedMemory],
         subjects: Sequence[PreparedSubject],
         links: Sequence[PreparedLink],
-        subject_appends: Sequence[ExistingSubjectAppend],
+        subject_touches: Sequence[ExistingSubjectTouch],
         signature_id: str,
         actor: str,
         config_signature: str,
@@ -764,34 +762,24 @@ class Store:
                     signature_id,
                     now,
                 )
-            for append in subject_appends:
+            for touch in subject_touches:
                 cursor = connection.execute(
                     """
-                    UPDATE subjects SET summary = ?, new_memory_count = new_memory_count + ?,
-                        summary_revision = summary_revision + 1, updated_at = ?
+                    UPDATE subjects SET new_memory_count = new_memory_count + ?,
+                        updated_at = ?
                     WHERE subject_id = ? AND memory_space_id = ? AND lifecycle_status = 'active'
                         AND summary_revision = ?
                     """,
                     (
-                        append.summary,
-                        append.new_memory_increment,
+                        touch.new_memory_increment,
                         now,
-                        append.subject_id,
+                        touch.subject_id,
                         memory_space_id,
-                        append.expected_revision,
+                        touch.expected_revision,
                     ),
                 )
                 if cursor.rowcount != 1:
-                    raise ConcurrentUpdateError(f"stale subject: {append.subject_id}")
-                self._upsert_subject_embedding(
-                    connection,
-                    append.subject_id,
-                    "name_summary",
-                    append.summary,
-                    append.name_summary_embedding,
-                    signature_id,
-                    now,
-                )
+                    raise ConcurrentUpdateError(f"stale subject: {touch.subject_id}")
             for link in links:
                 self._insert_link(connection, link, operation_id, now)
             self._validate_active_memory_links(connection, memory_space_id)
@@ -1266,7 +1254,8 @@ class Store:
             cursor = connection.execute(
                 """
                 UPDATE subjects SET summary = ?, new_memory_count = 0,
-                    summary_revision = summary_revision + 1, updated_at = ?
+                    summary_revision = summary_revision + 1,
+                    updated_at = ?
                 WHERE subject_id = ? AND summary_revision = ?
                 """,
                 (summary, now, subject_id, expected_revision),
@@ -1284,6 +1273,104 @@ class Store:
             )
             self._effect(connection, operation_id, "subject", subject_id, "reviewed")
             self._validate_active_memory_links(connection, memory_space_id)
+        return operation_id
+
+    def commit_summary_refresh(
+        self,
+        *,
+        memory_space_id: str,
+        snapshot: SubjectSnapshot,
+        summary: str,
+        summary_embedding: np.ndarray,
+        signature_id: str,
+        actor: str,
+        config_signature: str,
+    ) -> str:
+        operation_id = str(uuid4())
+        now = utc_milliseconds()
+        with self._transaction() as connection:
+            subject = connection.execute(
+                """
+                SELECT name, summary_revision FROM subjects
+                WHERE subject_id = ? AND memory_space_id = ?
+                    AND lifecycle_status = 'active'
+                """,
+                (snapshot.subject_id, memory_space_id),
+            ).fetchone()
+            if subject is None:
+                raise NotFoundError(f"active subject not found: {snapshot.subject_id}")
+            if subject["summary_revision"] != snapshot.summary_revision:
+                raise ConcurrentUpdateError(f"stale subject: {snapshot.subject_id}")
+            rows = connection.execute(
+                """
+                SELECT u.memory_id, u.latest_source_at, v.content, l.link_basis
+                FROM subject_memory_links l
+                JOIN memory_units u ON u.memory_id = l.memory_id
+                    AND u.lifecycle_status = 'active'
+                JOIN memory_versions v ON v.memory_id = u.memory_id AND v.is_latest = 1
+                WHERE l.subject_id = ? AND l.unlinked_at IS NULL
+                ORDER BY u.memory_id
+                """,
+                (snapshot.subject_id,),
+            ).fetchall()
+            current_memories = tuple(
+                (
+                    row["memory_id"],
+                    row["content"],
+                    row["latest_source_at"],
+                    row["link_basis"],
+                )
+                for row in rows
+            )
+            supplied_memories = tuple(
+                (
+                    memory.memory_id,
+                    memory.content,
+                    memory.latest_source_at,
+                    memory.link_basis,
+                )
+                for memory in snapshot.memories
+            )
+            if (
+                subject["name"] != snapshot.name
+                or current_memories != supplied_memories
+            ):
+                raise ConcurrentUpdateError(
+                    f"subject evidence changed: {snapshot.subject_id}"
+                )
+            self._insert_operation(
+                connection,
+                operation_id,
+                memory_space_id,
+                "refresh_subject_summary",
+                actor,
+                config_signature,
+                "Rewrite a linked subject summary from all active memories.",
+                now,
+            )
+            connection.execute(
+                """
+                UPDATE subjects SET summary = ?, summary_revision = summary_revision + 1,
+                    updated_at = ? WHERE subject_id = ?
+                """,
+                (summary, now, snapshot.subject_id),
+            )
+            self._upsert_subject_embedding(
+                connection,
+                snapshot.subject_id,
+                "name_summary",
+                _subject_embedding_text(snapshot.name, summary),
+                summary_embedding,
+                signature_id,
+                now,
+            )
+            self._effect(
+                connection,
+                operation_id,
+                "subject",
+                snapshot.subject_id,
+                "summary_refreshed",
+            )
         return operation_id
 
     def _replace_memory_version(
@@ -1457,7 +1544,8 @@ class Store:
                 connection.execute(
                     """
                     UPDATE subjects SET summary = ?, new_memory_count = 0,
-                        summary_revision = summary_revision + 1, updated_at = ?
+                        summary_revision = summary_revision + 1,
+                        updated_at = ?
                     WHERE subject_id = ?
                     """,
                     (remaining_summary, now, original.subject_id),
@@ -1555,8 +1643,9 @@ class Store:
             signature_id = self._active_signature(connection, memory_space_id)
             subject_refs: list[tuple[str, float, tuple[str, ...]]] = []
             memory_refs: list[tuple[str, float, tuple[str, ...]]] = []
-            subject_ids = {item[0] for item in subject_hits}
-            memory_ids = {item[0] for item in memory_hits}
+            direct_subject_ids = tuple(item[0] for item in subject_hits)
+            subject_order = list(direct_subject_ids)
+            memory_order = [item[0] for item in memory_hits]
             for subject_id, similarity in subject_hits:
                 rows = connection.execute(
                     """
@@ -1574,7 +1663,9 @@ class Store:
                     "memory_id",
                     self.config.search_subject_attached_memory_k,
                 )
-                memory_ids.update(attached)
+                for memory_id in attached:
+                    if memory_id not in memory_order:
+                        memory_order.append(memory_id)
                 subject_refs.append((subject_id, similarity, attached))
             for memory_id, similarity in memory_hits:
                 rows = connection.execute(
@@ -1593,10 +1684,16 @@ class Store:
                     "subject_id",
                     self.config.search_memory_attached_subject_k,
                 )
-                subject_ids.update(attached)
+                for subject_id in attached:
+                    if subject_id not in subject_order:
+                        subject_order.append(subject_id)
                 memory_refs.append((memory_id, similarity, attached))
-            subjects = self._load_search_subjects(connection, subject_ids)
-            memories = self._load_search_memories(connection, memory_ids)
+            subject_ids = set(subject_order)
+            memory_ids = set(memory_order)
+            subjects = self._load_search_subjects(
+                connection, subject_order, set(direct_subject_ids)
+            )
+            memories = self._load_search_memories(connection, memory_order)
             links = self._load_search_links(connection, subject_ids, memory_ids)
         from fluxfold.models import RankedMemoryRef, RankedSubjectRef
 
@@ -1616,6 +1713,54 @@ class Store:
                 for row in connection.execute(
                     "SELECT subject_id FROM subjects WHERE memory_space_id = ? AND lifecycle_status = 'active' ORDER BY subject_id",
                     (memory_space_id,),
+                )
+            )
+
+    def operation_active_subject_ids(
+        self, memory_space_id: str, operation_id: str | None
+    ) -> tuple[str, ...]:
+        if operation_id is None:
+            return ()
+        with self._connect() as connection:
+            return tuple(
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT l.subject_id FROM subject_memory_links l
+                    JOIN subjects s ON s.subject_id = l.subject_id
+                        AND s.lifecycle_status = 'active'
+                    WHERE s.memory_space_id = ? AND l.opened_by_operation_id = ?
+                        AND l.unlinked_at IS NULL
+                    ORDER BY l.subject_id
+                    """,
+                    (memory_space_id, operation_id),
+                )
+            )
+
+    def operation_active_existing_subject_ids(
+        self, memory_space_id: str, operation_id: str | None
+    ) -> tuple[str, ...]:
+        if operation_id is None:
+            return ()
+        with self._connect() as connection:
+            return tuple(
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT l.subject_id FROM subject_memory_links l
+                    JOIN subjects s ON s.subject_id = l.subject_id
+                        AND s.lifecycle_status = 'active'
+                    WHERE s.memory_space_id = ? AND l.opened_by_operation_id = ?
+                        AND l.unlinked_at IS NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM domain_operation_effects e
+                            WHERE e.operation_id = ? AND e.object_type = 'subject'
+                                AND e.object_id = l.subject_id
+                                AND e.effect_type = 'created'
+                        )
+                    ORDER BY l.subject_id
+                    """,
+                    (memory_space_id, operation_id, operation_id),
                 )
             )
 
@@ -1673,6 +1818,10 @@ class Store:
                 "SELECT count(*) FROM domain_operations WHERE memory_space_id = ? AND operation_type = 'split_subject'",
                 (memory_space_id,),
             ).fetchone()[0]
+            refresh_count = connection.execute(
+                "SELECT count(*) FROM domain_operations WHERE memory_space_id = ? AND operation_type = 'refresh_subject_summary'",
+                (memory_space_id,),
+            ).fetchone()[0]
         memory_chars = memory_content_chars + summary_chars
         rate = 0.0 if source_chars == 0 else 1 - memory_chars / source_chars
         return {
@@ -1683,40 +1832,54 @@ class Store:
             "active_subjects": active_subjects,
             "subject_review_count": review_count,
             "subject_split_count": split_count,
+            "subject_summary_refresh_count": refresh_count,
         }
 
     def _load_search_subjects(
-        self, connection: sqlite3.Connection, ids: set[str]
+        self,
+        connection: sqlite3.Connection,
+        ids: Sequence[str],
+        summary_ids: set[str],
     ) -> tuple[SearchSubject, ...]:
         if not ids:
             return ()
-        stable_ids = tuple(sorted(ids))
+        stable_ids = tuple(ids)
         rows = connection.execute(
-            f"SELECT subject_id, name, summary FROM subjects WHERE subject_id IN ({_placeholders(stable_ids)}) ORDER BY subject_id",
+            f"SELECT subject_id, name, summary FROM subjects WHERE subject_id IN ({_placeholders(stable_ids)})",
             stable_ids,
         ).fetchall()
+        by_id = {row["subject_id"]: row for row in rows}
         return tuple(
-            SearchSubject(row["subject_id"], row["name"], row["summary"])
-            for row in rows
+            SearchSubject(
+                subject_id,
+                by_id[subject_id]["name"],
+                by_id[subject_id]["summary"] if subject_id in summary_ids else None,
+            )
+            for subject_id in stable_ids
         )
 
     def _load_search_memories(
-        self, connection: sqlite3.Connection, ids: set[str]
+        self, connection: sqlite3.Connection, ids: Sequence[str]
     ) -> tuple[SearchMemory, ...]:
         if not ids:
             return ()
-        stable_ids = tuple(sorted(ids))
+        stable_ids = tuple(ids)
         rows = connection.execute(
             f"""
             SELECT u.memory_id, u.latest_source_at, v.content FROM memory_units u
             JOIN memory_versions v ON v.memory_id = u.memory_id AND v.is_latest = 1
-            WHERE u.memory_id IN ({_placeholders(stable_ids)}) ORDER BY u.memory_id
+            WHERE u.memory_id IN ({_placeholders(stable_ids)})
             """,
             stable_ids,
         ).fetchall()
+        by_id = {row["memory_id"]: row for row in rows}
         return tuple(
-            SearchMemory(row["memory_id"], row["content"], row["latest_source_at"])
-            for row in rows
+            SearchMemory(
+                memory_id,
+                by_id[memory_id]["content"],
+                by_id[memory_id]["latest_source_at"],
+            )
+            for memory_id in stable_ids
         )
 
     def _load_search_links(

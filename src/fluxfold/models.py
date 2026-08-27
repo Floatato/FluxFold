@@ -121,7 +121,9 @@ class EmbeddingRebuildResult:
 @dataclass(frozen=True, slots=True)
 class MaintenanceResult:
     subject_id: str
-    operation: Literal["review", "full_split", "partial_split", "defer_split"]
+    operation: Literal[
+        "review", "full_split", "partial_split", "defer_split", "summary_refresh"
+    ]
     operation_id: str | None
     reason: str | None = None
 
@@ -141,7 +143,7 @@ class AddResult:
 class SearchSubject:
     subject_id: str
     name: str
-    summary: str
+    summary: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,25 +184,28 @@ class SearchResult:
     memory_channel: tuple[RankedMemoryRef, ...]
 
     def render(self) -> str:
-        """Render the structured result without changing its ordering."""
+        """Render one deduplicated group per subject in retrieval order."""
 
-        subjects = {item.subject_id: item for item in self.subjects}
         memories = {item.memory_id: item for item in self.memories}
-        lines = ["Subject channel:"]
-        for subject_hit in self.subject_channel:
-            subject = subjects[subject_hit.subject_id]
-            lines.append(f"- Subject: {subject.name}\n  Summary: {subject.summary}")
-            for memory_id in subject_hit.attached_memory_ids:
-                lines.append(f"  Attached memory: {memories[memory_id].content}")
-        lines.append("Memory channel:")
+        grouped_memory_ids: dict[str, list[str]] = {
+            subject.subject_id: [] for subject in self.subjects
+        }
+        for hit in self.subject_channel:
+            grouped_memory_ids[hit.subject_id].extend(hit.attached_memory_ids)
         for memory_hit in self.memory_channel:
-            memory = memories[memory_hit.memory_id]
-            lines.append(f"- Memory: {memory.content}")
             for subject_id in memory_hit.attached_subject_ids:
-                subject = subjects[subject_id]
-                lines.append(
-                    f"  Attached subject: {subject.name}\n  Summary: {subject.summary}"
-                )
+                grouped_memory_ids[subject_id].append(memory_hit.memory_id)
+
+        lines = ["Subject groups:"]
+        for subject in self.subjects:
+            lines.append(f"- Subject: {subject.name}")
+            if subject.summary is not None:
+                lines.append(f"  Summary: {subject.summary}")
+            seen: set[str] = set()
+            for memory_id in grouped_memory_ids[subject.subject_id]:
+                if memory_id not in seen:
+                    seen.add(memory_id)
+                    lines.append(f"  Memory: {memories[memory_id].content}")
         return "\n".join(lines)
 
 
@@ -311,6 +316,11 @@ class ReviewOutput(StrictModel):
     result: Literal["review"]
     updates: list[MemoryUpdateOutput]
     retirements: list[str]
+    summary: str
+
+
+class SummaryRefreshOutput(StrictModel):
+    result: Literal["summary_refresh"]
     summary: str
 
 

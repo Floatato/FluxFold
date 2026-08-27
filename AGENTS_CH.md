@@ -79,6 +79,7 @@ dataset session
 → 批次 Subject linking              （一次 LLM 输出覆盖整个 episode 批次）
 → 原子提交                          （memory、version、provenance、embedding、subject、link、completion）
 → Subject split / Subject review    （两者同时满足时先 split）
+→ 已链接旧 Subject summary refresh  （仅逐个整体重写本次局部目标中未被上述流程重写者）
 ```
 
 
@@ -104,4 +105,3 @@ migration、shim 或 feature flag。
 没有配套文档更新的代码改动是不完整的。
 - 只描述最终的当前设计。删除被取代的描述，而不是记录“某机制已不再使用”；历史由 git 保存。
 - `AGENTS.md` 与 `AGENTS_CH.md` 必须同步更新并保持等价。
-
