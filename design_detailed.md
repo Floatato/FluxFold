@@ -278,7 +278,7 @@ Subject 审计的容量使用当前 active links 关联的 active memory 数量�
 新行，不复用旧行。`direct` 表示 memory 直接描述 subject 本身或其核心事实直接属于该
 subject；`contextual` 表示 memory 不直接描述 subject，但会具体影响、约束、更新或解释
 该 subject 下的信息，遗漏它可能实质性损害未来回答。每条新 memory 至少建立一个
-`direct` link，且可以有多个 `direct` link；全部 active subject links 合计不得超过 8。
+`direct` link，且可以有多个 `direct` link；全部 active subject links 合计不得超过 5。
 `contextual` link 按需建立，不表示较低优先级。
 SQLite 使用 `CHECK (link_basis IN ('direct', 'contextual'))` 约束取值。
 
@@ -356,14 +356,19 @@ byte_length(vector) = dimension * 4
 
 ##### `episode_extractions`
 
-`episode_extractions` 记录 episode 是否已经完成一次逻辑上的记忆添加流程。它至少保存
-episode ID、输入 hash、extractor 配置签名、状态、完成 operation ID 和完成时间。
+`episode_extractions` 记录 episode 是否已经完成一次逻辑上的记忆添加流程，或已经成为不应
+自动重试的终态单项失败。它至少保存 episode ID、输入 hash、extractor 配置签名、状态、
+完成 operation ID、完成时间，以及终态失败时的 error class 和简短原因。
 
 `completed` 可以对应 `0..N` 条 memory，因此不能用 provenance 是否存在判断 episode
 是否处理过。一个 episode 在同一 memory space 中只允许有一个 completed 结果；使用不同
 配置重跑 benchmark 时创建新的 memory space。LLM 推理和 embedding 计算在事务外完成；
 最终 memory、subjects、links、embeddings 和 completion record 一起提交，避免重试产生
 部分结果或重复 memory。
+
+`terminal_failure` 不产生 memory、subject、link 或 domain operation。相同来源的安全重放
+返回已经记录的失败，不重复调用模型；benchmark 按来源顺序继续处理后续 session。临时传输、
+限流或服务不可用在 item retry 耗尽后不写入该状态，而是保留未完成 episode 供显式恢复。
 
 ##### `domain_operations`
 
@@ -557,7 +562,9 @@ jitter，不设置退避最大时间。同一 memory space 的正式写入并发
 
 实验版 public library 提供以下能力：创建或打开 memory space、删除指定 memory space、
 清空全部 memory spaces、向指定 space 添加一个已规范化 dataset episode，以及在指定
-space 中检索记忆。删除指定 space 和清空全部 spaces 都能通过单条管理命令完成；它们是
+space 中检索记忆。它还提供检索 embedding 的全量重建：先为全部 active memory latest
+content 和 active subject 的 name/name-summary 生成新 signature 下的向量，再在一个事务
+中校验来源快照并切换 active retrieval signature。删除指定 space 和清空全部 spaces 都能通过单条管理命令完成；它们是
 memory-space 级管理操作，会清除目标 space 的整套数据，不改变普通流程中 episode、历史
 版本和 domain operation 的不可变约束。
 
@@ -748,7 +755,7 @@ LLM 判断应链接哪些已有 subject、是否新建 subject，以及每条 li
 `contextual` basis。直接描述 subject 核心事实使用 `direct`；只有遗漏某条非直接描述的
 memory 会实质损害未来回答时才建立 `contextual`。宽泛常识联系不足以建立 link。Prompt
 建议每条 memory 通常建立 1--4 个 links，硬校验要求每条 memory 至少一个 direct link，
-全部 active links 不超过 8。已有 subject 与其语义具体化 subject 同时成为候选时，LLM 只
+全部 active links 不超过 5。已有 subject 与其语义具体化 subject 同时成为候选时，LLM 只
 选择语义正确且更具体的一个；程序不校验或持久化这种包含关系。
 
 每当新 memory 建立指向已有 subject 的新 active link，立即把 memory content append 到该
@@ -870,7 +877,6 @@ link 或 membership 等业务不变量时也归入同类；不能静默改写为
 | `benchmark_memory_space_build_concurrency`     | 10      | benchmark 同时构建的独立 memory space 数                                  |
 | `benchmark_extraction_concurrency_per_space`   | 10      | 同一 benchmark memory space 同时执行的无状态 session extraction 数           |
 | `benchmark_search_concurrency`                 | 5       | 同时执行的 benchmark search/QA 样例数                                     |
-| `benchmark_repetitions`                        | 3       | 同一质量配置完整重复运行的次数                                                   |
 | `benchmark_seed`                               | 42      | generation provider 支持 seed 时 benchmark 使用的固定 seed                |
 | `benchmark_memory_space_build_timeout_seconds` | 7,200 秒 | 构建一个 memory space 的总 timeout                                      |
 | `benchmark_search_sample_timeout_seconds`      | 300 秒   | 一条 benchmark search/QA 样例的 timeout                                |
@@ -894,7 +900,27 @@ LoCoMo 的 10 个 conversations 分别建立 10 个 memory spaces，可同时构
 可重试的 SQLite transaction/连接错误，才在所属操作内重试耗尽后由 benchmark 额外重跑
 完整 item 2 次；这两次 item retry 不替代也不增加单次操作的 transport/transaction retry
 上限，并继续遵守 1.1.12 的退避和有效 `Retry-After`。模型给出的结构和业务均有效但错误的
-答案不重试。三次重复使用相同 seed 和数据顺序，同时报告各次结果、均值与标准差。
+答案不重试。一次 full 或 sample 脚本只执行一个 run；需要重复实验时调用方使用不同 run
+目录手工重复执行。runner 不内置重复次数，也不跨 run 计算均值或标准差。
+
+每套数据集提供 `build`、`answer`、`score` 三个独立 stage，并分别提供 full 与 sample
+薄脚本，共六个可直接通过 `python -m benchmarks.scripts.<stage>_<mode>` 运行的模块。
+build 只构建数据库和写入审计产物；answer 从同一 run manifest 和数据库执行 public
+search 并生成官方字段形状的 predictions；score 独立读取 predictions 生成逐题结果和汇总。
+stage 之间使用不可变 manifest 校验数据文件 hash、选择范围、配置签名、generation model、
+embedding signature 和 seed，不自动下载数据集。
+
+LoCoMo_refined sample 必须选择一个 conversation ID 或零基位置，并处理该 conversation 的
+全部 sessions 和全部 questions。LongMemEval-S sample 可以显式选择 question IDs；未指定时
+确定性选择覆盖 `abstention`、`knowledge-update`、`multi-session`、
+`single-session-assistant`、`single-session-preference`、`single-session-user` 和
+`temporal-reasoning` 的七个完整 evaluation instances。full mode 始终处理全部数据。
+
+write stages、benchmark QA answer 和 LLM judge 使用同一个 generation model 配置；retrieval
+embedding 使用独立 embedding model 配置。LongMemEval 输出 `question_id`/`hypothesis`，按
+其公开 rubric 进行等价答案 LLM 判断。LoCoMo_refined 输出 `qa_id`/`predicted_answer`，使用
+根据公开指标说明独立实现的严格 LLM judge、token F1 和 BLEU-1；多个合法 reference 取最佳
+匹配。本仓库不导入或调用 LoCoMo_refined 的非商业许可 evaluator 源码。
 
 上述临时错误在 item retry 耗尽后暂停整个 benchmark 记忆构建流水线；`rate_limited` 或
 `quota_exhausted` 给出明确恢复时间时暂停到该时间，否则进入临时暂停并等待下一次显式恢复
@@ -1743,4 +1769,3 @@ Markdown/其他格式反向写入；系统不同时维护两个可写事实源�
 optional extras、多 distributions、workspace 或独立 connector package。
 - native extension、任务编排器、pre-commit、更多测试工具和发布基础设施只在已有工具出现
 可观察缺口时引入。
-

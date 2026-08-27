@@ -11,6 +11,8 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = [
     "numpy>=2.0",
+    "openai>=1.68",
+    "pydantic>=2.10",
 ]
 
 [build-system]
@@ -30,6 +32,7 @@ target-version = "py312"
 src = ["src", "tests", "benchmarks"]
 
 [tool.ruff.lint]
+ignore = ["E501"]
 select = [
     "E",
     "F",
