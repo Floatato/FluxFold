@@ -13,6 +13,7 @@ dependencies = [
     "numpy>=2.0",
     "openai>=1.68",
     "pydantic>=2.10",
+    "socksio>=1.0.0",
 ]
 
 [build-system]

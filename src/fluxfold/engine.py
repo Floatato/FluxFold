@@ -57,6 +57,7 @@ from fluxfold.prompts import (
     repair_input,
     review_input,
     split_input,
+    validation_feedback,
 )
 from fluxfold.providers import (
     EmbeddingProvider,
@@ -214,8 +215,6 @@ class FluxFold:
                 user_prompt=extraction_input(episode),
                 adapter=TypeAdapter(ExtractionOutput),
                 temperature=self.config.extraction_temperature,
-                request_timeout=self.config.extraction_request_timeout_seconds,
-                stage_deadline=self.config.extraction_stage_deadline_seconds,
                 validator=self._validate_extraction,
             ),
         )
@@ -337,17 +336,9 @@ class FluxFold:
                 memory_space_id=memory_space_id,
                 episode_id=current.episode_id,
                 operation_id=operation_id,
-                extraction=extraction.model_dump(mode="json"),
-                memories=[
-                    {
-                        "memory_ref": memory_ref,
-                        "memory_id": memory_id,
-                        "content": content,
-                    }
-                    for memory_ref, memory_id, content in zip(
-                        memory_refs, memory_ids, contents, strict=True
-                    )
-                ],
+                extraction=self._audit_extraction(
+                    memory_space_id, extraction, memory_refs, contents, linking
+                ),
                 new_subjects=[
                     {
                         **subject.model_dump(mode="json"),
@@ -357,7 +348,6 @@ class FluxFold:
                         linking.new_subjects, prepared_subjects, strict=True
                     )
                 ],
-                links=[link.model_dump(mode="json") for link in linking.links],
             )
             maintenance: list[MaintenanceResult] = []
             for subject_id in sorted(affected_subject_ids):
@@ -376,7 +366,6 @@ class FluxFold:
                         ErrorClass.POLICY_REJECTED,
                         ErrorClass.INVALID_STRUCTURED_OUTPUT,
                         ErrorClass.INCOMPLETE_OUTPUT,
-                        ErrorClass.STAGE_DEADLINE_EXCEEDED,
                     }:
                         raise
                     self._event(
@@ -504,8 +493,6 @@ class FluxFold:
                 user_prompt=linking_input(new_memories, candidates),
                 adapter=TypeAdapter(LinkingStageOutput),
                 temperature=self.config.linking_temperature,
-                request_timeout=self.config.linking_request_timeout_seconds,
-                stage_deadline=self.config.linking_stage_deadline_seconds,
                 validator=validate_initial,
             ),
         )
@@ -538,8 +525,6 @@ class FluxFold:
                 ),
                 adapter=TypeAdapter(LinkingStageOutput),
                 temperature=self.config.linking_temperature,
-                request_timeout=self.config.linking_request_timeout_seconds,
-                stage_deadline=self.config.linking_stage_deadline_seconds,
                 validator=validate_final,
             ),
         )
@@ -789,8 +774,6 @@ class FluxFold:
                 user_prompt=review_input(snapshot),
                 adapter=TypeAdapter(ReviewStageOutput),
                 temperature=self.config.review_temperature,
-                request_timeout=self.config.review_request_timeout_seconds,
-                stage_deadline=self.config.review_stage_deadline_seconds,
                 validator=validate_first,
             ),
         )
@@ -812,8 +795,6 @@ class FluxFold:
                     user_prompt=review_input(snapshot, provenance),
                     adapter=TypeAdapter(ReviewStageOutput),
                     temperature=self.config.review_temperature,
-                    request_timeout=self.config.review_request_timeout_seconds,
-                    stage_deadline=self.config.review_stage_deadline_seconds,
                     validator=validate_final,
                 ),
             )
@@ -925,8 +906,6 @@ class FluxFold:
                 user_prompt=split_input(snapshot),
                 adapter=TypeAdapter(SplitStageOutput),
                 temperature=self.config.split_temperature,
-                request_timeout=self.config.split_request_timeout_seconds,
-                stage_deadline=self.config.split_stage_deadline_seconds,
                 validator=validate,
             ),
         )
@@ -1098,32 +1077,21 @@ class FluxFold:
         user_prompt: str,
         adapter: TypeAdapter[Any],
         temperature: float,
-        request_timeout: float,
-        stage_deadline: float,
         validator: Callable[[Any], None],
     ) -> Any:
         started = time.monotonic()
-        failed_output = ""
         current_input = user_prompt
         for attempt in range(self.config.structured_output_max_retries + 1):
-            remaining = stage_deadline - (time.monotonic() - started)
-            if remaining <= 0:
-                raise StageFailure(
-                    stage, ErrorClass.STAGE_DEADLINE_EXCEEDED, "stage deadline exceeded"
-                )
+            failed_output = ""
             try:
-                response = await asyncio.wait_for(
-                    self._generation.generate(
-                        GenerationRequest(
-                            stage,
-                            system_prompt,
-                            current_input,
-                            temperature,
-                            min(request_timeout, remaining),
-                            self._benchmark_seed,
-                        )
-                    ),
-                    timeout=min(request_timeout, remaining),
+                response = await self._generation.generate(
+                    GenerationRequest(
+                        stage=stage,
+                        system_prompt=system_prompt,
+                        user_prompt=current_input,
+                        temperature=temperature,
+                        seed=self._benchmark_seed,
+                    )
                 )
                 failed_output = response.text
                 raw = _parse_json_object(response.text)
@@ -1139,13 +1107,6 @@ class FluxFold:
                     request_id=response.request_id,
                 )
                 return value
-            except TimeoutError as error:
-                provider_error = ProviderError(
-                    ErrorClass.TRANSIENT_TRANSPORT, "request timeout"
-                )
-                raise StageFailure(
-                    stage, provider_error.error_class, str(provider_error)
-                ) from error
             except ProviderError as error:
                 if error.error_class not in {
                     ErrorClass.INVALID_STRUCTURED_OUTPUT,
@@ -1154,25 +1115,26 @@ class FluxFold:
                     raise StageFailure(
                         stage, error.error_class, error.message
                     ) from error
-                validation_message = error.message
+                output_error: Exception = error
             except (
                 json.JSONDecodeError,
                 PydanticValidationError,
                 ValidationError,
             ) as error:
-                validation_message = str(error)
+                output_error = error
+            feedback = validation_feedback(output_error)
             self._event(
                 "structured_output_retry",
                 severity="warning",
                 stage=stage,
                 attempt=attempt + 1,
-                reason=validation_message,
+                reason=feedback,
             )
             if attempt >= self.config.structured_output_max_retries:
                 raise StageFailure(
-                    stage, ErrorClass.INVALID_STRUCTURED_OUTPUT, validation_message
+                    stage, ErrorClass.INVALID_STRUCTURED_OUTPUT, feedback
                 )
-            current_input = repair_input(user_prompt, failed_output, validation_message)
+            current_input = repair_input(user_prompt, failed_output, feedback)
         raise AssertionError("unreachable structured-output retry state")
 
     async def _embed_documents(self, texts: Sequence[str]) -> tuple[Any, ...]:
@@ -1285,6 +1247,49 @@ class FluxFold:
             raise ValidationError(
                 "generated subject summary is blank or exceeds character limit"
             )
+
+    def _audit_extraction(
+        self,
+        memory_space_id: str,
+        extraction: ExtractionOutput,
+        memory_refs: Sequence[str],
+        contents: Sequence[str],
+        linking: LinkingOutput,
+    ) -> dict[str, object]:
+        if extraction.result != "memories":
+            return extraction.model_dump(mode="json")
+        new_names = {
+            subject.subject_ref: subject.name for subject in linking.new_subjects
+        }
+        existing_ids = {
+            link.subject.subject_id
+            for link in linking.links
+            if link.subject.kind == "existing"
+        }
+        existing_names = {
+            subject_id: self._store.subject_snapshot(memory_space_id, subject_id).name
+            for subject_id in existing_ids
+        }
+        subjects_by_ref: dict[str, list[str]] = {
+            memory_ref: [] for memory_ref in memory_refs
+        }
+        for link in linking.links:
+            name = (
+                existing_names[link.subject.subject_id]
+                if link.subject.kind == "existing"
+                else new_names[link.subject.subject_ref]
+            )
+            subjects_by_ref[link.memory_ref].append(name)
+        return {
+            "result": "memories",
+            "memories": [
+                {
+                    "content": content,
+                    "subjects": subjects_by_ref[memory_ref],
+                }
+                for memory_ref, content in zip(memory_refs, contents, strict=True)
+            ],
+        }
 
     def _event(self, event_type: str, **fields: object) -> None:
         if self._event_sink is not None:

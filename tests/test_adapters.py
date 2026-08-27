@@ -85,3 +85,47 @@ def test_locomo_adapter_preserves_speakers_and_caption(tmp_path) -> None:
         "message_index": 0,
         "image_urls": ["https://example.invalid/bike.jpg"],
     }
+
+
+def test_locomo_adapter_accepts_one_based_session_indexes(tmp_path) -> None:
+    conversations = tmp_path / "conversations.json"
+    questions = tmp_path / "questions.json"
+    conversations.write_text(
+        json.dumps(
+            [
+                {
+                    "sample_id": "conv-26",
+                    "speaker_a": "Alice",
+                    "speaker_b": "Bob",
+                    "sessions": [
+                        {
+                            "session_index": 1,
+                            "messages": [{"speaker": "Alice", "text": "First."}],
+                        },
+                        {
+                            "session_index": 2,
+                            "messages": [{"speaker": "Bob", "text": "Second."}],
+                        },
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    questions.write_text(
+        json.dumps(
+            [
+                {
+                    "sample_id": "conv-26",
+                    "qa_id": "qa-1",
+                    "question": "What was first?",
+                    "answer": "First.",
+                    "category": "single-hop",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    space = load_locomo(conversations, questions)[0]
+    assert [episode.source_sequence for episode in space.episodes] == [1, 2]
+    assert space.episodes[0].source_key == "conv-26:1"

@@ -47,6 +47,8 @@ graph DB, vector DB, ANN index, BM25, rerankers, query rewriting.
 src/fluxfold/           # library core; must not import benchmark or adapter code
 tests/                  # pytest, mirrors src/fluxfold/ structure
 benchmarks/             # dataset adapters + runner; depends on the library, never the reverse
+data/                   # cloned LongMemEval and LoCoMo_refined; gitignored
+runs/                   # local benchmark artifacts; gitignored
 scripts/setup-dev.sh    # one-time local environment bootstrap
 pyproject.toml uv.lock .python-version LICENSE README.md .env.example
 design.md design_detailed.md background.md AGENTS.md AGENTS_CH.md

@@ -467,19 +467,22 @@ name、LLM 新生成 summary 和 memory content 超限时不得静默截断；�
 LLM 阶段参数如下：
 
 
-| 阶段                | temperature | top-p | 单次请求 timeout | 阶段 deadline |
-| ----------------- | ----------- | ----- | ------------ | ----------- |
-| memory extraction | 0.1         | 不传    | 180 秒        | 600 秒       |
-| subject linking   | 0.0         | 不传    | 90 秒         | 300 秒       |
-| Subject review    | 0.1         | 不传    | 180 秒        | 600 秒       |
-| Subject split     | 0.1         | 不传    | 240 秒        | 900 秒       |
+| 阶段                | temperature | top-p |
+| ----------------- | ----------- | ----- |
+| memory extraction | 0.1         | 不传    |
+| subject linking   | 0.0         | 不传    |
+| Subject review    | 0.1         | 不传    |
+| Subject split     | 0.1         | 不传    |
 
 
 所有阶段均不设置 `max_output_tokens`。普通运行不设置 seed；generation provider 支持 seed
 时，benchmark 使用 `42`。不设置全局或分阶段 LLM 并发上限，也不默认设置
 requests-per-minute 或 tokens-per-minute；即默认不设置 `requests_per_minute` 或
 `tokens_per_minute`。Generation provider/deployment profile 可按真实外部配额覆盖。不支持 temperature
-的 generation provider profile 省略该参数。
+的 generation provider profile 省略该参数。Memory Engine 不设置分阶段 request timeout、
+阶段 deadline，也不在 generation provider 外再包一层 timeout。连接和单次请求 timeout 由
+generation provider 的 transport 负责；timeout 归一化后在 provider 内执行下述 transport
+retry，耗尽后才把错误返回 Memory Engine。
 
 本文用 model provider 统称外部模型服务；调用 extraction、linking、review 和 split 的服务
 称为 generation provider，生成 retrieval 或 boundary vector 的服务称为 embedding provider。
@@ -500,7 +503,6 @@ SQLite 等数据库基础设施不属于 model provider。具体 provider adapte
 | `policy_rejected`                 | generation provider 因 safety 或 content policy 拒绝处理 | 不原样重试                                                                    | 当前 episode 或维护任务终态单项失败，pipeline 继续                             |
 | `invalid_structured_output`       | JSON、schema、字段长度、非法引用或业务不变量错误                      | 带校验错误执行 structured-output 修复重试                                           | 重试耗尽后当前 episode 或维护任务终态单项失败，pipeline 继续                        |
 | `incomplete_output`               | 无明确拒绝原因的空响应、截断输出或缺少必要字段                            | 按 structured-output 规则修复；若 finish reason 已表明 context 或 policy 原因，则改归相应类别 | 修复耗尽后当前 episode 或维护任务终态单项失败，pipeline 继续                        |
-| `stage_deadline_exceeded`         | 整个 LLM 阶段达到 deadline                               | 不再发起调用                                                                   | 保留最后一个已归一化根因及其作用范围；没有其他根因时，当前 item 终态单项失败                      |
 
 
 格式和业务均合法但事实错误或质量不理想的输出不自动重试。Extractor 明确返回“没有值得提取
@@ -516,16 +518,21 @@ SQLite 等数据库基础设施不属于 model provider。具体 provider adapte
 random(0, 1 second * 2^retry_index)
 ```
 
-`retry_index` 从 0 开始，provider 的有效 `Retry-After` 优先，但不能越过所属阶段 deadline
-继续占用调用。仅由一层执行 transport retry，使用 SDK 时关闭 SDK 的重复重试。
+`retry_index` 从 0 开始，provider 的有效 `Retry-After` 优先。仅由 generation provider
+执行 transport retry，使用 SDK 时关闭 SDK 的重复重试。
 
 `invalid_structured_output` 或 `incomplete_output` 在初次生成后最多额外重新生成 5 次，因此
 一次逻辑输出最多生成 6 次。每次重新生成中的传输失败仍独立遵守 transport retry；不设置
-跨 transport 与 structured-output 修复的 provider 调用总上限，但阶段 deadline 始终生效。
-JSON 解析、schema、非法引用、字段长度和业务不变量错误应把具体错误与合法 ID 集反馈给
-LLM，不能伪装成零结果或静默截断。反馈包含足以定位错误的原失败输出；只在上下文预算需要
-时裁剪，并保留与错误直接相关的部分。修复信息必须说明违反的约束以及合法输出应满足的
-形状，令 LLM 能针对原输出纠正。Subject split 无法形成合法语义分组时使用明确的
+跨 transport 与 structured-output 修复的 provider 调用总上限。每个结构化阶段的 system
+prompt 必须给出与程序校验一致的完整判别联合字段、嵌套结构、枚举值和少量合法示例，不能用
+`[...]` 代替关键契约。JSON 解析、schema、非法引用、字段长度和业务不变量错误不能伪装成
+零结果或静默截断。每次修复请求由原始阶段输入、仅紧邻上一次的失败输出、精简校验反馈和
+重新输出完整 JSON 对象的明确请求组成；不得嵌套此前的修复请求或累计更早输出。
+
+发送给 LLM 的 Pydantic 校验反馈把数组下标归一为 `[*]` 并折叠重复错误，最多保留 8 类、
+2,000 字符；单条说明最多 300 字符。JSON 语法错误只保留行列和解析原因，业务校验错误保留
+可操作的约束说明。若 provider 没有返回响应正文，明确标记无正文，不复用更早一次输出。
+Subject split 无法形成合法语义分组时使用明确的
 `defer_split` 结果；声称执行 split 却违反 schema 或业务不变量的输出仍按
 `invalid_structured_output` 修复。
 
@@ -616,8 +623,8 @@ instance 的不同位置出现时仍是不同 episode；正文相同但时间不
 
 - 实验版读取官方公开 `conversations.jsonl` 中的结构化 `sessions`，不使用已拼接的
 conversation-history 文本；每个 conversation 建立独立 memory space。
-- `sample_id` 与 session index 共同确定 `source_key`，session index 同时确定
-`source_sequence`。
+- 官方 `session_index` 是从 1 起的连续整数。`sample_id` 与该 index 共同确定
+`source_key`，该 index 同时作为 `source_sequence`。
 - `speaker_a` 映射为 user，`speaker_b` 映射为 assistant；保留稳定 speaker 身份和原始姓名；
 `dia_id` 与 message index 作为来源定位 metadata 保存，未知 speaker 不猜测角色。
 - Message text 保持为正文。非空 `blip_caption` 以明确标记的“数据集提供的图片描述”附加在
@@ -907,8 +914,14 @@ LoCoMo 的 10 个 conversations 分别建立 10 个 memory spaces，可同时构
 薄脚本，共六个可直接通过 `python -m benchmarks.scripts.<stage>_<mode>` 运行的模块。
 build 只构建数据库和写入审计产物；answer 从同一 run manifest 和数据库执行 public
 search 并生成官方字段形状的 predictions；score 独立读取 predictions 生成逐题结果和汇总。
-stage 之间使用不可变 manifest 校验数据文件 hash、选择范围、配置签名、generation model、
-embedding signature 和 seed，不自动下载数据集。
+stage 之间使用不可变 manifest 校验数据文件 hash、选择范围、配置签名、
+embedding signature 和 seed。manifest 记录 build 使用的 generation model，供复盘写入侧；
+answer 和 score 各自读取独立的 generation provider 配置，不要求与 build model 相同。
+数据集由 `./scripts/setup-dev.sh` clone 到 `data/`：
+`LoCoMo_refined` 与 `LongMemEval` 来自其上游 Git 仓库，LongMemEval-S 的
+`longmemeval_s_cleaned.json` 另从 Hugging Face 下载。build 默认读取这些本地文件，可用
+`--data-path`、`--conversations-path`、`--questions-path` 覆盖；build/answer/score 运行时
+不下载数据集。Benchmark 脚本从仓库根目录加载 `.env`；进程里已经存在的环境变量优先。
 
 LoCoMo_refined sample 必须选择一个 conversation ID 或零基位置，并处理该 conversation 的
 全部 sessions 和全部 questions。LongMemEval-S sample 可以显式选择 question IDs；未指定时
@@ -916,9 +929,11 @@ LoCoMo_refined sample 必须选择一个 conversation ID 或零基位置，并�
 `single-session-assistant`、`single-session-preference`、`single-session-user` 和
 `temporal-reasoning` 的七个完整 evaluation instances。full mode 始终处理全部数据。
 
-write stages、benchmark QA answer 和 LLM judge 使用同一个 generation model 配置；retrieval
-embedding 使用独立 embedding model 配置。LongMemEval 输出 `question_id`/`hypothesis`，按
-其公开 rubric 进行等价答案 LLM 判断。LoCoMo_refined 输出 `qa_id`/`predicted_answer`，使用
+build、answer 和 score 分别从 `.env` 读取一组 generation provider 配置
+（`FLUXFOLD_BUILD_*`、`FLUXFOLD_ANSWER_*`、`FLUXFOLD_SCORE_*`，每组包含 `MODEL`、
+`API_KEY`、`BASE_URL`）；retrieval embedding 使用独立 embedding model 配置。
+LongMemEval 输出 `question_id`/`hypothesis`，按其公开 rubric 进行等价答案 LLM 判断。
+LoCoMo_refined 输出 `qa_id`/`predicted_answer`，使用
 根据公开指标说明独立实现的严格 LLM judge、token F1 和 BLEU-1；多个合法 reference 取最佳
 匹配。本仓库不导入或调用 LoCoMo_refined 的非商业许可 evaluator 源码。
 
@@ -927,9 +942,8 @@ embedding 使用独立 embedding model 配置。LongMemEval 输出 `question_id`
 探测，恢复后从最早未完成项目继续。`authentication_or_configuration`、没有恢复时间的
 `quota_exhausted`、`invalid_request` 或不可恢复的数据库配置/存储错误使 benchmark 进入
 配置阻塞，不能用定时 retry 代替人工修复。`invalid_structured_output`、
-`incomplete_output`、`context_overflow`、`policy_rejected` 或没有其他全局根因的
-`stage_deadline_exceeded` 只使对应 episode、维护任务或 QA item 成为终态失败，不暂停其他
-spaces，也不永久阻塞当前 space 的后续来源顺序。
+`incomplete_output`、`context_overflow` 或 `policy_rejected` 只使对应 episode、维护任务或
+QA item 成为终态失败，不暂停其他 spaces，也不永久阻塞当前 space 的后续来源顺序。
 
 第一版先完整实现 extraction、Subject linking、Subject review、Subject split 和 search，
 再执行正式实验；ablation study 留到以后。实验按配置直接报告各项结果，不选择优胜配置，
@@ -999,12 +1013,10 @@ prompt/completion/input/output 等 token 子类别；
 
 - extractor 实际读取的规范化 episode 内容，包括 message 顺序、speaker、role、已知来源
 时间和正文；不包含 dataset question、answer、evidence 等评测监督字段；
-- extraction 得到的全部 memory contents；如果结果是 `no_valuable_memory`，明确展示该
-语义结果；
+- extraction 得到的全部 memory contents，以及每条 memory 最终 link 到的 subject names；
+如果结果是 `no_valuable_memory`，明确展示该语义结果；
 - 本批新建 subjects 的 name 和初始 summary；
-- 每条 memory 最终 link 到的全部 subjects，以及每条 link 的 `direct` 或 `contextual`
-basis；
-- 已有 subject 在本批新增了哪些 links，以及本批原子提交的最终结果。
+- 本批原子提交的最终结果。
 
 memory unit 没有正式 name。日志为同一段落内的 memories 分配 `M1`、`M2` 等仅供阅读的
 短标签，并同时展示完整 content；短标签不能保存为领域字段或跨操作身份，跨段落引用使用
@@ -1078,10 +1090,9 @@ retrieval signature 和目标实体下的全部向量，每批最多 8,192 行�
 
 ### 1.4 LLM 结构化输出参考草图
 
-本节只记录四个记忆构建阶段的结构化输出形状，帮助实现时保持已经确定的语义边界。它们
-不是最终 JSON Schema 或 public API；实际字段命名、判别联合的编码方式、generation provider 原生
-structured-output 适配和校验库可以在写代码时调整，只要不改变 1.2 节定义的行为与不变量。
-各阶段的完整 prompt 也在实现时结合所选模型和 generation provider 确定。
+本节记录四个记忆构建阶段当前使用的精确结构化输出契约。它们不是 public API，但字段名、
+判别联合编码和枚举值必须与程序校验及 system prompt 一致；修改契约时三处同步修改。Prompt
+可以补充模型相关说明，但不得省略本节的完整结构和合法示例。
 
 #### 1.4.1 Memory extraction
 
@@ -1117,6 +1128,7 @@ Extraction 使用判别结果明确区分提取成功与“没有有价值的记
 
 ```json
 {
+  "result": "links",
   "new_subjects": [
     {
       "subject_ref": "new_subject_1",
@@ -1148,7 +1160,7 @@ Extraction 使用判别结果明确区分提取成功与“没有有价值的记
 返回覆盖整个批次的最终 linking 结果：
 
 ```json
-{"action": "association_search", "query": "possible relationship or impact direction"}
+{"result": "association_search", "query": "possible relationship or impact direction"}
 ```
 
 程序校验所有临时引用、已有 IDs、每条 memory 的 direct link 和 link 数量约束，并在应用前
@@ -1542,9 +1554,8 @@ provider；成功后解除阻塞。不可恢复的数据库 schema、文件权�
 
 `invalid_structured_output` 和 `incomplete_output` 完成 structured-output 修复后，受影响的
 episode 或维护任务成为终态单项失败并继续；`context_overflow`、`policy_rejected` 和永久
-输入错误直接成为终态单项失败。`stage_deadline_exceeded` 保留最后一个归一化根因；没有
-临时暂停或配置阻塞根因时仅终止当前 item。以上单项失败都不触发全局暂停，也不能反向拒绝
-已经成功 durable add 的交互。
+输入错误直接成为终态单项失败。以上单项失败都不触发全局暂停，也不能反向拒绝已经成功
+durable add 的交互。
 
 正式版使用按需启动、队列排空后退出的本地 worker，不依赖 Hook、MCP、CLI 或 TUI 中任一
 进程长期存活。Hook 完成 durable add、创建 flush request 或其他入口发现 pending 工作时，

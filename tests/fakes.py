@@ -251,7 +251,9 @@ class FakeEmbeddingProvider:
 
 
 def _original_json(prompt: str) -> dict[str, object]:
-    original = prompt.split("\n\nYour previous output failed validation.", 1)[0]
+    original = prompt.split(
+        "\n\nYour immediately previous response failed validation.", 1
+    )[0]
     value = json.loads(original)
     assert isinstance(value, dict)
     return value

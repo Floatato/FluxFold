@@ -45,6 +45,8 @@ ANN 索引、BM25、reranker、query 改写。
 src/fluxfold/           # library core；不得 import benchmark 或 adapter 代码
 tests/                  # pytest，目录结构对应 src/fluxfold/
 benchmarks/             # dataset adapters + runner；依赖 library，不可反向依赖
+data/                   # clone 的 LongMemEval 与 LoCoMo_refined；gitignored
+runs/                   # 本地 benchmark 产物；gitignored
 scripts/setup-dev.sh    # 一次性本地环境 bootstrap
 pyproject.toml uv.lock .python-version LICENSE README.md .env.example
 design.md design_detailed.md background.md AGENTS.md AGENTS_CH.md

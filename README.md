@@ -2,25 +2,24 @@
 
 FluxFold is an experimental agent-memory library that spends LLM cost on the write path and keeps the read path as exact vector search. Memories are grouped into bounded `subject`s which can be reviewed and split as they grow.
 
-The experimental version implements memory extraction, batch subject linking, optional association search, subject review and split, SQLite persistence, embedding-model rebuilds, and structured `search`. It also includes benchmark adapters and staged runners for LongMemEval-S and LoCoMo_refined. It is not production-ready and does not include a product CLI, TUI, connector, daemon, or network service.
+The experimental version is a Python library with adapters and runners for LongMemEval-S and LoCoMo_refined. It is not production-ready and has no product CLI, TUI, connector, daemon, or network service.
 
-## Requirements and setup
+## Requirements
 
-- Python 3.12 or newer
+- Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
+- `git` and `curl`
+
+## Setup
 
 ```bash
 ./scripts/setup-dev.sh
 ```
 
-For an existing environment, run `uv sync`. The standard checks are:
+Already have the environment:
 
 ```bash
-uv run ruff format --check .
-uv run ruff check .
-uv run mypy src/fluxfold
-uv run pytest
-uv build
+uv sync
 ```
 
 ## Library usage
@@ -81,35 +80,36 @@ asyncio.run(main())
 
 ## Benchmarks
 
-Copy the variable names from `.env.example` into your shell environment. The generation variables configure all write stages, QA answering, and judging; embedding variables are separate. Dataset files are supplied as local paths and are never downloaded automatically.
+```bash
+mkdir -p data
+git clone --depth 1 https://github.com/mem-eval-suite/LoCoMo_refined.git data/LoCoMo_refined
+git clone --depth 1 https://github.com/xiaowu0162/LongMemEval.git data/LongMemEval
+mkdir -p data/LongMemEval/data
+curl -L --fail -o data/LongMemEval/data/longmemeval_s_cleaned.json \
+  https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json
 
-Each benchmark is split into build, answer, and score stages. A LongMemEval-S stratified sample selects one full instance from each of its seven categories by default:
+cp .env.example .env
+```
+
+Fill the empty values in `.env` for the three generation groups (`FLUXFOLD_BUILD_*`,
+`FLUXFOLD_ANSWER_*`, `FLUXFOLD_SCORE_*`) and the embedding provider, then:
 
 ```bash
 uv run python -m benchmarks.scripts.build_sample \
   --dataset longmemeval \
-  --data-path /data/longmemeval_s_cleaned.json \
   --run-dir runs/longmemeval-sample
 uv run python -m benchmarks.scripts.answer_sample --run-dir runs/longmemeval-sample
 uv run python -m benchmarks.scripts.score_sample --run-dir runs/longmemeval-sample
-```
 
-LoCoMo_refined sample mode requires one conversation ID or zero-based conversation index and processes all its sessions and questions:
-
-```bash
 uv run python -m benchmarks.scripts.build_sample \
   --dataset locomo_refined \
-  --conversations-path /data/conversations.jsonl \
-  --questions-path /data/questions.jsonl \
   --select conv-26 \
   --run-dir runs/locomo-sample
 uv run python -m benchmarks.scripts.answer_sample --run-dir runs/locomo-sample
 uv run python -m benchmarks.scripts.score_sample --run-dir runs/locomo-sample
 ```
 
-Replace `_sample` with `_full` for complete datasets; full build scripts do not accept `--select`. Optional policy overrides are read from a TOML file passed as `--config`, with values under `[fluxfold]`.
-
-Each run directory contains the SQLite database, immutable manifest, checkpoint, JSONL event and prediction files, complete Markdown build audit, search evidence, per-question scores, and JSON/Markdown summaries. Re-running a stage uses or validates the existing manifest; use a new run directory for a distinct run or configuration.
+Replace `_sample` with `_full` for complete datasets. Optional `--config` TOML overrides go under `[fluxfold]`.
 
 ## Design
 

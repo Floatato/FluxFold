@@ -21,6 +21,7 @@ def _episode(key: str, content: str, sequence: int = 0) -> NormalizedEpisode:
 def test_add_search_replay_and_source_conflict(tmp_path) -> None:
     async def scenario() -> None:
         generation = FakeGenerationProvider()
+        events: list[dict[str, object]] = []
         engine = await FluxFold.open(
             db_path=str(tmp_path / "engine.sqlite3"),
             generation_provider=generation,
@@ -31,6 +32,7 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
                 search_subject_min_similarity=-1.0,
                 search_memory_min_similarity=-1.0,
             ),
+            event_sink=events.append,
         )
         space = await engine.create_or_open_space("test:alice")
         first = await engine.add(
@@ -39,6 +41,20 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
         assert first.memories_created == 1
         assert first.subjects_created == 1
         assert first.links_created == 1
+        decision = next(
+            event for event in events if event["event_type"] == "audit_episode_decision"
+        )
+        assert "links" not in decision
+        assert "memories" not in decision
+        assert decision["extraction"] == {
+            "result": "memories",
+            "memories": [
+                {
+                    "content": "Alice likes hiking.",
+                    "subjects": ["Alice's hiking"],
+                }
+            ],
+        }
 
         replay = await engine.add(
             space.memory_space_id, _episode("session-1", "Alice likes hiking.")
@@ -73,6 +89,7 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
 def test_existing_subject_append_triggers_review(tmp_path) -> None:
     async def scenario() -> None:
         generation = FakeGenerationProvider()
+        events: list[dict[str, object]] = []
         engine = await FluxFold.open(
             db_path=str(tmp_path / "review.sqlite3"),
             generation_provider=generation,
@@ -82,6 +99,7 @@ def test_existing_subject_append_triggers_review(tmp_path) -> None:
                 memory_candidate_min_similarity=-1.0,
                 subject_review_new_memory_threshold=1,
             ),
+            event_sink=events.append,
         )
         space = await engine.create_or_open_space("test:review")
         await engine.add(
@@ -95,6 +113,16 @@ def test_existing_subject_append_triggers_review(tmp_path) -> None:
         assert (
             engine.space_statistics(space.memory_space_id)["subject_review_count"] == 1
         )
+        decisions = [
+            event for event in events if event["event_type"] == "audit_episode_decision"
+        ]
+        assert decisions[1]["extraction"]["memories"] == [
+            {
+                "content": "Alice bought boots.",
+                "subjects": ["Alice's hiking"],
+            }
+        ]
+        assert decisions[1]["new_subjects"] == []
         await engine.close()
 
     asyncio.run(scenario())

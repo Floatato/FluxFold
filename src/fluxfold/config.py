@@ -51,17 +51,9 @@ class FluxFoldConfig:
     search_memory_min_similarity: float = 0.35
     search_memory_attached_subject_k: int = 1
     extraction_temperature: float = 0.1
-    extraction_request_timeout_seconds: float = 180
-    extraction_stage_deadline_seconds: float = 600
     linking_temperature: float = 0.0
-    linking_request_timeout_seconds: float = 90
-    linking_stage_deadline_seconds: float = 300
     review_temperature: float = 0.1
-    review_request_timeout_seconds: float = 180
-    review_stage_deadline_seconds: float = 600
     split_temperature: float = 0.1
-    split_request_timeout_seconds: float = 240
-    split_stage_deadline_seconds: float = 900
     transport_max_retries: int = 5
     embedding_transport_max_retries: int = 5
     structured_output_max_retries: int = 5

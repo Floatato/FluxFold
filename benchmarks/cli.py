@@ -21,11 +21,18 @@ from benchmarks.runner import (
     load_dataset_from_manifest,
     score_run,
 )
-from benchmarks.runtime import load_config
+from benchmarks.runtime import (
+    DEFAULT_LOCOMO_CONVERSATIONS_PATH,
+    DEFAULT_LOCOMO_QUESTIONS_PATH,
+    DEFAULT_LONGMEMEVAL_PATH,
+    load_config,
+    load_project_env,
+)
 from fluxfold.errors import ValidationError
 
 
 def main(stage: str, *, sample: bool, argv: Sequence[str] | None = None) -> None:
+    load_project_env()
     parser = _parser(stage, sample=sample)
     arguments = parser.parse_args(argv)
     config = load_config(arguments.config)
@@ -85,11 +92,18 @@ def _parser(stage: str, *, sample: bool) -> argparse.ArgumentParser:
         required=True,
         choices=("longmemeval", "locomo_refined"),
     )
-    parser.add_argument("--data-path", help="LongMemEval-S JSON or JSONL file.")
     parser.add_argument(
-        "--conversations-path", help="LoCoMo_refined conversations file."
+        "--data-path",
+        help="LongMemEval-S JSON or JSONL file. Defaults to the cloned dataset under data/.",
     )
-    parser.add_argument("--questions-path", help="LoCoMo_refined questions file.")
+    parser.add_argument(
+        "--conversations-path",
+        help="LoCoMo_refined conversations file. Defaults to the cloned dataset under data/.",
+    )
+    parser.add_argument(
+        "--questions-path",
+        help="LoCoMo_refined questions file. Defaults to the cloned dataset under data/.",
+    )
     if sample:
         parser.add_argument(
             "--select",
@@ -105,20 +119,41 @@ def _build_selection(
 ) -> tuple[str, tuple[BenchmarkSpace, ...], tuple[str, ...]]:
     dataset = str(arguments.dataset)
     if dataset == "longmemeval":
-        if not arguments.data_path:
-            raise ValidationError("--data-path is required for LongMemEval")
-        data_paths = (str(Path(arguments.data_path).resolve()),)
+        data_paths = (
+            str(
+                _existing_data_file(
+                    arguments.data_path or str(DEFAULT_LONGMEMEVAL_PATH),
+                    "LongMemEval-S dataset",
+                )
+            ),
+        )
         spaces = load_longmemeval(data_paths[0])
     else:
-        if not arguments.conversations_path or not arguments.questions_path:
-            raise ValidationError(
-                "--conversations-path and --questions-path are required for LoCoMo_refined"
-            )
         data_paths = (
-            str(Path(arguments.conversations_path).resolve()),
-            str(Path(arguments.questions_path).resolve()),
+            str(
+                _existing_data_file(
+                    arguments.conversations_path
+                    or str(DEFAULT_LOCOMO_CONVERSATIONS_PATH),
+                    "LoCoMo_refined conversations",
+                )
+            ),
+            str(
+                _existing_data_file(
+                    arguments.questions_path or str(DEFAULT_LOCOMO_QUESTIONS_PATH),
+                    "LoCoMo_refined questions",
+                )
+            ),
         )
         spaces = load_locomo(*data_paths)
     if sample:
         spaces = select_sample(dataset, spaces, tuple(arguments.select))
     return dataset, spaces, data_paths
+
+
+def _existing_data_file(path: str, label: str) -> Path:
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file():
+        raise ValidationError(
+            f"{label} is missing: {resolved}. Run ./scripts/setup-dev.sh to clone datasets."
+        )
+    return resolved

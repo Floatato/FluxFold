@@ -172,7 +172,10 @@ def load_locomo(
                 )
             )
         episodes.sort(key=lambda item: item.source_sequence)
-        if [item.source_sequence for item in episodes] != list(range(len(episodes))):
+        sequences = [item.source_sequence for item in episodes]
+        if not sequences or sequences != list(
+            range(sequences[0], sequences[0] + len(sequences))
+        ):
             raise ValidationError(
                 f"LoCoMo session indexes are not contiguous: {sample_id}"
             )

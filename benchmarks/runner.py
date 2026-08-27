@@ -16,7 +16,6 @@ from benchmarks.artifacts import ArtifactWriter, RunPaths, append_jsonl
 from benchmarks.runtime import (
     dataset_hash,
     embedding_provider,
-    generation_model_id,
     generation_provider,
 )
 from benchmarks.scoring import score_predictions
@@ -37,7 +36,7 @@ async def build_run(
     config: FluxFoldConfig,
 ) -> None:
     writer = ArtifactWriter(run_paths)
-    generation = generation_provider(config)
+    generation = generation_provider(config, stage="build")
     embedding = embedding_provider(config)
     selected_ids = [space.source_id for space in spaces]
     existing_manifest = (
@@ -59,7 +58,7 @@ async def build_run(
         "dataset_hash": dataset_hash(data_paths),
         "selected_space_ids": selected_ids,
         "config_signature": config.signature,
-        "generation_model": generation.model_id,
+        "build_model": generation.model_id,
         "embedding_model": asdict(embedding.model_info),
         "benchmark_seed": config.benchmark_seed,
         "source_timezone_convention": "UTC",
@@ -222,7 +221,7 @@ async def answer_run(
     _validate_manifest(run_paths, dataset, spaces, config)
     _remove_if_exists(run_paths.predictions)
     _remove_if_exists(run_paths.search_results)
-    generation = generation_provider(config)
+    generation = generation_provider(config, stage="answer")
     embedding = embedding_provider(config)
     engine = await FluxFold.open(
         db_path=str(run_paths.database),
@@ -314,7 +313,7 @@ async def score_run(
     _validate_manifest(run_paths, dataset, spaces, config)
     predictions = _load_predictions(run_paths.predictions, dataset)
     questions = tuple(question for space in spaces for question in space.questions)
-    generation = generation_provider(config)
+    generation = generation_provider(config, stage="score")
     try:
         scores, summary = await score_predictions(
             dataset=dataset,
@@ -331,7 +330,7 @@ async def score_run(
     for score in scores:
         append_jsonl(run_paths.scores, score)
     writer = ArtifactWriter(run_paths)
-    summary["generation_model"] = generation_model_id()
+    summary["score_model"] = generation.model_id
     writer.write_json(run_paths.score_summary, summary)
     run_paths.score_markdown.write_text(_summary_markdown(summary), encoding="utf-8")
 
@@ -371,8 +370,6 @@ def _validate_manifest(
         raise ValidationError("dataset does not match build manifest")
     if manifest["config_signature"] != config.signature:
         raise ValidationError("configuration does not match build manifest")
-    if manifest["generation_model"] != generation_model_id():
-        raise ValidationError("generation model does not match build manifest")
     if list(manifest["selected_space_ids"]) != [space.source_id for space in spaces]:
         raise ValidationError("space selection does not match build manifest")
 
@@ -411,7 +408,6 @@ async def _add_with_item_retry(
         ErrorClass.POLICY_REJECTED,
         ErrorClass.INVALID_STRUCTURED_OUTPUT,
         ErrorClass.INCOMPLETE_OUTPUT,
-        ErrorClass.STAGE_DEADLINE_EXCEEDED,
     }
     for retry_index in range(config.benchmark_failure_max_retries + 1):
         try:
@@ -538,7 +534,7 @@ def _summary_markdown(summary: dict[str, object]) -> str:
         f"# {summary['dataset']} score",
         "",
         f"Evaluator: `{summary['evaluator']}`",
-        f"Generation model: `{summary['generation_model']}`",
+        f"Score model: `{summary['score_model']}`",
         "",
         "| Category | Count | Accuracy | F1 | BLEU-1 |",
         "| --- | ---: | ---: | ---: | ---: |",

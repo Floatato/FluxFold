@@ -12,6 +12,7 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 from openai import (
+    NOT_GIVEN,
     APIConnectionError,
     APIStatusError,
     APITimeoutError,
@@ -31,8 +32,8 @@ class GenerationRequest:
     system_prompt: str
     user_prompt: str
     temperature: float
-    timeout_seconds: float
     seed: int | None = None
+    timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,7 +128,11 @@ class OpenAICompatibleGenerationProvider:
                     ],
                     temperature=request.temperature,
                     seed=request.seed,
-                    timeout=request.timeout_seconds,
+                    timeout=(
+                        request.timeout_seconds
+                        if request.timeout_seconds is not None
+                        else NOT_GIVEN
+                    ),
                 )
                 choice = response.choices[0]
                 if choice.finish_reason == "length":

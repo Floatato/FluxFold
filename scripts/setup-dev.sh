@@ -32,6 +32,34 @@ else
     uv sync
 fi
 
+echo "==> Fetching benchmark datasets"
+if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+    echo "git and curl are required to fetch benchmark datasets" >&2
+    exit 1
+fi
+mkdir -p "${ROOT}/data"
+if [[ ! -d "${ROOT}/data/LoCoMo_refined/.git" ]]; then
+    git clone --depth 1 https://github.com/mem-eval-suite/LoCoMo_refined.git \
+        "${ROOT}/data/LoCoMo_refined"
+else
+    echo "    LoCoMo_refined already cloned"
+fi
+if [[ ! -d "${ROOT}/data/LongMemEval/.git" ]]; then
+    git clone --depth 1 https://github.com/xiaowu0162/LongMemEval.git \
+        "${ROOT}/data/LongMemEval"
+else
+    echo "    LongMemEval already cloned"
+fi
+LONGMEMEVAL_S="${ROOT}/data/LongMemEval/data/longmemeval_s_cleaned.json"
+if [[ ! -f "${LONGMEMEVAL_S}" ]]; then
+    mkdir -p "$(dirname "${LONGMEMEVAL_S}")"
+    echo "    Downloading LongMemEval-S"
+    curl -L --fail --retry 3 --retry-delay 2 -o "${LONGMEMEVAL_S}" \
+        https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json
+else
+    echo "    LongMemEval-S already present"
+fi
+
 echo "==> Running quality checks"
 uv run ruff format --check .
 uv run ruff check .

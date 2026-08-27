@@ -161,9 +161,9 @@ FluxFold 采用 Python 3.12 及以上版本、`uv`、单 package 和 `src` layou
 - `uv.lock` 应提交到版本控制，以复现本地开发和 CI 环境。
 - FluxFold 作为单个 Python distribution 开发；现阶段不拆分 core、CLI 或其他子 package，也不建立 workspace。
 - 可导入 package 使用 `src/fluxfold/` 目录，公共 import 名称为 `fluxfold`。
-- 实验版运行时依赖包括 NumPy，用于 SQLite 之上的精确向量扫描；不暴露 CLI entry point，也不加入 Typer 或 Textual。
+- 实验版运行时依赖包括 NumPy，用于 SQLite 之上的精确向量扫描；以及 `socksio`，供 OpenAI 兼容 HTTP 客户端在 SOCKS 代理下工作。不暴露 CLI entry point，也不加入 Typer 或 Textual。
 - 第一版正式版仍使用同一个 distribution：通过 `pyproject.toml` 的 `[project.scripts]` 暴露 `fluxfold` 命令，并加入 Typer 与 Textual。
-- 首次建立本地开发环境时运行 `scripts/setup-dev.sh`：安装 `.python-version` 指定的 Python、按 `uv.lock` 同步环境，并执行与日常开发相同的质量检查和 `uv build`。该脚本只负责一次性 bootstrap，不是任务运行器；日常开发仍直接使用 `uv run`。
+- 首次建立本地开发环境时运行 `scripts/setup-dev.sh`：安装 `.python-version` 指定的 Python、按 `uv.lock` 同步环境、将 `LoCoMo_refined` 与 `LongMemEval` clone 到 `data/` 并下载 LongMemEval-S，然后执行与日常开发相同的质量检查和 `uv build`。该脚本只负责一次性 bootstrap，不是任务运行器；日常开发仍直接使用 `uv run`。
 
 
 
@@ -212,17 +212,16 @@ FluxFold 采用 Python 3.12 及以上版本、`uv`、单 package 和 `src` layou
 ### README 当前定位
 
 - repository 根目录使用英文 `README.md` 作为面对使用者和新贡献者的项目入口；架构讨论和决策细节继续以本文件为准。
-- 初始 README 只包含：项目定位、当前 early-development 状态、核心能力概览、Python/uv prerequisites、开发环境建立方式、质量检查与构建命令，以及指向 `design.md` 的链接。
-- 在 API 尚未实现前，不写无法运行的安装/使用示例，不宣称尚未通过 benchmark 验证的性能、准确率或兼容能力。
-- 出现第一个可运行的 `add`/`search` vertical slice 后，再加入经过测试的 minimal usage；Claude Code connector 可用后，再加入安装和验证步骤。
+- README 包含：项目定位、setup、library 最小用法、benchmark 数据集 clone 与运行命令，以及设计文档入口。不写脚本内部步骤、质量检查清单或 provider 字段说明。
+- 不宣称尚未通过 benchmark 验证的性能、准确率或兼容能力。
 - 当 README 因 API reference、connector 指南、配置说明或运维内容变得难以浏览时，将细节迁移到 `docs/`，README 只保留入口和最短路径。
 
 
 
 ### `.gitignore` 边界
 
-- `.gitignore` 只排除可再生成的构建/缓存文件、本地环境、编辑器状态、coverage 产物和本地 secret files，不排除源码、测试、配置模板、`uv.lock` 或 migration files。
-- 初始规则覆盖 `.venv/`、`__pycache__/`、`*.py[cod]`、`.pytest_cache/`、`.mypy_cache/`、`.ruff_cache/`、`.coverage`、`coverage.xml`、`htmlcov/`、`build/`、`dist/`、`*.egg-info/`、`.env`、`.env.*`、`.DS_Store`、`.idea/` 和 `.vscode/`。
+- `.gitignore` 只排除可再生成的构建/缓存文件、本地环境、编辑器状态、coverage 产物、本地 secret files、clone 到 `data/` 的第三方 benchmark 数据集，以及本地 benchmark run 产物 `runs/`；不排除源码、测试、配置模板、`uv.lock` 或 migration files。
+- 初始规则覆盖 `.venv/`、`__pycache__/`、`*.py[cod]`、`.pytest_cache/`、`.mypy_cache/`、`.ruff_cache/`、`.coverage`、`coverage.xml`、`htmlcov/`、`build/`、`dist/`、`*.egg-info/`、`.env`、`.env.*`、`/data/`、`/runs/`、`.DS_Store`、`.idea/` 和 `.vscode/`。
 - 允许提交不含真实 secret 的 `.env.example`；ignore 规则对 `.env.*` 使用 `!.env.example` 例外。`uv.lock` 和 `.python-version` 必须提交。
 - FluxFold 的实际用户记忆和 model provider credentials 不得进入 repository。其本地存储路径确定后，再为该明确路径增加 ignore rule，不预先用宽泛规则隐藏可能应提交的 fixtures 或 examples。
 

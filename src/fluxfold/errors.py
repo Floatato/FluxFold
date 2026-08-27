@@ -39,7 +39,6 @@ class ErrorClass(StrEnum):
     POLICY_REJECTED = "policy_rejected"
     INVALID_STRUCTURED_OUTPUT = "invalid_structured_output"
     INCOMPLETE_OUTPUT = "incomplete_output"
-    STAGE_DEADLINE_EXCEEDED = "stage_deadline_exceeded"
 
 
 @dataclass(frozen=True, slots=True)

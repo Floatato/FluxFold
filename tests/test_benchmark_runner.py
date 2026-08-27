@@ -41,11 +41,13 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
         search_subject_min_similarity=-1.0,
         search_memory_min_similarity=-1.0,
     )
-    monkeypatch.setenv("FLUXFOLD_GENERATION_MODEL", "fake-generation")
+    monkeypatch.setenv("FLUXFOLD_BUILD_MODEL", "fake-generation")
+    monkeypatch.setenv("FLUXFOLD_ANSWER_MODEL", "fake-generation")
+    monkeypatch.setenv("FLUXFOLD_SCORE_MODEL", "fake-generation")
     generation = FakeGenerationProvider(extraction_delay_seconds=0.01)
     monkeypatch.setattr(
         "benchmarks.runner.generation_provider",
-        lambda ignored_config: generation,
+        lambda ignored_config, **_kwargs: generation,
     )
     monkeypatch.setattr(
         "benchmarks.runner.embedding_provider",
@@ -70,9 +72,12 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
 
     asyncio.run(scenario())
     assert paths.database.is_file()
+    manifest = json.loads(paths.manifest.read_text(encoding="utf-8"))
+    assert manifest["build_model"] == "fake-generation"
     prediction = json.loads(paths.predictions.read_text(encoding="utf-8"))
     assert prediction == {"question_id": "q-1", "hypothesis": "Alice likes hiking."}
     summary = json.loads(paths.score_summary.read_text(encoding="utf-8"))
     assert summary["overall"]["accuracy"] == 1.0
+    assert summary["score_model"] == "fake-generation"
     assert paths.score_markdown.is_file()
     assert generation.max_active_extractions > 1
