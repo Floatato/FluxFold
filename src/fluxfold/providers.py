@@ -29,9 +29,9 @@ from fluxfold.errors import ErrorClass, ProviderError
 @dataclass(frozen=True, slots=True)
 class GenerationRequest:
     stage: str
-    system_prompt: str
     user_prompt: str
     temperature: float
+    system_prompt: str | None = None
     seed: int | None = None
     timeout_seconds: float | None = None
 
@@ -122,10 +122,14 @@ class OpenAICompatibleGenerationProvider:
             try:
                 response = await self._client.chat.completions.create(
                     model=self._model,
-                    messages=[
-                        {"role": "system", "content": request.system_prompt},
-                        {"role": "user", "content": request.user_prompt},
-                    ],
+                    messages=(
+                        [
+                            {"role": "system", "content": request.system_prompt},
+                            {"role": "user", "content": request.user_prompt},
+                        ]
+                        if request.system_prompt
+                        else [{"role": "user", "content": request.user_prompt}]
+                    ),
                     temperature=request.temperature,
                     seed=request.seed,
                     timeout=(

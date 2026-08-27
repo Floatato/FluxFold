@@ -214,7 +214,7 @@ class FakeGenerationProvider:
         elif request.stage == "benchmark_answer":
             text = self.benchmark_answer
         elif request.stage == "benchmark_judge":
-            text = "YES Correct."
+            text = '{"label": "CORRECT"}' if '"label"' in request.user_prompt else "yes"
         else:
             raise AssertionError(f"unexpected generation stage: {request.stage}")
         return GenerationResponse(text=text, total_tokens=10, request_id="fake-request")

@@ -95,21 +95,18 @@ Fill the empty values in `.env` for the three generation groups (`FLUXFOLD_BUILD
 `FLUXFOLD_ANSWER_*`, `FLUXFOLD_SCORE_*`) and the embedding provider, then:
 
 ```bash
-uv run python -m benchmarks.scripts.build_sample \
-  --dataset longmemeval \
-  --run-dir runs/longmemeval-sample
-uv run python -m benchmarks.scripts.answer_sample --run-dir runs/longmemeval-sample
-uv run python -m benchmarks.scripts.score_sample --run-dir runs/longmemeval-sample
+uv run python -m benchmarks.scripts.build_sample --dataset longmemeval
+uv run python -m benchmarks.scripts.answer_sample --dataset longmemeval
+uv run python -m benchmarks.scripts.score_sample --dataset longmemeval
 
 uv run python -m benchmarks.scripts.build_sample \
   --dataset locomo_refined \
-  --select conv-26 \
-  --run-dir runs/locomo-sample
-uv run python -m benchmarks.scripts.answer_sample --run-dir runs/locomo-sample
-uv run python -m benchmarks.scripts.score_sample --run-dir runs/locomo-sample
+  --select conv-26
+uv run python -m benchmarks.scripts.answer_sample --dataset locomo_refined
+uv run python -m benchmarks.scripts.score_sample --dataset locomo_refined
 ```
 
-Replace `_sample` with `_full` for complete datasets. Optional `--config` TOML overrides go under `[fluxfold]`.
+`build` without `--run-dir` creates `runs/{dataset}_{month}.{day}_{HH:MM}_{seq}` using local time, for example `runs/longmemeval_8.27_21:02_1`. A second build in the same minute becomes `_2`. `answer` and `score` without `--run-dir` use the latest run of that dataset and mode. Pass `--run-dir` to override. Replace `_sample` with `_full` for complete datasets. Optional `--config` TOML overrides go under `[fluxfold]`.
 
 ## Design
 

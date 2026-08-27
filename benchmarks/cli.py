@@ -15,6 +15,12 @@ from benchmarks.adapters import (
     select_sample,
 )
 from benchmarks.artifacts import RunPaths
+from benchmarks.run_dirs import (
+    DATASETS,
+    allocate_run_dir,
+    display_run_dir,
+    latest_run_dir,
+)
 from benchmarks.runner import (
     answer_run,
     build_run,
@@ -36,7 +42,7 @@ def main(stage: str, *, sample: bool, argv: Sequence[str] | None = None) -> None
     parser = _parser(stage, sample=sample)
     arguments = parser.parse_args(argv)
     config = load_config(arguments.config)
-    run_paths = RunPaths(Path(arguments.run_dir).resolve())
+    run_paths = RunPaths(_resolve_run_dir(stage, arguments, sample=sample))
     if stage == "build":
         dataset, spaces, data_paths = _build_selection(arguments, sample=sample)
         asyncio.run(
@@ -83,15 +89,26 @@ def _parser(stage: str, *, sample: bool) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=f"FluxFold {stage} stage ({'sample' if sample else 'full'} run)."
     )
-    parser.add_argument("--run-dir", required=True, help="Run artifact directory.")
+    parser.add_argument(
+        "--run-dir",
+        help=(
+            "Run artifact directory. When omitted, build creates "
+            "runs/{dataset}_{month}.{day}_{HH:MM}_{seq}; answer and score use the "
+            "latest run of the same dataset and mode."
+        ),
+    )
     parser.add_argument("--config", help="Optional TOML configuration file.")
-    if stage != "build":
-        return parser
     parser.add_argument(
         "--dataset",
-        required=True,
-        choices=("longmemeval", "locomo_refined"),
+        required=stage == "build",
+        choices=DATASETS,
+        help=(
+            "Dataset name. Required for build; required for answer/score when "
+            "--run-dir is omitted."
+        ),
     )
+    if stage != "build":
+        return parser
     parser.add_argument(
         "--data-path",
         help="LongMemEval-S JSON or JSONL file. Defaults to the cloned dataset under data/.",
@@ -157,3 +174,20 @@ def _existing_data_file(path: str, label: str) -> Path:
             f"{label} is missing: {resolved}. Run ./scripts/setup-dev.sh to clone datasets."
         )
     return resolved
+
+
+def _resolve_run_dir(
+    stage: str, arguments: argparse.Namespace, *, sample: bool
+) -> Path:
+    if arguments.run_dir:
+        return Path(arguments.run_dir).resolve()
+    dataset = arguments.dataset
+    if not dataset:
+        raise ValidationError("--dataset is required when --run-dir is omitted")
+    mode = "sample" if sample else "full"
+    if stage == "build":
+        path = allocate_run_dir(dataset)
+    else:
+        path = latest_run_dir(dataset, mode=mode)
+    print(f"run-dir: {display_run_dir(path)}", flush=True)
+    return path.resolve()

@@ -256,20 +256,12 @@ async def answer_run(
                     memory_space.memory_space_id, question.question
                 )
                 search_latency = time.perf_counter() - started
-                date_context = (
-                    f"\nQuestion date: {question.question_date}"
-                    if question.question_date
-                    else ""
-                )
-                prompt = (
-                    "Answer the question using only the FluxFold search result. Be concise and include every required fact. "
-                    "If the result is insufficient, explicitly say that the available information is insufficient."
-                    f"{date_context}\nQuestion: {question.question}\n\nFluxFold search result:\n{result.render()}"
+                prompt = _answer_user_prompt(
+                    dataset, question.question, question.question_date, result.render()
                 )
                 response = await generation.generate(
                     GenerationRequest(
                         stage="benchmark_answer",
-                        system_prompt="You answer long-term memory questions from retrieved evidence only.",
                         user_prompt=prompt,
                         temperature=0.0,
                         timeout_seconds=config.benchmark_search_sample_timeout_seconds,
@@ -496,6 +488,40 @@ def _write_build_checkpoint(
                 key: value for key, value in sorted(last_episode_by_space.items())
             },
         },
+    )
+
+
+def _answer_user_prompt(
+    dataset: str, question: str, question_date: str | None, search_text: str
+) -> str:
+    if dataset == "longmemeval":
+        date_line = f"Current Date: {question_date}\n" if question_date else ""
+        return (
+            "I will give you retrieved memories. Please answer the question based on "
+            "the relevant memories. Include every required fact. If the memories are "
+            "insufficient, say that the available information is insufficient.\n\n"
+            f"Retrieved memories:\n\n{search_text}\n\n"
+            f"{date_line}Question: {question}\nAnswer:"
+        )
+    return (
+        "Based on the retrieved memories, write an answer in the form of a short "
+        "phrase. Answer with exact words from the memories whenever possible. Do not "
+        'add extra facts, explanations, or hedging words such as "around" or '
+        '"about".\n'
+        "Time:\n"
+        '- For "when" questions, answer with a date or relative time at the same '
+        "granularity as the evidence. Format calendar days as D Month YYYY (for "
+        'example "7 May 2023", not "07 May 2023" or "2023-05-07").\n'
+        '- If a memory uses a relative expression such as "yesterday", "last week", '
+        '"next month", or "the week before", resolve it against the date shown on '
+        "that memory when the question asks when an event happened.\n"
+        '- For "how long" or "how long ago" questions, copy the duration or relative '
+        "form from the memories. Do not convert relative forms into calendar dates or "
+        "the reverse unless the memories already state that form.\n"
+        "If the memories contain the answer, output it even if you must connect more "
+        'than one memory. Output "Not mentioned" only when the memories truly lack '
+        "the asked information.\n\n"
+        f"Question: {question}\n\nRetrieved memories:\n{search_text}\n\nShort answer:"
     )
 
 

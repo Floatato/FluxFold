@@ -934,8 +934,14 @@ LoCoMo 的 10 个 conversations 分别建立 10 个 memory spaces，可同时构
 保存 checkpoint。Benchmark runner 不提供完整 item 外层 retry；generation transport、
 embedding transport、structured-output repair 和 SQLite transaction 只执行各自所属操作内
 的有限重试。模型给出的结构和业务均有效但错误的答案不重试。一次 full 或 sample 脚本只
-执行一个 run；需要重复实验时调用方使用不同 run 目录手工重复执行。runner 不内置重复次数，
-也不跨 run 计算均值或标准差。
+执行一个 run。build 未指定 `--run-dir` 时，在 `runs/` 下创建
+`{dataset}_{月}.{日}_{HH:MM}_{seq}` 目录：时刻为本地墙钟时间，月日不补零、时分补零，
+同一分钟内多次 build 递增 seq，例如 `runs/longmemeval_8.27_21:02_1` 与
+`runs/longmemeval_8.27_21:02_2`。answer 与 score 未指定 `--run-dir` 时，使用同一
+dataset、同一 mode（sample 或 full）下按该命名解析出的最新目录；目录名无法解析、缺少
+manifest，或 manifest 的 dataset/mode 不匹配的项不参与选择。未指定 `--run-dir` 时必须
+提供 `--dataset`。需要指向特定 run 或恢复未完成的 build 时显式传入 `--run-dir`。
+runner 不内置重复次数，也不跨 run 计算均值或标准差。
 
 每套数据集提供 `build`、`answer`、`score` 三个独立 stage，并分别提供 full 与 sample
 薄脚本，共六个可直接通过 `python -m benchmarks.scripts.<stage>_<mode>` 运行的模块。
@@ -959,10 +965,9 @@ LoCoMo_refined sample 必须选择一个 conversation ID 或零基位置，并�
 build、answer 和 score 分别从 `.env` 读取一组 generation provider 配置
 （`FLUXFOLD_BUILD_*`、`FLUXFOLD_ANSWER_*`、`FLUXFOLD_SCORE_*`，每组包含 `MODEL`、
 `API_KEY`、`BASE_URL`）；retrieval embedding 使用独立 embedding model 配置。
-LongMemEval 输出 `question_id`/`hypothesis`，按其公开 rubric 进行等价答案 LLM 判断。
-LoCoMo_refined 输出 `qa_id`/`predicted_answer`，使用
-根据公开指标说明独立实现的严格 LLM judge、token F1 和 BLEU-1；多个合法 reference 取最佳
-匹配。本仓库不导入或调用 LoCoMo_refined 的非商业许可 evaluator 源码。
+LongMemEval 输出 `question_id`/`hypothesis`，使用官方 `evaluate_qa.py` 的 yes/no LLM judge prompt。
+LoCoMo_refined 输出 `qa_id`/`predicted_answer`，使用官方 `refined` LLM judge prompt、token F1 和 BLEU-1；多个合法 reference 取最佳
+匹配。answer 阶段按数据集选择 prompt：LoCoMo_refined 要求短短语、尽量使用记忆原文、保持时间粒度并把相对时间锚定到记忆日期；LongMemEval 要求覆盖全部所需事实，并在有 `question_date` 时写入 `Current Date`。检索结果渲染为 subject 分组，每条 memory 带上 `latest_source_at` 对应的日期（`D Month YYYY`）。
 
 除局部 Subject summary refresh 外，上述临时错误在所属操作内重试耗尽后暂停整个 benchmark
 记忆构建流水线；`rate_limited` 或
