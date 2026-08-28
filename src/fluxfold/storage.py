@@ -1784,6 +1784,33 @@ class Store:
             raise ValidationError("link count requested for an invalid memory")
         return {row["memory_id"]: row["n"] for row in rows}
 
+    def memory_active_direct_link_counts(
+        self,
+        memory_space_id: str,
+        memory_ids: Sequence[str],
+        *,
+        excluding_subject_id: str,
+    ) -> dict[str, int]:
+        if not memory_ids:
+            return {}
+        ids = tuple(memory_ids)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT u.memory_id,
+                    count(CASE WHEN l.link_basis = 'direct' AND l.subject_id != ? THEN 1 END) AS n
+                FROM memory_units u
+                LEFT JOIN subject_memory_links l
+                    ON l.memory_id = u.memory_id AND l.unlinked_at IS NULL
+                WHERE u.memory_space_id = ? AND u.memory_id IN ({_placeholders(ids)})
+                GROUP BY u.memory_id
+                """,
+                (excluding_subject_id, memory_space_id, *ids),
+            ).fetchall()
+        if len(rows) != len(ids):
+            raise ValidationError("link count requested for an invalid memory")
+        return {row["memory_id"]: row["n"] for row in rows}
+
     def space_statistics(self, memory_space_id: str) -> dict[str, int | float]:
         with self._connect() as connection:
             source_chars = connection.execute(

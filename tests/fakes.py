@@ -22,6 +22,7 @@ class FakeGenerationProvider:
         *,
         benchmark_answer: str = "Alice likes hiking.",
         split_result: str | None = None,
+        split_missing_direct_first: bool = False,
         association_search_once: bool = False,
         review_mode: str = "keep",
         extraction_delay_seconds: float = 0.0,
@@ -29,12 +30,14 @@ class FakeGenerationProvider:
     ) -> None:
         self.benchmark_answer = benchmark_answer
         self.split_result = split_result
+        self.split_missing_direct_first = split_missing_direct_first
         self.association_search_once = association_search_once
         self.review_mode = review_mode
         self.extraction_delay_seconds = extraction_delay_seconds
         self.always_new_subject = always_new_subject
         self.requests: list[GenerationRequest] = []
         self._association_requested = False
+        self._illegal_split_emitted = False
         self.active_extractions = 0
         self.max_active_extractions = 0
 
@@ -162,7 +165,39 @@ class FakeGenerationProvider:
             subject = payload["subject"]
             memories = subject["memories"]
             memory_ids = [memory["memory_id"] for memory in memories]
-            if self.split_result == "full_split":
+            if (
+                self.split_missing_direct_first
+                and not self._illegal_split_emitted
+                and len(memory_ids) >= 2
+            ):
+                self._illegal_split_emitted = True
+                first, second = memory_ids[0], memory_ids[1]
+                text = json.dumps(
+                    {
+                        "result": "full_split",
+                        "subjects": [
+                            {
+                                "subject_ref": "trails",
+                                "name": "Alice's hiking trails",
+                                "summary": "Alice's trail-related hiking memories.",
+                                "links": [
+                                    {"memory_id": first, "basis": "direct"},
+                                    {"memory_id": second, "basis": "contextual"},
+                                ],
+                            },
+                            {
+                                "subject_ref": "equipment",
+                                "name": "Alice's hiking equipment",
+                                "summary": "Alice's hiking equipment and preparation.",
+                                "links": [
+                                    {"memory_id": first, "basis": "direct"},
+                                    {"memory_id": second, "basis": "contextual"},
+                                ],
+                            },
+                        ],
+                    }
+                )
+            elif self.split_result == "full_split":
                 links = [
                     {"memory_id": memory_id, "basis": "direct"}
                     for memory_id in memory_ids

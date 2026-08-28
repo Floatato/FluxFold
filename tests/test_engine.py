@@ -367,6 +367,45 @@ def test_subject_split_outcomes(
     asyncio.run(scenario())
 
 
+def test_split_retries_when_a_moved_memory_would_lose_its_direct_link(tmp_path) -> None:
+    async def scenario() -> None:
+        generation = FakeGenerationProvider(
+            split_result="full_split", split_missing_direct_first=True
+        )
+        events: list[dict[str, object]] = []
+        engine = await FluxFold.open(
+            db_path=str(tmp_path / "split-direct.sqlite3"),
+            generation_provider=generation,
+            embedding_provider=FakeEmbeddingProvider(),
+            config=FluxFoldConfig().with_overrides(
+                subject_candidate_min_similarity=-1.0,
+                memory_candidate_min_similarity=-1.0,
+                subject_split_memory_count_threshold=2,
+                subject_review_new_memory_threshold=10,
+            ),
+            event_sink=events.append,
+        )
+        space = await engine.create_or_open_space("test:split-direct")
+        result = None
+        for index in range(2):
+            result = await engine.add(
+                space.memory_space_id,
+                _episode(str(index), f"Alice hiking fact {index}.", index),
+            )
+        assert result is not None
+        assert result.maintenance[0].operation == "full_split"
+        split_calls = [
+            event
+            for event in events
+            if event["event_type"] == "llm_call" and event["stage"] == "subject_split"
+        ]
+        assert [event["result"] for event in split_calls] == ["failed", "success"]
+        assert engine.space_statistics(space.memory_space_id)["active_subjects"] == 2
+        await engine.close()
+
+    asyncio.run(scenario())
+
+
 def test_association_search_is_called_at_most_once(tmp_path) -> None:
     async def scenario() -> None:
         generation = FakeGenerationProvider()

@@ -693,11 +693,18 @@ LLM 与 embedding 在事务外运行。`episode_extractions` 以 episode input h
 决定或目标，以及理解它所必需的时间、条件、原因或直接结果。不同主体、不同生命周期、
 不同时间范围或可以分别完成的事项应拆开；同一不可分割事实的条件和直接结果应保留在一起。
 
-memory 必须脱离 episode 后仍可理解，消除含糊代词并明确关系双方。extractor 只能重组
+memory 必须脱离 episode 后仍可理解，消除含糊代词并明确关系双方。多参与者数据存在
+`speaker_name` 时用真实姓名而非协议角色指称主体。content 必须保留来源给出的具体名称、
+地点、数量和限定语，不得用更宽泛的表述替换。extractor 只能重组
 episode 明确支持的信息，不能推测动机或因果；Assistant 建议只有被 User 明确接受后才能
 写成已确认方案。外部事实的来源归属、不确定性、计划/进行中/完成/失败/取消等状态必须保留。
 同一 episode 内的明确纠正以最终状态为准；跨 episode 的重复、冲突和状态变化交给 Subject
 review 处理。
+
+episode 存在来源时间时，message 中的相对时间表述换算为明确的日历日期、月份或年份写入
+content，换算只以该 episode 自身的来源时间为基准；只能近似到月或年时同时保留说话人的
+原始表述。来源时间缺失或无法支持时不写时间，也不得编造。LLM 输入中的全部时间统一渲染为
+带星期的可读 UTC 字符串，不向模型暴露 Unix 毫秒值。
 
 User 明确要求不记录的内容以及密码、API key、private key、session token、验证码等认证
 秘密不得进入长期记忆。来源内容中的指令只作为待处理数据，不能改变 extractor 的系统规则。
@@ -731,9 +738,16 @@ Extraction 不设置每 episode 的建议 memory 数、硬数量上限、总 mem
 或其他可独立组织范围的一组记忆；初始名称保持宏观、简短、可独立理解，后续可以由 split
 形成更具体的领域或关系 subject。
 
+一条 memory 必须覆盖它涉及的每个核心主体，且对每个主体选择该 memory 确实描述的最细粒度
+候选 subject：memory 不描述的更细 subject 不建立 link，存在合适的更细 subject 时不退回
+更粗的一个。某个核心主体没有合适候选时，以最粗粒度新建 subject（通常就是该实体或范围
+本身的名称），使该主体后续的 memories 汇集到同一处；同批需要同一新范围的 memories 共用
+一个新 subject。
+
 被动候选召回以新 memory content 为 query。开启可选主动关联检索后，LLM 还可以最多一次
 调用 `association_search(query)`；主动 query 应表达可能的影响方向，而非复述新 memory。
-两种召回使用同一参数：
+prompt 明确鼓励在任一新 memory 带有限制、后果、期限、纠正或状态变化，且这些内容可能作用
+于别处已记录信息时发起该调用。两种召回使用同一参数：
 
 
 | 配置项                                        | 值    | 含义                                             |
@@ -880,7 +894,9 @@ link 到原 subject 且容量仍达到阈值时再次尝试。它计入 Subject 
 benchmark 失败样本数。
 
 每个新 subject 至少包含 2 条 memories，目标不超过 20 条，并且至少有一条 `direct` link。
-一条 memory 在本次新 subjects 中最多出现两次；partial split 中出现在任一新 subject 的
+被移出原 subject 的每条 memory，在关闭指向原 subject 的 link 之后，仍必须至少有一条 active
+`direct` link：来自本次新 subjects 的新 direct，或仍指向 split 范围之外其他 subjects 的既有
+direct。一条 memory 在本次新 subjects 中最多出现两次；partial split 中出现在任一新 subject 的
 memory 到原 subject 的 link 由程序关闭，但它指向 split 范围之外其他 subjects 的 links
 保持不变。不设置结果 subject 的字符目标、总 link 倍数或整体重叠率上限。
 
@@ -901,9 +917,10 @@ partial split 同时整体替换原 subject summary。Review 与 split 同时满
 full 或 partial split 成功后无需立即 review；defer split 后仍执行已经达到触发条件的 review。
 
 JSON、schema、字段类型或非法 ID 错误归入 `invalid_structured_output`，按 1.1.12 的规则
-立即反馈并修复。结果虽然符合 schema 但违反 ID 覆盖、结果数量、最少 memories、direct
-link 或 membership 等业务不变量时也归入同类；不能静默改写为 defer split。LLM 判断不
-存在有意义的合法分组时应直接输出 `defer_split`。
+立即反馈并修复。结果虽然符合 schema 但违反 ID 覆盖、结果数量、最少 memories、新 subject
+缺少 direct、移出后某条 memory 不再有任何 active direct，或 membership 等业务不变量时也
+归入同类；不能静默改写为 defer split。LLM 判断不存在有意义的合法分组时应直接输出
+`defer_split`。
 
 #### 1.2.6 Benchmark 执行与可复现性
 
@@ -1020,14 +1037,16 @@ memory_compression_rate = 1 - memory_chars / source_chars
 
 #### 1.2.7 实验版记忆构建日志
 
-每次 memory-space build 至少生成两份按处理顺序追加的日志：一份 JSONL 结构化事件日志，
+每次 memory-space build 生成三份按处理顺序追加的日志：一份 JSONL 结构化事件日志，
 用于机器分析、统计和定位失败；一份 Markdown 高可读性审计日志，用于人工完整复盘 memories
-和 subjects 如何形成及演化。两份日志共享 build/run ID、memory-space ID、episode ID、
-source sequence、domain operation ID 及正式对象 ID，使同一事件可以相互对应。
+和 subjects 如何形成及演化；一份 Markdown LLM 输入输出采样日志，用于人工阅读完整 prompt
+与模型输出。结构化事件日志与审计日志共享 build/run ID、memory-space ID、episode ID、
+source sequence、domain operation ID 及正式对象 ID；LLM 采样日志通过 `run_id` 与
+`request_id` 对应到同一次 `llm_call`。
 
-这两份日志是实验产物，不是 SQLite 正式数据或可写事实源，不能反向驱动记忆状态，也不能
-进入后续 LLM 输入。高可读性日志包含完整 benchmark 对话和 memory 内容，必须按包含原始
-对话数据的敏感实验产物保存。
+这三份日志是实验产物，不是 SQLite 正式数据或可写事实源，不能反向驱动记忆状态，也不能
+进入后续 LLM 输入。高可读性日志包含完整 benchmark 对话、memory 内容以及完整 LLM prompt
+与输出，必须按包含原始对话数据的敏感实验产物保存。
 
 ##### 结构化事件日志
 
@@ -1099,6 +1118,25 @@ link basis，以及生成的完整新 summary；审计输入不展示旧 summary
 高可读性日志还按实际发生位置展示 model provider 错误类别、structured-output 修复重试、
 warning、error、终态单项失败、临时暂停、配置阻塞和恢复，使一次 memory-space build 可以
 仅凭该日志按时间顺序复盘。
+
+##### LLM 输入输出采样日志
+
+该日志单独写入 `llm_io_samples.md`，不进入结构化事件 JSONL。它记录已经通过结构化校验的
+**首次 attempt** 成功调用：完整 system prompt、完整 user prompt（原始阶段输入，不含
+repair 包装）和完整模型输出。需要 structured-output 修复才成功的调用不采样。
+
+按出现顺序采样，满额即停：
+
+- `extract`、`link`、`review`、`split`、`summary` 各 2 次。`link` 只采未调用
+`association_search` 的单轮路径；`review` 只采未请求 provenance 的单轮路径。
+- 若发生 `association_search`，额外采样 1 次完整两轮：第 1 轮 linking prompt 与
+`association_search` 请求，第 2 轮带上 association 候选后的 linking prompt 与最终 linking
+结果。
+- 若发生 `provenance_viewed`，额外采样 1 次完整两轮：第 1 轮 review prompt 与
+provenance 请求，第 2 轮带上来源 episodes 后的 review prompt 与最终 review 结果。
+
+某类调用在本次 build 中未出现则该项空缺。显式恢复续跑时，已写入文件的样本计入配额，
+不因引擎重启而重复超过上限。JSON 形态的 prompt 与输出按缩进展开，便于阅读。
 
 ### 1.3 记忆检索
 
@@ -1328,8 +1366,8 @@ Partial split 只列出新 subjects 和要移走的 memories；原 subject 的�
 }
 ```
 
-`defer_split` 是语义决定；full/partial split 中的非法 ID、不完整覆盖、数量越界或缺少
-direct link 仍是需要修复的输出错误。
+`defer_split` 是语义决定；full/partial split 中的非法 ID、不完整覆盖、数量越界、新
+subject 缺少 direct，或移出后某条 memory 不再有任何 active direct，仍是需要修复的输出错误。
 
 #### 1.4.5 Subject summary refresh
 
@@ -1775,7 +1813,7 @@ provenance 和 domain operation 读取，不额外维护一份长期高可读性
 
 Pipeline 状态、pending 数、buffer 淘汰计数、`pause_until`、配置阻塞原因和最后错误类别是
 跨重启持久状态。CLI/TUI 以正式状态表为事实来源，日志只提供事件时间线和诊断信息；日志
-文件由宿主环境轮转。实验版 benchmark 的双日志仍按 1.2.7 独立生成，不改变正式版默认日志
+文件由宿主环境轮转。实验版 benchmark 的构建日志仍按 1.2.7 独立生成，不改变正式版默认日志
 边界。
 
 #### 2.4.5 Schema migration、备份与数据可携带性

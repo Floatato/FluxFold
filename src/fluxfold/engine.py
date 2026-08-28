@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 import numpy as np
@@ -57,6 +58,7 @@ from fluxfold.prompts import (
     SUMMARY_REFRESH_SYSTEM,
     extraction_input,
     linking_input,
+    prompt_timestamp,
     repair_input,
     review_input,
     split_input,
@@ -81,7 +83,26 @@ from fluxfold.storage import (
 )
 
 EventSink = Callable[[dict[str, object]], None]
-T = TypeVar("T")
+
+LLM_IO_SAMPLE_QUOTAS: dict[str, int] = {
+    "extract": 2,
+    "link": 2,
+    "review": 2,
+    "split": 2,
+    "summary": 2,
+    "link_association_search": 1,
+    "review_provenance": 1,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _LlmTurn:
+    first_attempt: bool
+    stage: str
+    system_prompt: str
+    user_prompt: str
+    output: str
+    request_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +147,8 @@ class FluxFold:
         self._event_sink = event_sink
         self._benchmark_seed = benchmark_seed
         self._space_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._llm_io_sample_counts: Counter[str] = Counter()
+        self._llm_io_sample_lock = threading.Lock()
 
     @classmethod
     async def open(
@@ -219,17 +242,16 @@ class FluxFold:
                 (),
                 (),
             )
-        extraction = cast(
-            ExtractionOutput,
-            await self._structured_output(
-                stage="memory_extraction",
-                system_prompt=EXTRACTION_SYSTEM,
-                user_prompt=extraction_input(episode),
-                adapter=TypeAdapter(ExtractionOutput),
-                temperature=self.config.extraction_temperature,
-                validator=self._validate_extraction,
-            ),
+        extraction, extraction_turn = await self._structured_output(
+            stage="memory_extraction",
+            system_prompt=EXTRACTION_SYSTEM,
+            user_prompt=extraction_input(episode),
+            adapter=TypeAdapter(ExtractionOutput),
+            temperature=self.config.extraction_temperature,
+            validator=self._validate_extraction,
         )
+        extraction = cast(ExtractionOutput, extraction)
+        self._offer_llm_sample("extract", extraction_turn)
         self._event(
             "extraction_completed",
             memory_space_id=memory_space_id,
@@ -500,18 +522,17 @@ class FluxFold:
                 return
             self._validate_linking(value, memory_refs, legal_by_memory)
 
-        first = cast(
-            LinkingStageOutput,
-            await self._structured_output(
-                stage="subject_linking",
-                system_prompt=LINKING_SYSTEM,
-                user_prompt=linking_input(new_memories, candidate_view),
-                adapter=TypeAdapter(LinkingStageOutput),
-                temperature=self.config.linking_temperature,
-                validator=validate_initial,
-            ),
+        first, first_turn = await self._structured_output(
+            stage="subject_linking",
+            system_prompt=LINKING_SYSTEM,
+            user_prompt=linking_input(new_memories, candidate_view),
+            adapter=TypeAdapter(LinkingStageOutput),
+            temperature=self.config.linking_temperature,
+            validator=validate_initial,
         )
+        first = cast(LinkingStageOutput, first)
         if isinstance(first, LinkingOutput):
+            self._offer_llm_sample("link", first_turn)
             return first, _LinkingMetrics(len(passive_candidate_memory_ids), False, 0)
         association_vector = (await self._embed_queries([first.query]))[0]
         association_candidates, association_legal = self._recall_candidates(
@@ -529,24 +550,22 @@ class FluxFold:
         candidate_view, association_candidate_view = _candidate_prompt_views(
             candidates, association_candidates
         )
-        final = cast(
-            LinkingStageOutput,
-            await self._structured_output(
-                stage="subject_linking",
-                system_prompt=LINKING_SYSTEM,
-                user_prompt=linking_input(
-                    new_memories,
-                    candidate_view,
-                    {
-                        "query": first.query,
-                        "candidates_by_memory": association_candidate_view,
-                    },
-                ),
-                adapter=TypeAdapter(LinkingStageOutput),
-                temperature=self.config.linking_temperature,
-                validator=validate_final,
+        final, final_turn = await self._structured_output(
+            stage="subject_linking",
+            system_prompt=LINKING_SYSTEM,
+            user_prompt=linking_input(
+                new_memories,
+                candidate_view,
+                {
+                    "query": first.query,
+                    "candidates_by_memory": association_candidate_view,
+                },
             ),
+            adapter=TypeAdapter(LinkingStageOutput),
+            temperature=self.config.linking_temperature,
+            validator=validate_final,
         )
+        self._offer_llm_sample("link_association_search", first_turn, final_turn)
         return cast(LinkingOutput, final), _LinkingMetrics(
             len(passive_candidate_memory_ids | association_candidate_memory_ids),
             True,
@@ -597,7 +616,7 @@ class FluxFold:
                 memory_value: dict[str, object] = {
                     "memory_id": memory.memory_id,
                     "content": memory.content,
-                    "latest_source_at": memory.latest_source_at,
+                    "last_mentioned_at": prompt_timestamp(memory.latest_source_at),
                     "similarity": memory.similarity,
                     "source": "memory_channel",
                 }
@@ -827,17 +846,16 @@ class FluxFold:
             subject_id=subject_id,
             memory_count=len(snapshot.memories),
         )
-        output = cast(
-            SummaryRefreshOutput,
-            await self._structured_output(
-                stage="subject_summary_refresh",
-                system_prompt=SUMMARY_REFRESH_SYSTEM,
-                user_prompt=summary_refresh_input(snapshot),
-                adapter=TypeAdapter(SummaryRefreshOutput),
-                temperature=self.config.review_temperature,
-                validator=lambda value: self._validate_summary(value.summary),
-            ),
+        output, summary_turn = await self._structured_output(
+            stage="subject_summary_refresh",
+            system_prompt=SUMMARY_REFRESH_SYSTEM,
+            user_prompt=summary_refresh_input(snapshot),
+            adapter=TypeAdapter(SummaryRefreshOutput),
+            temperature=self.config.review_temperature,
+            validator=lambda value: self._validate_summary(value.summary),
         )
+        output = cast(SummaryRefreshOutput, output)
+        self._offer_llm_sample("summary", summary_turn)
         vector = (
             await self._embed_documents([_name_summary(snapshot.name, output.summary)])
         )[0]
@@ -953,17 +971,15 @@ class FluxFold:
                 return
             self._validate_review(value, snapshot)
 
-        first = cast(
-            ReviewStageOutput,
-            await self._structured_output(
-                stage="subject_review",
-                system_prompt=REVIEW_SYSTEM,
-                user_prompt=review_input(snapshot),
-                adapter=TypeAdapter(ReviewStageOutput),
-                temperature=self.config.review_temperature,
-                validator=validate_first,
-            ),
+        first, first_turn = await self._structured_output(
+            stage="subject_review",
+            system_prompt=REVIEW_SYSTEM,
+            user_prompt=review_input(snapshot),
+            adapter=TypeAdapter(ReviewStageOutput),
+            temperature=self.config.review_temperature,
+            validator=validate_first,
         )
+        first = cast(ReviewStageOutput, first)
         if isinstance(first, ProvenanceRequestOutput):
             provenance_viewed = True
             provenance = self._store.provenance_episodes(
@@ -975,20 +991,19 @@ class FluxFold:
                     raise ValidationError("provenance may only be requested once")
                 self._validate_review(value, snapshot)
 
-            final = cast(
-                ReviewStageOutput,
-                await self._structured_output(
-                    stage="subject_review",
-                    system_prompt=REVIEW_SYSTEM,
-                    user_prompt=review_input(snapshot, provenance),
-                    adapter=TypeAdapter(ReviewStageOutput),
-                    temperature=self.config.review_temperature,
-                    validator=validate_final,
-                ),
+            final, final_turn = await self._structured_output(
+                stage="subject_review",
+                system_prompt=REVIEW_SYSTEM,
+                user_prompt=review_input(snapshot, provenance),
+                adapter=TypeAdapter(ReviewStageOutput),
+                temperature=self.config.review_temperature,
+                validator=validate_final,
             )
+            self._offer_llm_sample("review_provenance", first_turn, final_turn)
             review = cast(ReviewOutput, final)
         else:
             provenance_viewed = False
+            self._offer_llm_sample("review", first_turn)
             review = first
         snapshots = {memory.memory_id: memory for memory in snapshot.memories}
         prepared_values: list[tuple[str, str, tuple[str, ...]]] = []
@@ -1087,17 +1102,16 @@ class FluxFold:
         def validate(value: SplitStageOutput) -> None:
             self._validate_split(memory_space_id, value, snapshot)
 
-        output = cast(
-            SplitStageOutput,
-            await self._structured_output(
-                stage="subject_split",
-                system_prompt=SPLIT_SYSTEM,
-                user_prompt=split_input(snapshot),
-                adapter=TypeAdapter(SplitStageOutput),
-                temperature=self.config.split_temperature,
-                validator=validate,
-            ),
+        output, split_turn = await self._structured_output(
+            stage="subject_split",
+            system_prompt=SPLIT_SYSTEM,
+            user_prompt=split_input(snapshot),
+            adapter=TypeAdapter(SplitStageOutput),
+            temperature=self.config.split_temperature,
+            validator=validate,
         )
+        output = cast(SplitStageOutput, output)
+        self._offer_llm_sample("split", split_turn)
         if isinstance(output, DeferSplitOutput):
             operation_id = self._store.record_deferred_split(
                 memory_space_id=memory_space_id,
@@ -1251,11 +1265,25 @@ class FluxFold:
         current_counts = self._store.memory_active_link_counts(
             memory_space_id, tuple(moved)
         )
+        remaining_direct = self._store.memory_active_direct_link_counts(
+            memory_space_id,
+            tuple(moved),
+            excluding_subject_id=snapshot.subject_id,
+        )
+        new_direct: Counter[str] = Counter()
+        for subject in subjects:
+            for link in subject.links:
+                if link.basis == "direct":
+                    new_direct[link.memory_id] += 1
         for memory_id, new_count in membership.items():
             final_count = current_counts[memory_id] - 1 + new_count
             if final_count > self.config.memory_active_subject_link_max:
                 raise ValidationError(
                     "split would exceed a memory's active link maximum"
+                )
+            if remaining_direct[memory_id] + new_direct[memory_id] < 1:
+                raise ValidationError(
+                    f"split would leave memory {memory_id} without a direct link"
                 )
 
     async def _structured_output(
@@ -1267,7 +1295,7 @@ class FluxFold:
         adapter: TypeAdapter[Any],
         temperature: float,
         validator: Callable[[Any], None],
-    ) -> Any:
+    ) -> tuple[Any, _LlmTurn]:
         started = time.monotonic()
         current_input = user_prompt
         for attempt in range(self.config.structured_output_max_retries + 1):
@@ -1296,7 +1324,14 @@ class FluxFold:
                     total_tokens=response.total_tokens,
                     request_id=response.request_id,
                 )
-                return value
+                return value, _LlmTurn(
+                    first_attempt=attempt == 0,
+                    stage=stage,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    output=response.text,
+                    request_id=response.request_id,
+                )
             except ProviderError as error:
                 if error.error_class not in {
                     ErrorClass.INVALID_STRUCTURED_OUTPUT,
@@ -1506,6 +1541,28 @@ class FluxFold:
                 for memory_ref, content in zip(memory_refs, contents, strict=True)
             ],
         }
+
+    def _offer_llm_sample(self, kind: str, *turns: _LlmTurn) -> None:
+        if self._event_sink is None or any(not turn.first_attempt for turn in turns):
+            return
+        with self._llm_io_sample_lock:
+            if self._llm_io_sample_counts[kind] >= LLM_IO_SAMPLE_QUOTAS[kind]:
+                return
+            self._llm_io_sample_counts[kind] += 1
+        self._event(
+            "llm_io_sample",
+            kind=kind,
+            rounds=[
+                {
+                    "stage": turn.stage,
+                    "request_id": turn.request_id,
+                    "system_prompt": turn.system_prompt,
+                    "user_prompt": turn.user_prompt,
+                    "output": turn.output,
+                }
+                for turn in turns
+            ],
+        )
 
     def _event(self, event_type: str, **fields: object) -> None:
         if self._event_sink is not None:

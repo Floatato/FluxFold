@@ -3,12 +3,34 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from fluxfold.engine import LLM_IO_SAMPLE_QUOTAS
 from fluxfold.models import AddResult, NormalizedEpisode
+
+_LLM_IO_SAMPLE_HEADING = re.compile(r"^## ([a-z_]+) · sample (\d+)\s*$")
+_LLM_IO_SAMPLE_HEADER = """# LLM I/O samples
+
+Sampled first-attempt structured-output successes: the complete system prompt, user prompt, and model output.
+
+Quotas: extract, link (no `association_search`), review (no `provenance_viewed`), split, and summary ×2. Two-round `association_search` and `provenance_viewed` paths are sampled once each if they occur.
+
+"""
+_TWO_ROUND_TITLES = {
+    "link_association_search": (
+        "Round 1 — association_search request",
+        "Round 2 — final linking decision",
+    ),
+    "review_provenance": (
+        "Round 1 — provenance request",
+        "Round 2 — final review decision",
+    ),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +52,10 @@ class RunPaths:
     @property
     def audit(self) -> Path:
         return self.root / "build_audit.md"
+
+    @property
+    def llm_io_samples(self) -> Path:
+        return self.root / "llm_io_samples.md"
 
     @property
     def checkpoint(self) -> Path:
@@ -71,14 +97,19 @@ class ArtifactWriter:
         self._failed_llm_calls = 0
         self._llm_tokens = 0
         self._terminal_failures = 0
+        self._llm_io_sample_counts = _llm_io_sample_counts(paths.llm_io_samples)
         if paths.events.exists():
             for line in paths.events.read_text(encoding="utf-8").splitlines():
                 if line.strip():
                     self._count_event(json.loads(line))
 
     def event(self, event: dict[str, object]) -> None:
+        event_type = str(event.get("event_type", ""))
+        if event_type == "llm_io_sample":
+            self._accept_llm_io_sample(event)
+            return
         with self._lock:
-            if str(event.get("event_type", "")).startswith("audit_"):
+            if event_type.startswith("audit_"):
                 memory_space_id = str(event["memory_space_id"])
                 self._pending_audit.setdefault(memory_space_id, []).append(event)
                 return
@@ -88,6 +119,29 @@ class ArtifactWriter:
             with self.paths.events.open("a", encoding="utf-8") as handle:
                 handle.write(
                     json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
+                )
+
+    def _accept_llm_io_sample(self, event: dict[str, object]) -> None:
+        kind = str(event["kind"])
+        rounds = event["rounds"]
+        assert isinstance(rounds, list)
+        with self._lock:
+            if self._llm_io_sample_counts[kind] >= LLM_IO_SAMPLE_QUOTAS[kind]:
+                return
+            self._llm_io_sample_counts[kind] += 1
+            index = self._llm_io_sample_counts[kind]
+            path = self.paths.llm_io_samples
+            if not path.exists():
+                path.write_text(_LLM_IO_SAMPLE_HEADER, encoding="utf-8")
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    _render_llm_io_sample(
+                        kind,
+                        index,
+                        tuple(rounds),
+                        run_id=self.run_id,
+                        timestamp_ms=event.get("timestamp_ms"),
+                    )
                 )
 
     def audit_episode(
@@ -211,3 +265,92 @@ class ArtifactWriter:
 def append_jsonl(path: Path, value: dict[str, object]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _llm_io_sample_counts(path: Path) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    if not path.exists():
+        return counts
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = _LLM_IO_SAMPLE_HEADING.match(line)
+        if match is not None:
+            counts[match.group(1)] += 1
+    return counts
+
+
+def _render_llm_io_sample(
+    kind: str,
+    index: int,
+    rounds: tuple[object, ...],
+    *,
+    run_id: str | None,
+    timestamp_ms: object,
+) -> str:
+    lines = [f"## {kind} · sample {index}", ""]
+    if run_id is not None:
+        lines.append(f"- run_id: `{run_id}`")
+    if timestamp_ms is not None:
+        lines.append(f"- timestamp_ms: `{timestamp_ms}`")
+    titles = _TWO_ROUND_TITLES.get(kind)
+    for position, round_payload in enumerate(rounds):
+        assert isinstance(round_payload, dict)
+        if titles is not None:
+            lines.extend(["", f"### {titles[position]}", ""])
+        request_id = round_payload.get("request_id")
+        stage = round_payload.get("stage")
+        meta: list[str] = []
+        if stage is not None:
+            meta.append(f"- stage: `{stage}`")
+        if request_id is not None:
+            meta.append(f"- request_id: `{request_id}`")
+        if meta:
+            lines.extend([*meta, ""])
+        heading_prefix = "#### " if titles is not None else "### "
+        lines.extend(
+            _prompt_section(
+                f"{heading_prefix}System prompt",
+                str(round_payload["system_prompt"]),
+            )
+        )
+        lines.extend(
+            _prompt_section(
+                f"{heading_prefix}User prompt",
+                str(round_payload["user_prompt"]),
+            )
+        )
+        lines.extend(
+            _prompt_section(
+                f"{heading_prefix}Model output",
+                str(round_payload["output"]),
+            )
+        )
+    lines.extend(["---", "", ""])
+    return "\n".join(lines)
+
+
+def _prompt_section(heading: str, text: str) -> list[str]:
+    rendered, language = _pretty_json_if_possible(text)
+    return [heading, "", _markdown_fence(rendered, language), ""]
+
+
+def _pretty_json_if_possible(text: str) -> tuple[str, str]:
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return text, ""
+    return json.dumps(value, ensure_ascii=False, indent=2), "json"
+
+
+def _markdown_fence(text: str, language: str) -> str:
+    longest = 0
+    current = 0
+    for char in text:
+        if char == "`":
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    ticks = "`" * max(3, longest + 1)
+    body = text if text.endswith("\n") else f"{text}\n"
+    opener = f"{ticks}{language}\n" if language else f"{ticks}\n"
+    return f"{opener}{body}{ticks}"

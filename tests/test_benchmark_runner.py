@@ -128,6 +128,10 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
     assert summary["overall"]["accuracy"] == 1.0
     assert summary["score_model"] == "fake-generation"
     assert paths.score_markdown.is_file()
+    assert paths.llm_io_samples.is_file()
+    sample_text = paths.llm_io_samples.read_text(encoding="utf-8")
+    assert "## extract · sample 1" in sample_text
+    assert "You are a memory extractor." in sample_text
     assert generation.max_active_extractions > 1
     build_summary = json.loads(paths.build_summary.read_text(encoding="utf-8"))
     assert build_summary["successful_llm_call_count"] > 0
