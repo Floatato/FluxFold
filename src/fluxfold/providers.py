@@ -39,6 +39,8 @@ class GenerationRequest:
 @dataclass(frozen=True, slots=True)
 class GenerationResponse:
     text: str
+    input_tokens: int
+    output_tokens: int
     total_tokens: int
     request_id: str | None = None
 
@@ -158,9 +160,19 @@ class OpenAICompatibleGenerationProvider:
                         "provider returned an empty completion",
                         request_id=response.id,
                     )
-                total_tokens = response.usage.total_tokens if response.usage else 0
+                usage = response.usage
+                if usage is None:
+                    input_tokens = 0
+                    output_tokens = 0
+                    total_tokens = 0
+                else:
+                    input_tokens = usage.prompt_tokens
+                    output_tokens = usage.completion_tokens or 0
+                    total_tokens = usage.total_tokens
                 return GenerationResponse(
                     text=content,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
                     total_tokens=total_tokens,
                     request_id=response.id,
                 )

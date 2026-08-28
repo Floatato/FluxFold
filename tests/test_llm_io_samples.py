@@ -78,7 +78,7 @@ def test_extract_link_and_summary_are_sampled_twice(tmp_path) -> None:
                 "Alice hikes on weekends.",
             )
         ):
-            await engine.add(
+            await engine.add_episode(
                 space.memory_space_id, _episode(str(index), content, index)
             )
         assert [event["kind"] for event in _samples(events, "extract")] == [
@@ -120,7 +120,7 @@ def test_review_without_provenance_is_sampled_twice(tmp_path) -> None:
                 "Alice hikes on weekends.",
             )
         ):
-            await engine.add(
+            await engine.add_episode(
                 space.memory_space_id, _episode(str(index), content, index)
             )
         reviews = _samples(events, "review")
@@ -150,7 +150,7 @@ def test_split_is_sampled_twice(tmp_path) -> None:
         for space_name in ("one", "two"):
             space = await engine.create_or_open_space(f"test:split-{space_name}")
             for index in range(2):
-                await engine.add(
+                await engine.add_episode(
                     space.memory_space_id,
                     _episode(
                         f"{space_name}-{index}",
@@ -176,11 +176,11 @@ def test_association_search_records_both_rounds(tmp_path) -> None:
             tmp_path, name="association", generation=generation, events=events
         )
         space = await engine.create_or_open_space("test:association")
-        await engine.add(
+        await engine.add_episode(
             space.memory_space_id, _episode("one", "Alice likes hiking.", 0)
         )
         generation.association_search_once = True
-        await engine.add(
+        await engine.add_episode(
             space.memory_space_id, _episode("two", "Alice bought boots.", 1)
         )
         assert len(_samples(events, "link")) == 1
@@ -214,10 +214,10 @@ def test_provenance_viewed_records_both_rounds(tmp_path) -> None:
             subject_review_new_memory_threshold=1,
         )
         space = await engine.create_or_open_space("test:provenance")
-        await engine.add(
+        await engine.add_episode(
             space.memory_space_id, _episode("one", "Alice likes hiking.", 0)
         )
-        await engine.add(
+        await engine.add_episode(
             space.memory_space_id, _episode("two", "Alice bought boots.", 1)
         )
         assert _samples(events, "review") == []
@@ -251,7 +251,7 @@ def test_repaired_success_is_not_sampled(tmp_path) -> None:
         )
         space = await engine.create_or_open_space("test:repair")
         for index in range(2):
-            await engine.add(
+            await engine.add_episode(
                 space.memory_space_id,
                 _episode(str(index), f"Alice hiking fact {index}.", index),
             )
@@ -299,7 +299,7 @@ def test_artifact_writer_renders_readable_samples_and_enforces_quota(tmp_path) -
                     "request_id": "req-3",
                     "system_prompt": "Review the subject.",
                     "user_prompt": '{"requested_provenance":{"m1":[]}}',
-                    "output": '{"result":"review","updates":[],"retirements":[],"summary":"ok"}',
+                    "output": '{"result":"review","updates":[],"retirements":[]}',
                 },
             ],
         }

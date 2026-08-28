@@ -95,7 +95,9 @@ class ArtifactWriter:
         self._pending_audit: dict[str, list[dict[str, object]]] = {}
         self._successful_llm_calls = 0
         self._failed_llm_calls = 0
-        self._llm_tokens = 0
+        self._llm_input_tokens = 0
+        self._llm_output_tokens = 0
+        self._llm_total_tokens = 0
         self._terminal_failures = 0
         self._llm_io_sample_counts = _llm_io_sample_counts(paths.llm_io_samples)
         if paths.events.exists():
@@ -197,13 +199,17 @@ class ArtifactWriter:
             return {
                 "successful_llm_call_count": self._successful_llm_calls,
                 "failed_llm_call_count": self._failed_llm_calls,
-                "write_llm_total_tokens": self._llm_tokens,
+                "build_llm_input_tokens": self._llm_input_tokens,
+                "build_llm_output_tokens": self._llm_output_tokens,
+                "build_llm_total_tokens": self._llm_total_tokens,
                 "terminal_failure_count": self._terminal_failures,
             }
 
     def _count_event(self, event: dict[str, object]) -> None:
         if event.get("event_type") == "llm_call":
-            self._llm_tokens += int(event.get("total_tokens", 0))
+            self._llm_input_tokens += int(event.get("input_tokens", 0))
+            self._llm_output_tokens += int(event.get("output_tokens", 0))
+            self._llm_total_tokens += int(event.get("total_tokens", 0))
             if event.get("result") == "success":
                 self._successful_llm_calls += 1
             elif event.get("result") == "failed":

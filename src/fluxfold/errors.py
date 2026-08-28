@@ -41,7 +41,7 @@ class ErrorClass(StrEnum):
     INCOMPLETE_OUTPUT = "incomplete_output"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class ProviderError(FluxFoldError):
     """A provider failure normalized for FluxFold retry policy."""
 
@@ -55,7 +55,7 @@ class ProviderError(FluxFoldError):
         return f"{self.error_class}: {self.message}"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class StageFailure(FluxFoldError):
     """A terminal failure of one pipeline stage."""
 

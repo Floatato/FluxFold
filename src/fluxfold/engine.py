@@ -9,7 +9,6 @@ import threading
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
-from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any, Literal, cast
 from uuid import uuid4
@@ -39,7 +38,6 @@ from fluxfold.models import (
     MemoriesExtraction,
     MemorySpace,
     NormalizedEpisode,
-    PartialSplitOutput,
     ProvenanceRequestOutput,
     ReplaceContent,
     ReplaceProvenance,
@@ -94,6 +92,15 @@ LLM_IO_SAMPLE_QUOTAS: dict[str, int] = {
     "review_provenance": 1,
 }
 
+EPISODE_TERMINAL_ERROR_CLASSES = frozenset(
+    {
+        ErrorClass.CONTEXT_OVERFLOW,
+        ErrorClass.POLICY_REJECTED,
+        ErrorClass.INVALID_STRUCTURED_OUTPUT,
+        ErrorClass.INCOMPLETE_OUTPUT,
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class _LlmTurn:
@@ -146,7 +153,13 @@ class FluxFold:
         self.config = config
         self._event_sink = event_sink
         self._benchmark_seed = benchmark_seed
-        self._space_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._space_extraction_locks: defaultdict[str, asyncio.Lock] = defaultdict(
+            asyncio.Lock
+        )
+        self._space_stateful_locks: defaultdict[str, asyncio.Lock] = defaultdict(
+            asyncio.Lock
+        )
+        self._space_pipeline_failures: dict[str, StageFailure] = {}
         self._llm_io_sample_counts: Counter[str] = Counter()
         self._llm_io_sample_lock = threading.Lock()
 
@@ -192,23 +205,37 @@ class FluxFold:
         return space
 
     async def delete_space(self, memory_space_id: str) -> None:
-        async with self._space_locks[memory_space_id]:
-            self._store.delete_space(memory_space_id)
+        async with self._space_extraction_locks[memory_space_id]:
+            async with self._space_stateful_locks[memory_space_id]:
+                self._store.delete_space(memory_space_id)
 
     async def clear_spaces(self) -> None:
         self._store.clear_spaces()
 
-    async def add(
+    async def add_episode(
         self,
         memory_space_id: str,
         episode: NormalizedEpisode,
         *,
         actor: str = "dataset",
     ) -> AddResult:
-        """Add one complete normalized dataset episode."""
+        """Extract and add one complete normalized episode to a memory space."""
 
-        prepared = await self._prepare_add(memory_space_id, episode, actor=actor)
-        return await self._commit_prepared_add(prepared)
+        try:
+            async with self._space_extraction_locks[memory_space_id]:
+                self._raise_if_pipeline_failed(memory_space_id)
+                prepared = await self._prepare_add(
+                    memory_space_id, episode, actor=actor
+                )
+            self._raise_if_pipeline_failed(memory_space_id)
+            return await self._commit_prepared_add(prepared)
+        except StageFailure as failure:
+            self._handle_episode_failure(memory_space_id, episode, failure)
+            raise
+        except ProviderError as error:
+            normalized = StageFailure("embedding", error.error_class, error.message)
+            self._handle_episode_failure(memory_space_id, episode, normalized)
+            raise normalized from error
 
     async def _prepare_add(
         self,
@@ -294,21 +321,17 @@ class FluxFold:
     async def _commit_prepared_add(self, prepared: _PreparedAdd) -> AddResult:
         memory_space_id = prepared.memory_space_id
         episode = prepared.episode
-        async with self._space_locks[memory_space_id]:
+        async with self._space_stateful_locks[memory_space_id]:
+            self._raise_if_pipeline_failed(memory_space_id)
             current = self._store.persist_episode(memory_space_id, episode)
             if current.extraction_completed:
                 replay_subject_ids = self._store.operation_active_subject_ids(
                     memory_space_id, current.completed_operation_id
                 )
-                replay_refresh_subject_ids = (
-                    self._store.operation_active_existing_subject_ids(
-                        memory_space_id, current.completed_operation_id
-                    )
-                )
                 maintenance = await self._complete_maintenance(
                     memory_space_id,
+                    cast(str, current.completed_operation_id),
                     replay_subject_ids,
-                    replay_refresh_subject_ids,
                     prepared.signature_id,
                     prepared.actor,
                 )
@@ -332,7 +355,7 @@ class FluxFold:
             memory_vectors = prepared.memory_vectors
             prepared_memories = prepared.prepared_memories
             if contents:
-                linking, linking_metrics = await self._link_batch(
+                linking, linking_metrics = await self._link_memories(
                     memory_space_id,
                     memory_refs,
                     contents,
@@ -358,7 +381,6 @@ class FluxFold:
                 prepared_links,
                 subject_touches,
                 affected_subject_ids,
-                summary_refresh_subject_ids,
             ) = await self._prepare_link_commit(
                 memory_space_id,
                 memory_refs,
@@ -406,8 +428,8 @@ class FluxFold:
             )
             maintenance = await self._complete_maintenance(
                 memory_space_id,
+                operation_id,
                 sorted(affected_subject_ids),
-                sorted(summary_refresh_subject_ids),
                 prepared.signature_id,
                 prepared.actor,
             )
@@ -421,15 +443,19 @@ class FluxFold:
                 tuple(maintenance),
             )
 
-    def record_episode_terminal_failure(
+    def _handle_episode_failure(
         self,
         memory_space_id: str,
         episode: NormalizedEpisode,
         failure: StageFailure,
     ) -> None:
-        """Persist a benchmark episode's deterministic terminal failure."""
-
         persisted = self._store.persist_episode(memory_space_id, episode)
+        if persisted.extraction_completed:
+            self._space_pipeline_failures[memory_space_id] = failure
+            return
+        if failure.error_class not in EPISODE_TERMINAL_ERROR_CLASSES:
+            self._space_pipeline_failures[memory_space_id] = failure
+            return
         self._store.record_episode_terminal_failure(
             memory_space_id=memory_space_id,
             episode_id=persisted.episode_id,
@@ -438,6 +464,20 @@ class FluxFold:
             error_class=failure.error_class.value,
             error_message=failure.message,
         )
+        if persisted.terminal_error_class is None:
+            self._event(
+                "episode_terminal_failure",
+                severity="error",
+                memory_space_id=memory_space_id,
+                source_sequence=episode.source_sequence,
+                error_class=failure.error_class.value,
+                reason=failure.message,
+            )
+
+    def _raise_if_pipeline_failed(self, memory_space_id: str) -> None:
+        failure = self._space_pipeline_failures.get(memory_space_id)
+        if failure is not None:
+            raise failure
 
     async def search(self, memory_space_id: str, query: str) -> SearchResult:
         """Search active subjects and memories using only exact vector retrieval."""
@@ -453,65 +493,110 @@ class FluxFold:
     ) -> EmbeddingRebuildResult:
         """Rebuild all active retrieval vectors and atomically switch signatures."""
 
-        async with self._space_locks[memory_space_id]:
-            self._store.get_space(memory_space_id)
-            signature_id = self._store.prepare_retrieval_signature(
-                self._embedding.model_info
-            )
-            memory_sources, subject_sources = self._store.retrieval_embedding_sources(
-                memory_space_id
-            )
-            vectors = await self._embed_documents(
-                [source.content for source in memory_sources]
-                + [
-                    text
-                    for source in subject_sources
-                    for text in (
-                        source.name,
-                        _name_summary(source.name, source.summary),
-                    )
-                ]
-            )
-            memory_vectors = vectors[: len(memory_sources)]
-            subject_vectors = iter(vectors[len(memory_sources) :])
-            prepared_subjects = [
-                (source, next(subject_vectors), next(subject_vectors))
+        async with self._space_extraction_locks[memory_space_id]:
+            async with self._space_stateful_locks[memory_space_id]:
+                return await self._rebuild_retrieval_embeddings_locked(memory_space_id)
+
+    async def _rebuild_retrieval_embeddings_locked(
+        self, memory_space_id: str
+    ) -> EmbeddingRebuildResult:
+        self._store.get_space(memory_space_id)
+        signature_id = self._store.prepare_retrieval_signature(
+            self._embedding.model_info
+        )
+        memory_sources, subject_sources = self._store.retrieval_embedding_sources(
+            memory_space_id
+        )
+        vectors = await self._embed_documents(
+            [source.content for source in memory_sources]
+            + [source.name for source in subject_sources]
+            + [
+                _name_summary(source.name, source.summary)
                 for source in subject_sources
+                if source.summary is not None
             ]
-            self._store.commit_retrieval_embedding_switch(
-                memory_space_id=memory_space_id,
-                signature_id=signature_id,
-                memories=tuple(zip(memory_sources, memory_vectors, strict=True)),
-                subjects=prepared_subjects,
+        )
+        memory_vectors = vectors[: len(memory_sources)]
+        subject_vectors = iter(vectors[len(memory_sources) :])
+        name_vectors = [next(subject_vectors) for _ in subject_sources]
+        summary_vectors = iter(subject_vectors)
+        prepared_subjects = [
+            (
+                source,
+                name_vector,
+                next(summary_vectors) if source.summary is not None else None,
             )
-            return EmbeddingRebuildResult(
-                memory_space_id,
-                signature_id,
-                len(memory_sources),
-                len(subject_sources),
-            )
+            for source, name_vector in zip(subject_sources, name_vectors, strict=True)
+        ]
+        self._store.commit_retrieval_embedding_switch(
+            memory_space_id=memory_space_id,
+            signature_id=signature_id,
+            memories=tuple(zip(memory_sources, memory_vectors, strict=True)),
+            subjects=prepared_subjects,
+        )
+        return EmbeddingRebuildResult(
+            memory_space_id,
+            signature_id,
+            len(memory_sources),
+            len(subject_sources),
+        )
 
     def space_statistics(self, memory_space_id: str) -> dict[str, int | float]:
         """Return the experiment metrics derived from final database state."""
 
         return self._store.space_statistics(memory_space_id)
 
-    async def _link_batch(
+    async def _link_memories(
         self,
         memory_space_id: str,
         memory_refs: Sequence[str],
         contents: Sequence[str],
         vectors: Sequence[Any],
     ) -> tuple[LinkingOutput, _LinkingMetrics]:
+        new_subjects: list[Any] = []
+        links: list[Any] = []
+        passive_memory_ids: set[str] = set()
+        association_memory_ids: set[str] = set()
+        association_called = False
+        for memory_ref, content, vector in zip(
+            memory_refs, contents, vectors, strict=True
+        ):
+            output, passive_ids, active_ids, called = await self._link_memory(
+                memory_space_id,
+                memory_ref,
+                content,
+                vector,
+                new_subjects,
+            )
+            new_subjects.extend(output.new_subjects)
+            links.extend(output.links)
+            passive_memory_ids.update(passive_ids)
+            association_memory_ids.update(active_ids)
+            association_called = association_called or called
+        return LinkingOutput(new_subjects=new_subjects, links=links), _LinkingMetrics(
+            len(passive_memory_ids | association_memory_ids),
+            association_called,
+            len(association_memory_ids - passive_memory_ids),
+        )
+
+    async def _link_memory(
+        self,
+        memory_space_id: str,
+        memory_ref: str,
+        content: str,
+        vector: Any,
+        provisional_subjects: Sequence[Any],
+    ) -> tuple[LinkingOutput, set[str], set[str], bool]:
         candidates, legal_by_memory = self._recall_candidates(
-            memory_space_id, memory_refs, vectors
+            memory_space_id, [memory_ref], [vector]
         )
         passive_candidate_memory_ids = _candidate_memory_ids(candidates)
-        (candidate_view,) = _candidate_prompt_views(candidates)
-        new_memories = [
-            {"memory_ref": memory_ref, "content": content}
-            for memory_ref, content in zip(memory_refs, contents, strict=True)
+        new_memories = [{"memory_ref": memory_ref, "content": content}]
+        provisional_view = [
+            {"subject_ref": subject.subject_ref, "name": subject.name}
+            for subject in provisional_subjects
         ]
+        provisional_refs = {subject.subject_ref for subject in provisional_subjects}
 
         def validate_initial(value: LinkingStageOutput) -> None:
             if isinstance(value, AssociationSearchOutput):
@@ -520,12 +605,14 @@ class FluxFold:
                 if not value.query.strip():
                     raise ValidationError("association_search query must not be blank")
                 return
-            self._validate_linking(value, memory_refs, legal_by_memory)
+            self._validate_linking(
+                value, memory_ref, legal_by_memory[memory_ref], provisional_refs
+            )
 
         first, first_turn = await self._structured_output(
             stage="subject_linking",
             system_prompt=LINKING_SYSTEM,
-            user_prompt=linking_input(new_memories, candidate_view),
+            user_prompt=linking_input(new_memories, candidates, provisional_view),
             adapter=TypeAdapter(LinkingStageOutput),
             temperature=self.config.linking_temperature,
             validator=validate_initial,
@@ -533,32 +620,31 @@ class FluxFold:
         first = cast(LinkingStageOutput, first)
         if isinstance(first, LinkingOutput):
             self._offer_llm_sample("link", first_turn)
-            return first, _LinkingMetrics(len(passive_candidate_memory_ids), False, 0)
+            return first, passive_candidate_memory_ids, set(), False
         association_vector = (await self._embed_queries([first.query]))[0]
         association_candidates, association_legal = self._recall_candidates(
-            memory_space_id, memory_refs, [association_vector] * len(memory_refs)
+            memory_space_id, [memory_ref], [association_vector]
         )
         association_candidate_memory_ids = _candidate_memory_ids(association_candidates)
-        for memory_ref, ids in association_legal.items():
-            legal_by_memory[memory_ref].update(ids)
+        legal_by_memory[memory_ref].update(association_legal[memory_ref])
 
         def validate_final(value: LinkingStageOutput) -> None:
             if isinstance(value, AssociationSearchOutput):
                 raise ValidationError("association_search may only be requested once")
-            self._validate_linking(value, memory_refs, legal_by_memory)
+            self._validate_linking(
+                value, memory_ref, legal_by_memory[memory_ref], provisional_refs
+            )
 
-        candidate_view, association_candidate_view = _candidate_prompt_views(
-            candidates, association_candidates
-        )
         final, final_turn = await self._structured_output(
             stage="subject_linking",
             system_prompt=LINKING_SYSTEM,
             user_prompt=linking_input(
                 new_memories,
-                candidate_view,
+                candidates,
+                provisional_view,
                 {
                     "query": first.query,
-                    "candidates_by_memory": association_candidate_view,
+                    "candidates_by_memory": association_candidates,
                 },
             ),
             adapter=TypeAdapter(LinkingStageOutput),
@@ -566,10 +652,11 @@ class FluxFold:
             validator=validate_final,
         )
         self._offer_llm_sample("link_association_search", first_turn, final_turn)
-        return cast(LinkingOutput, final), _LinkingMetrics(
-            len(passive_candidate_memory_ids | association_candidate_memory_ids),
+        return (
+            cast(LinkingOutput, final),
+            passive_candidate_memory_ids,
+            association_candidate_memory_ids,
             True,
-            len(association_candidate_memory_ids - passive_candidate_memory_ids),
         )
 
     def _recall_candidates(
@@ -594,14 +681,13 @@ class FluxFold:
                 min_similarity=self.config.memory_candidate_min_similarity,
             )
             groups: dict[str, dict[str, object]] = {}
-            for index, subject in enumerate(subjects):
+            for subject in subjects:
                 group: dict[str, object] = {
                     "subject_id": subject.subject_id,
                     "name": subject.name,
                     "subject_similarity": subject.similarity,
                     "memory_hits": [],
                 }
-                group["summary"] = subject.summary
                 if subject.attached_memory_id is not None:
                     cast(list[dict[str, object]], group["memory_hits"]).append(
                         {
@@ -645,27 +731,34 @@ class FluxFold:
     def _validate_linking(
         self,
         output: LinkingOutput,
-        memory_refs: Sequence[str],
-        legal_by_memory: dict[str, set[str]],
+        memory_ref: str,
+        legal_existing_subject_ids: set[str],
+        provisional_refs: set[str],
     ) -> None:
-        expected = set(memory_refs)
         subject_refs = [subject.subject_ref for subject in output.new_subjects]
         if len(subject_refs) != len(set(subject_refs)):
             raise ValidationError("new subject_ref values must be unique")
         new_refs = set(subject_refs)
+        if new_refs & provisional_refs:
+            raise ValidationError("new subject_ref collides with a provisional subject")
         referenced_new: set[str] = set()
         seen_pairs: set[tuple[str, str, str]] = set()
         by_memory: defaultdict[str, list[Any]] = defaultdict(list)
         for link in output.links:
-            if link.memory_ref not in expected:
+            if link.memory_ref != memory_ref:
                 raise ValidationError(f"unknown memory_ref: {link.memory_ref}")
             if link.subject.kind == "existing":
                 target = link.subject.subject_id
-                if target not in legal_by_memory[link.memory_ref]:
+                if target not in legal_existing_subject_ids:
                     raise ValidationError(
                         f"subject {target} was not a candidate for {link.memory_ref}"
                     )
                 target_kind = "existing"
+            elif link.subject.kind == "provisional":
+                target = link.subject.subject_ref
+                if target not in provisional_refs:
+                    raise ValidationError(f"unknown provisional subject_ref: {target}")
+                target_kind = "provisional"
             else:
                 target = link.subject.subject_ref
                 if target not in new_refs:
@@ -676,17 +769,18 @@ class FluxFold:
             if pair in seen_pairs:
                 raise ValidationError("duplicate memory-subject link")
             seen_pairs.add(pair)
-            by_memory[link.memory_ref].append(link)
+            by_memory[memory_ref].append(link)
         if referenced_new != new_refs:
-            raise ValidationError("every new subject must be linked to a batch memory")
-        for memory_ref in expected:
-            links = by_memory[memory_ref]
-            if not links or not any(link.basis == "direct" for link in links):
-                raise ValidationError(f"{memory_ref} needs at least one direct link")
-            if len(links) > self.config.memory_active_subject_link_max:
-                raise ValidationError(f"{memory_ref} exceeds the active link maximum")
+            raise ValidationError(
+                "every new subject must be linked to an episode memory"
+            )
+        memory_links = by_memory[memory_ref]
+        if not memory_links or not any(link.basis == "direct" for link in memory_links):
+            raise ValidationError(f"{memory_ref} needs at least one direct link")
+        if len(memory_links) > self.config.memory_active_subject_link_max:
+            raise ValidationError(f"{memory_ref} exceeds the active link maximum")
         for subject in output.new_subjects:
-            self._validate_subject_text(subject.name, subject.summary)
+            self._validate_subject_name(subject.name)
 
     async def _prepare_link_commit(
         self,
@@ -699,25 +793,23 @@ class FluxFold:
         list[PreparedLink],
         list[ExistingSubjectTouch],
         set[str],
-        set[str],
     ]:
         ref_to_memory_id = dict(zip(memory_refs, memory_ids, strict=True))
         new_ref_to_id = {
             subject.subject_ref: str(uuid4()) for subject in linking.new_subjects
         }
-        subject_texts: list[str] = []
-        for subject in linking.new_subjects:
-            subject_texts.extend(
-                [subject.name, _name_summary(subject.name, subject.summary)]
+        subject_vectors = iter(
+            await self._embed_documents(
+                [subject.name for subject in linking.new_subjects]
             )
-        subject_vectors = iter(await self._embed_documents(subject_texts))
+        )
         prepared_subjects = [
             PreparedSubject(
                 new_ref_to_id[subject.subject_ref],
                 subject.name,
-                subject.summary,
+                None,
                 next(subject_vectors),
-                next(subject_vectors),
+                None,
             )
             for subject in linking.new_subjects
         ]
@@ -728,7 +820,7 @@ class FluxFold:
             if link.subject.kind == "existing":
                 subject_id = link.subject.subject_id
                 existing_link_counts[subject_id] += 1
-            else:
+            elif link.subject.kind in {"new", "provisional"}:
                 subject_id = new_ref_to_id[link.subject.subject_ref]
             prepared_links.append(
                 PreparedLink(ref_to_memory_id[link.memory_ref], subject_id, link.basis)
@@ -745,30 +837,27 @@ class FluxFold:
             prepared_links,
             touches,
             affected,
-            set(existing_link_counts),
         )
 
     async def _complete_maintenance(
         self,
         memory_space_id: str,
+        add_operation_id: str,
         affected_subject_ids: Sequence[str],
-        summary_refresh_subject_ids: Sequence[str],
         signature_id: str,
         actor: str,
     ) -> list[MaintenanceResult]:
         outcomes: list[MaintenanceResult] = []
-        summaries_rewritten: set[str] = set()
         for subject_id in affected_subject_ids:
             try:
                 subject_outcomes = await self._maintain_subject(
-                    memory_space_id, subject_id, signature_id, actor
+                    memory_space_id,
+                    add_operation_id,
+                    subject_id,
+                    signature_id,
+                    actor,
                 )
                 outcomes.extend(subject_outcomes)
-                if any(
-                    outcome.operation in {"review", "full_split", "partial_split"}
-                    for outcome in subject_outcomes
-                ):
-                    summaries_rewritten.add(subject_id)
             except StageFailure as error:
                 self._handle_maintenance_failure(memory_space_id, subject_id, error)
             except ProviderError as error:
@@ -780,25 +869,50 @@ class FluxFold:
                     ),
                 )
 
-        for subject_id in sorted(
-            set(summary_refresh_subject_ids) - summaries_rewritten
-        ):
-            try:
-                outcomes.append(
-                    await self._refresh_subject_summary(
-                        memory_space_id, subject_id, signature_id, actor
+        refresh_subject_ids = self._store.pending_summary_refresh_subject_ids(
+            memory_space_id, add_operation_id
+        )
+        semaphore = asyncio.Semaphore(
+            self.config.subject_summary_refresh_concurrency_per_episode
+        )
+
+        async def refresh_one(
+            subject_id: str,
+        ) -> MaintenanceResult | StageFailure:
+            async with semaphore:
+                try:
+                    return await self._refresh_subject_summary(
+                        memory_space_id,
+                        add_operation_id,
+                        subject_id,
+                        signature_id,
+                        actor,
                     )
-                )
-            except StageFailure as error:
-                self._record_summary_refresh_failure(memory_space_id, subject_id, error)
-            except ProviderError as error:
-                self._record_summary_refresh_failure(
-                    memory_space_id,
-                    subject_id,
-                    StageFailure(
+                except StageFailure as error:
+                    self._record_summary_refresh_failure(
+                        memory_space_id, subject_id, error
+                    )
+                    return error
+                except ProviderError as error:
+                    failure = StageFailure(
                         "maintenance_embedding", error.error_class, error.message
-                    ),
-                )
+                    )
+                    self._record_summary_refresh_failure(
+                        memory_space_id, subject_id, failure
+                    )
+                    return failure
+
+        refresh_results = await asyncio.gather(
+            *(refresh_one(subject_id) for subject_id in refresh_subject_ids)
+        )
+        failures: list[StageFailure] = []
+        for result in refresh_results:
+            if isinstance(result, StageFailure):
+                failures.append(result)
+            else:
+                outcomes.append(result)
+        if failures:
+            raise failures[0]
         return outcomes
 
     def _record_summary_refresh_failure(
@@ -806,7 +920,7 @@ class FluxFold:
     ) -> None:
         self._event(
             "subject_summary_refresh_failed",
-            severity="warning",
+            severity="error",
             memory_space_id=memory_space_id,
             subject_id=subject_id,
             error_class=error.error_class.value,
@@ -835,6 +949,7 @@ class FluxFold:
     async def _refresh_subject_summary(
         self,
         memory_space_id: str,
+        add_operation_id: str,
         subject_id: str,
         signature_id: str,
         actor: str,
@@ -860,6 +975,7 @@ class FluxFold:
             await self._embed_documents([_name_summary(snapshot.name, output.summary)])
         )[0]
         operation_id = self._store.commit_summary_refresh(
+            add_operation_id=add_operation_id,
             memory_space_id=memory_space_id,
             snapshot=snapshot,
             summary=output.summary,
@@ -890,6 +1006,7 @@ class FluxFold:
     async def _maintain_subject(
         self,
         memory_space_id: str,
+        add_operation_id: str,
         subject_id: str,
         signature_id: str,
         actor: str,
@@ -910,7 +1027,11 @@ class FluxFold:
                 memory_chars=memory_chars,
             )
             split = await self._split_subject(
-                memory_space_id, snapshot, signature_id, actor
+                memory_space_id,
+                add_operation_id,
+                snapshot,
+                signature_id,
+                actor,
             )
             outcomes.append(split)
             self._event(
@@ -932,7 +1053,11 @@ class FluxFold:
                 memory_count=len(snapshot.memories),
             )
             operation_id, provenance_viewed = await self._review_subject(
-                memory_space_id, snapshot, signature_id, actor
+                memory_space_id,
+                add_operation_id,
+                snapshot,
+                signature_id,
+                actor,
             )
             outcomes.append(MaintenanceResult(subject_id, "review", operation_id))
             self._event(
@@ -947,6 +1072,7 @@ class FluxFold:
     async def _review_subject(
         self,
         memory_space_id: str,
+        add_operation_id: str,
         snapshot: SubjectSnapshot,
         signature_id: str,
         actor: str,
@@ -1022,23 +1148,20 @@ class FluxFold:
             prepared_values.append((update.memory_id, content, provenance_ids))
         vectors = await self._embed_documents(
             [content for _, content, _ in prepared_values]
-            + [_name_summary(snapshot.name, review.summary)]
         )
         updates = [
             PreparedMemoryUpdate(memory_id, str(uuid4()), content, provenance, vector)
             for (memory_id, content, provenance), vector in zip(
-                prepared_values, vectors[: len(prepared_values)], strict=True
+                prepared_values, vectors, strict=True
             )
         ]
-        summary_vector = vectors[-1]
         operation_id = self._store.commit_review(
+            add_operation_id=add_operation_id,
             memory_space_id=memory_space_id,
             subject_id=snapshot.subject_id,
             expected_revision=snapshot.summary_revision,
             updates=updates,
             retirements=review.retirements,
-            summary=review.summary,
-            summary_embedding=summary_vector,
             signature_id=signature_id,
             actor=actor,
             config_signature=self.config.signature,
@@ -1090,11 +1213,11 @@ class FluxFold:
                     and not content_changed
                 ):
                     raise ValidationError("replacement provenance is unchanged")
-        self._validate_summary(review.summary)
 
     async def _split_subject(
         self,
         memory_space_id: str,
+        add_operation_id: str,
         snapshot: SubjectSnapshot,
         signature_id: str,
         actor: str,
@@ -1137,15 +1260,7 @@ class FluxFold:
             if isinstance(output, FullSplitOutput)
             else output.new_subjects
         )
-        embedding_texts = [
-            text
-            for subject in subjects
-            for text in (subject.name, _name_summary(subject.name, subject.summary))
-        ]
-        if isinstance(output, PartialSplitOutput):
-            embedding_texts.append(
-                _name_summary(snapshot.name, output.remaining_summary)
-            )
+        embedding_texts = [subject.name for subject in subjects]
         vectors = iter(await self._embed_documents(embedding_texts))
         prepared: list[PreparedSplitSubject] = []
         for subject in subjects:
@@ -1155,9 +1270,9 @@ class FluxFold:
                     PreparedSubject(
                         subject_id,
                         subject.name,
-                        subject.summary,
+                        None,
                         next(vectors),
-                        next(vectors),
+                        None,
                     ),
                     tuple(
                         PreparedLink(link.memory_id, subject_id, link.basis)
@@ -1165,23 +1280,15 @@ class FluxFold:
                     ),
                 )
             )
-        remaining_vector = (
-            next(vectors) if isinstance(output, PartialSplitOutput) else None
-        )
         result: Literal["full_split", "partial_split"] = (
             "full_split" if isinstance(output, FullSplitOutput) else "partial_split"
         )
         operation_id = self._store.commit_split(
+            add_operation_id=add_operation_id,
             memory_space_id=memory_space_id,
             original=snapshot,
             result=result,
             new_subjects=prepared,
-            remaining_summary=(
-                output.remaining_summary
-                if isinstance(output, PartialSplitOutput)
-                else None
-            ),
-            remaining_summary_embedding=remaining_vector,
             signature_id=signature_id,
             actor=actor,
             config_signature=self.config.signature,
@@ -1226,7 +1333,7 @@ class FluxFold:
         input_ids = {memory.memory_id for memory in snapshot.memories}
         membership: Counter[str] = Counter()
         for subject in subjects:
-            self._validate_subject_text(subject.name, subject.summary)
+            self._validate_subject_name(subject.name)
             if subject.name.strip().lower() in {
                 "other",
                 "misc",
@@ -1261,7 +1368,6 @@ class FluxFold:
                 raise ValidationError(
                     "partial split must move a non-empty proper subset"
                 )
-            self._validate_summary(output.remaining_summary)
         current_counts = self._store.memory_active_link_counts(
             memory_space_id, tuple(moved)
         )
@@ -1321,6 +1427,8 @@ class FluxFold:
                     attempt=attempt + 1,
                     result="success",
                     elapsed_seconds=time.monotonic() - started,
+                    input_tokens=response.input_tokens,
+                    output_tokens=response.output_tokens,
                     total_tokens=response.total_tokens,
                     request_id=response.request_id,
                 )
@@ -1344,6 +1452,8 @@ class FluxFold:
                         attempt=attempt + 1,
                         result="failed",
                         elapsed_seconds=time.monotonic() - started,
+                        input_tokens=0,
+                        output_tokens=0,
                         total_tokens=0,
                         request_id=None,
                         error_class=error.error_class.value,
@@ -1369,6 +1479,8 @@ class FluxFold:
                 attempt=attempt + 1,
                 result="failed",
                 elapsed_seconds=time.monotonic() - started,
+                input_tokens=response.input_tokens if response is not None else 0,
+                output_tokens=response.output_tokens if response is not None else 0,
                 total_tokens=response.total_tokens if response is not None else 0,
                 request_id=response.request_id if response is not None else None,
                 error_class=error_class.value,
@@ -1401,7 +1513,9 @@ class FluxFold:
             texts[index : index + self.config.embedding_batch_size]
             for index in range(0, len(texts), self.config.embedding_batch_size)
         ]
-        semaphore = asyncio.Semaphore(self.config.embedding_max_concurrency)
+        semaphore = asyncio.Semaphore(
+            self.config.embedding_batch_concurrency_per_operation
+        )
 
         async def one(batch: Sequence[str]) -> tuple[Any, ...]:
             async with semaphore:
@@ -1485,10 +1599,9 @@ class FluxFold:
                 "memory content appears to contain an authentication secret"
             )
 
-    def _validate_subject_text(self, name: str, summary: str) -> None:
+    def _validate_subject_name(self, name: str) -> None:
         if not name.strip() or len(name) > self.config.subject_name_max_chars:
             raise ValidationError("subject name is blank or exceeds character limit")
-        self._validate_summary(summary)
 
     def _validate_summary(self, summary: str) -> None:
         if (
@@ -1594,44 +1707,6 @@ def _candidate_memory_ids(
         for memory in cast(list[dict[str, object]], value["unattached_memories"]):
             memory_ids.add(cast(str, memory["memory_id"]))
     return memory_ids
-
-
-def _candidate_prompt_views(
-    *candidate_sets: dict[str, dict[str, object]],
-) -> tuple[dict[str, dict[str, object]], ...]:
-    """Return prompt copies with five globally ranked, deduplicated summaries."""
-
-    best_similarity: dict[str, float] = {}
-    for candidates in candidate_sets:
-        for value in candidates.values():
-            for group in cast(list[dict[str, object]], value["subjects"]):
-                similarity = group["subject_similarity"]
-                if similarity is None or "summary" not in group:
-                    continue
-                subject_id = cast(str, group["subject_id"])
-                best_similarity[subject_id] = max(
-                    best_similarity.get(subject_id, -1.0), cast(float, similarity)
-                )
-    selected = {
-        subject_id
-        for subject_id, _ in sorted(
-            best_similarity.items(), key=lambda item: (-item[1], item[0])
-        )[:5]
-    }
-    views = cast(
-        tuple[dict[str, dict[str, object]], ...],
-        tuple(deepcopy(candidates) for candidates in candidate_sets),
-    )
-    shown: set[str] = set()
-    for candidates in views:
-        for value in candidates.values():
-            for group in cast(list[dict[str, object]], value["subjects"]):
-                subject_id = cast(str, group["subject_id"])
-                if subject_id in selected and subject_id not in shown:
-                    shown.add(subject_id)
-                else:
-                    group.pop("summary", None)
-    return views
 
 
 def _parse_json_object(text: str) -> dict[str, object]:

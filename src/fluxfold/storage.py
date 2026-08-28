@@ -39,7 +39,7 @@ from fluxfold.models import (
 )
 from fluxfold.providers import EmbeddingModelInfo
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,9 +64,9 @@ class PreparedMemory:
 class PreparedSubject:
     subject_id: str
     name: str
-    summary: str
+    summary: str | None
     name_embedding: np.ndarray
-    name_summary_embedding: np.ndarray
+    name_summary_embedding: np.ndarray | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,7 +108,7 @@ class RetrievalMemorySource:
 class RetrievalSubjectSource:
     subject_id: str
     name: str
-    summary: str
+    summary: str | None
 
 
 class Store:
@@ -255,6 +255,10 @@ class Store:
         )
         connection.execute(
             f"DELETE FROM domain_operation_effects WHERE operation_id IN ({operations})",
+            (memory_space_id,),
+        )
+        connection.execute(
+            f"DELETE FROM episode_summary_refresh_targets WHERE add_operation_id IN ({operations})",
             (memory_space_id,),
         )
         connection.execute(
@@ -448,7 +452,9 @@ class Store:
         memory_space_id: str,
         signature_id: str,
         memories: Sequence[tuple[RetrievalMemorySource, np.ndarray]],
-        subjects: Sequence[tuple[RetrievalSubjectSource, np.ndarray, np.ndarray]],
+        subjects: Sequence[
+            tuple[RetrievalSubjectSource, np.ndarray, np.ndarray | None]
+        ],
     ) -> None:
         now = utc_milliseconds()
         with self._transaction() as connection:
@@ -515,17 +521,20 @@ class Store:
                     signature_id,
                     now,
                 )
-                self._upsert_subject_embedding(
-                    connection,
-                    subject_source.subject_id,
-                    "name_summary",
-                    _subject_embedding_text(
-                        subject_source.name, subject_source.summary
-                    ),
-                    summary_vector,
-                    signature_id,
-                    now,
-                )
+                if subject_source.summary is not None:
+                    if summary_vector is None:
+                        raise ValidationError("summary embedding is missing")
+                    self._upsert_subject_embedding(
+                        connection,
+                        subject_source.subject_id,
+                        "name_summary",
+                        _subject_embedding_text(
+                            subject_source.name, subject_source.summary
+                        ),
+                        summary_vector,
+                        signature_id,
+                        now,
+                    )
             active = connection.execute(
                 "SELECT 1 FROM memory_space_model_signatures WHERE memory_space_id = ? AND purpose = 'retrieval'",
                 (memory_space_id,),
@@ -559,7 +568,9 @@ class Store:
             CROSS JOIN (SELECT 'name' AS kind UNION ALL SELECT 'name_summary') kinds
             LEFT JOIN subject_embeddings e ON e.subject_id = s.subject_id
                 AND e.embedding_kind = kinds.kind AND e.model_signature_id = ?
-            WHERE s.memory_space_id = ? AND s.lifecycle_status = 'active' AND e.subject_id IS NULL
+            WHERE s.memory_space_id = ? AND s.lifecycle_status = 'active'
+                AND (kinds.kind = 'name' OR s.summary IS NOT NULL)
+                AND e.subject_id IS NULL
             """,
             (signature_id, memory_space_id),
         ).fetchone()["n"]
@@ -782,6 +793,9 @@ class Store:
                     raise ConcurrentUpdateError(f"stale subject: {touch.subject_id}")
             for link in links:
                 self._insert_link(connection, link, operation_id, now)
+            self._insert_summary_refresh_targets(
+                connection, operation_id, {link.subject_id for link in links}
+            )
             self._validate_active_memory_links(connection, memory_space_id)
             connection.execute(
                 """
@@ -876,15 +890,18 @@ class Store:
             signature_id,
             now,
         )
-        self._upsert_subject_embedding(
-            connection,
-            subject.subject_id,
-            "name_summary",
-            _subject_embedding_text(subject.name, subject.summary),
-            subject.name_summary_embedding,
-            signature_id,
-            now,
-        )
+        if subject.summary is not None:
+            if subject.name_summary_embedding is None:
+                raise ValidationError("summary embedding is missing")
+            self._upsert_subject_embedding(
+                connection,
+                subject.subject_id,
+                "name_summary",
+                _subject_embedding_text(subject.name, subject.summary),
+                subject.name_summary_embedding,
+                signature_id,
+                now,
+            )
         self._effect(connection, operation_id, "subject", subject.subject_id, "created")
 
     def _insert_link(
@@ -974,7 +991,7 @@ class Store:
             signature_id = self._active_signature(connection, memory_space_id)
             for subject_id, similarity in hits:
                 row = connection.execute(
-                    "SELECT name, summary FROM subjects WHERE subject_id = ?",
+                    "SELECT name FROM subjects WHERE subject_id = ?",
                     (subject_id,),
                 ).fetchone()
                 attached = connection.execute(
@@ -992,7 +1009,6 @@ class Store:
                     CandidateSubject(
                         subject_id,
                         row["name"],
-                        row["summary"],
                         similarity,
                         best["memory_id"] if best is not None else None,
                         best["content"] if best is not None else None,
@@ -1204,13 +1220,12 @@ class Store:
     def commit_review(
         self,
         *,
+        add_operation_id: str,
         memory_space_id: str,
         subject_id: str,
         expected_revision: int,
         updates: Sequence[PreparedMemoryUpdate],
         retirements: Sequence[str],
-        summary: str,
-        summary_embedding: np.ndarray,
         signature_id: str,
         actor: str,
         config_signature: str,
@@ -1219,7 +1234,7 @@ class Store:
         now = utc_milliseconds()
         with self._transaction() as connection:
             subject = connection.execute(
-                "SELECT name, summary_revision FROM subjects WHERE subject_id = ? AND memory_space_id = ? AND lifecycle_status = 'active'",
+                "SELECT summary_revision FROM subjects WHERE subject_id = ? AND memory_space_id = ? AND lifecycle_status = 'active'",
                 (subject_id, memory_space_id),
             ).fetchone()
             if subject is None:
@@ -1253,31 +1268,24 @@ class Store:
                 )
             cursor = connection.execute(
                 """
-                UPDATE subjects SET summary = ?, new_memory_count = 0,
-                    summary_revision = summary_revision + 1,
-                    updated_at = ?
+                UPDATE subjects SET new_memory_count = 0, updated_at = ?
                 WHERE subject_id = ? AND summary_revision = ?
                 """,
-                (summary, now, subject_id, expected_revision),
+                (now, subject_id, expected_revision),
             )
             if cursor.rowcount != 1:
                 raise ConcurrentUpdateError(f"stale subject: {subject_id}")
-            self._upsert_subject_embedding(
-                connection,
-                subject_id,
-                "name_summary",
-                _subject_embedding_text(subject["name"], summary),
-                summary_embedding,
-                signature_id,
-                now,
-            )
             self._effect(connection, operation_id, "subject", subject_id, "reviewed")
+            self._insert_summary_refresh_targets(
+                connection, add_operation_id, {subject_id}
+            )
             self._validate_active_memory_links(connection, memory_space_id)
         return operation_id
 
     def commit_summary_refresh(
         self,
         *,
+        add_operation_id: str,
         memory_space_id: str,
         snapshot: SubjectSnapshot,
         summary: str,
@@ -1371,6 +1379,19 @@ class Store:
                 snapshot.subject_id,
                 "summary_refreshed",
             )
+            cursor = connection.execute(
+                """
+                UPDATE episode_summary_refresh_targets
+                SET completed_by_operation_id = ?
+                WHERE add_operation_id = ? AND subject_id = ?
+                    AND completed_by_operation_id IS NULL
+                """,
+                (operation_id, add_operation_id, snapshot.subject_id),
+            )
+            if cursor.rowcount != 1:
+                raise ConcurrentUpdateError(
+                    f"summary refresh target is no longer pending: {snapshot.subject_id}"
+                )
         return operation_id
 
     def _replace_memory_version(
@@ -1478,12 +1499,11 @@ class Store:
     def commit_split(
         self,
         *,
+        add_operation_id: str,
         memory_space_id: str,
         original: SubjectSnapshot,
         result: Literal["full_split", "partial_split"],
         new_subjects: Sequence[PreparedSplitSubject],
-        remaining_summary: str | None,
-        remaining_summary_embedding: np.ndarray | None,
         signature_id: str,
         actor: str,
         config_signature: str,
@@ -1522,6 +1542,13 @@ class Store:
                 close_ids = current_ids
                 connection.execute(
                     """
+                    DELETE FROM episode_summary_refresh_targets
+                    WHERE add_operation_id = ? AND subject_id = ?
+                    """,
+                    (add_operation_id, original.subject_id),
+                )
+                connection.execute(
+                    """
                     UPDATE subjects SET lifecycle_status = 'retired', retired_at = ?,
                         retired_by_operation_id = ?, updated_at = ?
                     WHERE subject_id = ?
@@ -1536,28 +1563,13 @@ class Store:
                     connection, operation_id, "subject", original.subject_id, "retired"
                 )
             else:
-                if remaining_summary is None or remaining_summary_embedding is None:
-                    raise ValidationError(
-                        "partial split requires a remaining summary and embedding"
-                    )
                 close_ids = moved_ids
                 connection.execute(
                     """
-                    UPDATE subjects SET summary = ?, new_memory_count = 0,
-                        summary_revision = summary_revision + 1,
-                        updated_at = ?
+                    UPDATE subjects SET new_memory_count = 0, updated_at = ?
                     WHERE subject_id = ?
                     """,
-                    (remaining_summary, now, original.subject_id),
-                )
-                self._upsert_subject_embedding(
-                    connection,
-                    original.subject_id,
-                    "name_summary",
-                    _subject_embedding_text(row["name"], remaining_summary),
-                    remaining_summary_embedding,
-                    signature_id,
-                    now,
+                    (now, original.subject_id),
                 )
                 self._effect(
                     connection,
@@ -1586,6 +1598,11 @@ class Store:
                 )
                 for link in prepared.links:
                     self._insert_link(connection, link, operation_id, now)
+            self._insert_summary_refresh_targets(
+                connection,
+                add_operation_id,
+                {prepared.subject.subject_id for prepared in new_subjects},
+            )
             self._validate_active_memory_links(connection, memory_space_id)
         return operation_id
 
@@ -1737,30 +1754,24 @@ class Store:
                 )
             )
 
-    def operation_active_existing_subject_ids(
-        self, memory_space_id: str, operation_id: str | None
+    def pending_summary_refresh_subject_ids(
+        self, memory_space_id: str, add_operation_id: str | None
     ) -> tuple[str, ...]:
-        if operation_id is None:
+        if add_operation_id is None:
             return ()
         with self._connect() as connection:
             return tuple(
                 row[0]
                 for row in connection.execute(
                     """
-                    SELECT DISTINCT l.subject_id FROM subject_memory_links l
-                    JOIN subjects s ON s.subject_id = l.subject_id
+                    SELECT t.subject_id FROM episode_summary_refresh_targets t
+                    JOIN subjects s ON s.subject_id = t.subject_id
                         AND s.lifecycle_status = 'active'
-                    WHERE s.memory_space_id = ? AND l.opened_by_operation_id = ?
-                        AND l.unlinked_at IS NULL
-                        AND NOT EXISTS (
-                            SELECT 1 FROM domain_operation_effects e
-                            WHERE e.operation_id = ? AND e.object_type = 'subject'
-                                AND e.object_id = l.subject_id
-                                AND e.effect_type = 'created'
-                        )
-                    ORDER BY l.subject_id
+                    WHERE t.add_operation_id = ? AND s.memory_space_id = ?
+                        AND t.completed_by_operation_id IS NULL
+                    ORDER BY t.subject_id
                     """,
-                    (memory_space_id, operation_id, operation_id),
+                    (add_operation_id, memory_space_id),
                 )
             )
 
@@ -2063,6 +2074,21 @@ class Store:
                 effect_type,
                 canonical_json(metadata) if metadata is not None else None,
             ),
+        )
+
+    def _insert_summary_refresh_targets(
+        self,
+        connection: sqlite3.Connection,
+        add_operation_id: str,
+        subject_ids: set[str],
+    ) -> None:
+        connection.executemany(
+            """
+            INSERT OR IGNORE INTO episode_summary_refresh_targets(
+                add_operation_id, subject_id
+            ) VALUES (?, ?)
+            """,
+            [(add_operation_id, subject_id) for subject_id in sorted(subject_ids)],
         )
 
 

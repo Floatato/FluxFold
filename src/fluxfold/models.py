@@ -245,7 +245,6 @@ ExtractionOutput = Annotated[
 class NewSubjectOutput(StrictModel):
     subject_ref: str
     name: str
-    summary: str
 
 
 class ExistingSubjectTarget(StrictModel):
@@ -258,8 +257,14 @@ class NewSubjectTarget(StrictModel):
     subject_ref: str
 
 
+class ProvisionalSubjectTarget(StrictModel):
+    kind: Literal["provisional"]
+    subject_ref: str
+
+
 SubjectTarget = Annotated[
-    ExistingSubjectTarget | NewSubjectTarget, Field(discriminator="kind")
+    ExistingSubjectTarget | NewSubjectTarget | ProvisionalSubjectTarget,
+    Field(discriminator="kind"),
 ]
 
 
@@ -326,7 +331,6 @@ class ReviewOutput(StrictModel):
     result: Literal["review"]
     updates: list[MemoryUpdateOutput]
     retirements: list[str]
-    summary: str
 
 
 class SummaryRefreshOutput(StrictModel):
@@ -347,7 +351,6 @@ class SplitLinkOutput(StrictModel):
 class SplitSubjectOutput(StrictModel):
     subject_ref: str
     name: str
-    summary: str
     links: list[SplitLinkOutput]
 
 
@@ -358,7 +361,6 @@ class FullSplitOutput(StrictModel):
 
 class PartialSplitOutput(StrictModel):
     result: Literal["partial_split"]
-    remaining_summary: str
     new_subjects: list[SplitSubjectOutput]
 
 
@@ -387,7 +389,6 @@ class CandidateMemory:
 class CandidateSubject:
     subject_id: str
     name: str
-    summary: str
     similarity: float
     attached_memory_id: str | None = None
     attached_memory_content: str | None = None
@@ -406,7 +407,7 @@ class MemorySnapshot:
 class SubjectSnapshot:
     subject_id: str
     name: str
-    summary: str
+    summary: str | None
     new_memory_count: int
     summary_revision: int
     memories: tuple[MemorySnapshot, ...] = field(default_factory=tuple)

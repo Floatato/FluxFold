@@ -31,7 +31,7 @@ FluxFold 是从零构建的 agent memory system。核心判断：**把全部 LLM
 
 ## 实验版范围
 
-**范围内：** memory extraction、候选召回、批次 Subject linking、Subject review、Subject split、
+**范围内：** memory extraction、候选召回、逐 memory Subject linking、Subject review、Subject split、
 公开 `search`、SQLite 持久化、embedding 管理、`LongMemEval-S` 与 `LoCoMo_refined` 的
 dataset adapter、benchmark runner、构建日志、测试。
 
@@ -76,10 +76,10 @@ dataset session
 → 规范化并持久化不可变 episode（content_hash、source_sequence）
 → memory extraction                 （0..N 条自包含 memory，或 no_valuable_memory）
 → 逐条 memory 的候选召回            （Subject 通道 + Memory 通道，可选 1 次 association_search）
-→ 批次 Subject linking              （一次 LLM 输出覆盖整个 episode 批次）
+→ 逐 memory Subject linking         （每条新 memory 一次 LLM 输出；共享 provisional subjects）
 → 原子提交                          （memory、version、provenance、embedding、subject、link、completion）
 → Subject split / Subject review    （两者同时满足时先 split）
-→ 已链接旧 Subject summary refresh  （仅逐个整体重写本次局部目标中未被上述流程重写者）
+→ Subject summary refresh           （持久化 episode targets，最多并发 5 个完整重写）
 ```
 
 

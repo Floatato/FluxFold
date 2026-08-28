@@ -60,7 +60,7 @@ async def main() -> None:
         embedding_provider=embedding,
     ) as engine:
         space = await engine.create_or_open_space("example")
-        await engine.add(
+        await engine.add_episode(
             space.memory_space_id,
             NormalizedEpisode(
                 source_type="example",

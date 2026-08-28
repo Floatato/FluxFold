@@ -6,8 +6,8 @@ import json
 import pytest
 
 from fluxfold import EpisodeBlock, FluxFold, FluxFoldConfig, NormalizedEpisode, Role
-from fluxfold.errors import ErrorClass, ProviderError, SourceConflictError
-from fluxfold.providers import GenerationRequest
+from fluxfold.errors import ErrorClass, ProviderError, SourceConflictError, StageFailure
+from fluxfold.providers import GenerationRequest, GenerationResponse
 from tests.fakes import FakeEmbeddingProvider, FakeGenerationProvider
 
 
@@ -37,7 +37,7 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
             event_sink=events.append,
         )
         space = await engine.create_or_open_space("test:alice")
-        first = await engine.add(
+        first = await engine.add_episode(
             space.memory_space_id, _episode("session-1", "Alice likes hiking.")
         )
         assert first.memories_created == 1
@@ -58,7 +58,7 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
             ],
         }
 
-        replay = await engine.add(
+        replay = await engine.add_episode(
             space.memory_space_id, _episode("session-1", "Alice likes hiking.")
         )
         assert replay.replayed is True
@@ -80,9 +80,274 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
         assert "Alice likes hiking." in result.render()
 
         with pytest.raises(SourceConflictError):
-            await engine.add(
+            await engine.add_episode(
                 space.memory_space_id, _episode("session-1", "Alice dislikes hiking.")
             )
+        await engine.close()
+
+    asyncio.run(scenario())
+
+
+def test_add_episode_pipelines_extraction_ahead_of_ordered_linking(tmp_path) -> None:
+    class ObservedPipelineProvider(FakeGenerationProvider):
+        def __init__(self) -> None:
+            super().__init__(extraction_delay_seconds=0.01)
+            self.events: list[tuple[str, str]] = []
+            self.second_extraction_started = asyncio.Event()
+
+        async def generate(self, request: GenerationRequest):
+            payload = json.loads(request.user_prompt)
+            if request.stage == "memory_extraction":
+                content = str(payload["episode"]["messages"][-1]["content"])
+                self.events.append(("extract_started", content))
+                if content == "Alice bought boots.":
+                    self.second_extraction_started.set()
+                response = await super().generate(request)
+                self.events.append(("extract_completed", content))
+                return response
+            if request.stage == "subject_linking":
+                content = str(payload["new_memories"][0]["content"])
+                self.events.append(("link_started", content))
+                if content == "Alice likes hiking.":
+                    await asyncio.wait_for(
+                        self.second_extraction_started.wait(), timeout=1
+                    )
+                response = await super().generate(request)
+                self.events.append(("link_completed", content))
+                return response
+            return await super().generate(request)
+
+    async def scenario() -> None:
+        generation = ObservedPipelineProvider()
+        engine = await FluxFold.open(
+            db_path=str(tmp_path / "pipeline.sqlite3"),
+            generation_provider=generation,
+            embedding_provider=FakeEmbeddingProvider(),
+            config=FluxFoldConfig().with_overrides(
+                subject_candidate_min_similarity=-1.0,
+                memory_candidate_min_similarity=-1.0,
+            ),
+        )
+        space = await engine.create_or_open_space("test:pipeline")
+        episodes = (
+            _episode("one", "Alice likes hiking.", 0),
+            _episode("two", "Alice bought boots.", 1),
+        )
+        results = await asyncio.gather(
+            *(
+                asyncio.create_task(engine.add_episode(space.memory_space_id, episode))
+                for episode in episodes
+            )
+        )
+
+        assert [result.memories_created for result in results] == [1, 1]
+        assert generation.max_active_extractions == 1
+        assert generation.events.index(
+            ("link_started", "Alice likes hiking.")
+        ) < generation.events.index(("extract_started", "Alice bought boots."))
+        assert generation.events.index(
+            ("extract_started", "Alice bought boots.")
+        ) < generation.events.index(("link_completed", "Alice likes hiking."))
+        assert [
+            content for event, content in generation.events if event == "link_completed"
+        ] == ["Alice likes hiking.", "Alice bought boots."]
+        await engine.close()
+
+    asyncio.run(scenario())
+
+
+def test_add_episode_extraction_lanes_are_independent_between_spaces(tmp_path) -> None:
+    async def scenario() -> None:
+        generation = FakeGenerationProvider(extraction_delay_seconds=0.02)
+        engine = await FluxFold.open(
+            db_path=str(tmp_path / "independent-spaces.sqlite3"),
+            generation_provider=generation,
+            embedding_provider=FakeEmbeddingProvider(),
+        )
+        first = await engine.create_or_open_space("test:first-space")
+        second = await engine.create_or_open_space("test:second-space")
+
+        await asyncio.gather(
+            engine.add_episode(
+                first.memory_space_id, _episode("first", "Alice likes hiking.")
+            ),
+            engine.add_episode(
+                second.memory_space_id, _episode("second", "Bob likes cycling.")
+            ),
+        )
+
+        assert generation.max_active_extractions == 2
+        await engine.close()
+
+    asyncio.run(scenario())
+
+
+def test_episode_links_each_memory_separately_and_reuses_provisional_subject(
+    tmp_path,
+) -> None:
+    class TwoMemoryExtraction(FakeGenerationProvider):
+        async def generate(self, request: GenerationRequest):
+            if request.stage == "memory_extraction":
+                self.requests.append(request)
+                return GenerationResponse(
+                    text=json.dumps(
+                        {
+                            "result": "memories",
+                            "memories": [
+                                {"content": "Alice likes hiking."},
+                                {"content": "Alice bought hiking boots."},
+                            ],
+                        }
+                    ),
+                    input_tokens=6,
+                    output_tokens=4,
+                    total_tokens=10,
+                    request_id="two-memory-request",
+                )
+            return await super().generate(request)
+
+    async def scenario() -> None:
+        generation = TwoMemoryExtraction()
+        engine = await FluxFold.open(
+            db_path=str(tmp_path / "per-memory-linking.sqlite3"),
+            generation_provider=generation,
+            embedding_provider=FakeEmbeddingProvider(),
+        )
+        space = await engine.create_or_open_space("test:per-memory-linking")
+
+        result = await engine.add_episode(
+            space.memory_space_id, _episode("one", "Alice hiking facts.")
+        )
+
+        linking_requests = [
+            request
+            for request in generation.requests
+            if request.stage == "subject_linking"
+        ]
+        assert len(linking_requests) == 2
+        first = json.loads(linking_requests[0].user_prompt)
+        second = json.loads(linking_requests[1].user_prompt)
+        assert [item["memory_ref"] for item in first["new_memories"]] == ["memory_1"]
+        assert [item["memory_ref"] for item in second["new_memories"]] == ["memory_2"]
+        assert first["provisional_subjects"] == []
+        assert second["provisional_subjects"] == [
+            {"subject_ref": "alice_hiking_memory_1", "name": "Alice's hiking"}
+        ]
+        assert result.memories_created == 2
+        assert result.subjects_created == 1
+        assert result.links_created == 2
+        await engine.close()
+
+    asyncio.run(scenario())
+
+
+def test_episode_summary_refresh_concurrency_is_capped_at_five(tmp_path) -> None:
+    class ConcurrentSummaries(FakeGenerationProvider):
+        def __init__(self) -> None:
+            super().__init__(always_new_subject=True)
+            self.active_summaries = 0
+            self.max_active_summaries = 0
+
+        async def generate(self, request: GenerationRequest):
+            if request.stage == "memory_extraction":
+                self.requests.append(request)
+                return GenerationResponse(
+                    text=json.dumps(
+                        {
+                            "result": "memories",
+                            "memories": [
+                                {"content": f"Alice fact {index}."}
+                                for index in range(7)
+                            ],
+                        }
+                    ),
+                    input_tokens=6,
+                    output_tokens=4,
+                    total_tokens=10,
+                    request_id="seven-memory-request",
+                )
+            if request.stage == "subject_summary_refresh":
+                self.active_summaries += 1
+                self.max_active_summaries = max(
+                    self.max_active_summaries, self.active_summaries
+                )
+                try:
+                    await asyncio.sleep(0.01)
+                    return await super().generate(request)
+                finally:
+                    self.active_summaries -= 1
+            return await super().generate(request)
+
+    async def scenario() -> None:
+        generation = ConcurrentSummaries()
+        engine = await FluxFold.open(
+            db_path=str(tmp_path / "summary-concurrency.sqlite3"),
+            generation_provider=generation,
+            embedding_provider=FakeEmbeddingProvider(),
+        )
+        space = await engine.create_or_open_space("test:summary-concurrency")
+
+        result = await engine.add_episode(
+            space.memory_space_id, _episode("one", "Seven Alice facts.")
+        )
+
+        assert result.subjects_created == 7
+        assert [item.operation for item in result.maintenance] == [
+            "summary_refresh"
+        ] * 7
+        assert generation.max_active_summaries == 5
+        await engine.close()
+
+    asyncio.run(scenario())
+
+
+def test_add_episode_persists_terminal_failure_and_replays_it(tmp_path) -> None:
+    class RejectOneExtraction(FakeGenerationProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rejection_count = 0
+
+        async def generate(self, request: GenerationRequest):
+            if request.stage == "memory_extraction":
+                payload = json.loads(request.user_prompt)
+                content = str(payload["episode"]["messages"][-1]["content"])
+                if content == "REJECT":
+                    self.rejection_count += 1
+                    raise ProviderError(ErrorClass.POLICY_REJECTED, "rejected")
+            return await super().generate(request)
+
+    async def scenario() -> None:
+        generation = RejectOneExtraction()
+        events: list[dict[str, object]] = []
+        engine = await FluxFold.open(
+            db_path=str(tmp_path / "terminal.sqlite3"),
+            generation_provider=generation,
+            embedding_provider=FakeEmbeddingProvider(),
+            event_sink=events.append,
+        )
+        space = await engine.create_or_open_space("test:terminal")
+        rejected = _episode("rejected", "REJECT", 0)
+
+        for _ in range(2):
+            with pytest.raises(StageFailure) as raised:
+                await engine.add_episode(space.memory_space_id, rejected)
+            assert raised.value.error_class == ErrorClass.POLICY_REJECTED
+        accepted = await engine.add_episode(
+            space.memory_space_id, _episode("accepted", "Alice likes hiking.", 1)
+        )
+
+        assert generation.rejection_count == 1
+        assert accepted.memories_created == 1
+        assert (
+            len(
+                [
+                    event
+                    for event in events
+                    if event["event_type"] == "episode_terminal_failure"
+                ]
+            )
+            == 1
+        )
         await engine.close()
 
     asyncio.run(scenario())
@@ -104,10 +369,10 @@ def test_existing_subject_link_triggers_review(tmp_path) -> None:
             event_sink=events.append,
         )
         space = await engine.create_or_open_space("test:review")
-        await engine.add(
+        await engine.add_episode(
             space.memory_space_id, _episode("one", "Alice likes hiking.", 0)
         )
-        second = await engine.add(
+        second = await engine.add_episode(
             space.memory_space_id, _episode("two", "Alice bought boots.", 1)
         )
         assert second.subjects_created == 0
@@ -154,19 +419,19 @@ def test_linked_existing_subject_summary_is_rewritten_without_old_summary(
             ),
         )
         space = await engine.create_or_open_space("test:refresh")
-        await engine.add(
+        await engine.add_episode(
             space.memory_space_id, _episode("one", "Alice likes hiking.", 0)
         )
-        second = await engine.add(
+        second = await engine.add_episode(
             space.memory_space_id, _episode("two", "Alice bought boots.", 1)
         )
 
         assert [item.operation for item in second.maintenance] == ["summary_refresh"]
-        request = next(
+        request = [
             item
             for item in generation.requests
             if item.stage == "subject_summary_refresh"
-        )
+        ][-1]
         payload = json.loads(request.user_prompt)
         assert "summary" not in payload["subject"]
         assert {item["content"] for item in payload["subject"]["memories"]} == {
@@ -201,7 +466,7 @@ def test_search_groups_subjects_and_only_exposes_five_summaries(tmp_path) -> Non
         )
         space = await engine.create_or_open_space("test:search-groups")
         for index in range(9):
-            await engine.add(
+            await engine.add_episode(
                 space.memory_space_id,
                 _episode(
                     str(index), f"Unique fact number {index} token {index * 17}.", index
@@ -226,13 +491,13 @@ def test_search_groups_subjects_and_only_exposes_five_summaries(tmp_path) -> Non
         ]
         assert len(candidate_groups) == 8
         assert len({group["subject_id"] for group in candidate_groups}) == 8
-        assert sum("summary" in group for group in candidate_groups) == 5
+        assert all("summary" not in group for group in candidate_groups)
         await engine.close()
 
     asyncio.run(scenario())
 
 
-def test_failed_summary_refresh_is_local_and_a_later_link_rewrites_it(tmp_path) -> None:
+def test_failed_summary_refresh_is_recovered_by_episode_replay(tmp_path) -> None:
     class FailFirstRefresh(FakeGenerationProvider):
         def __init__(self) -> None:
             super().__init__()
@@ -249,8 +514,9 @@ def test_failed_summary_refresh_is_local_and_a_later_link_rewrites_it(tmp_path) 
     async def scenario() -> None:
         generation = FailFirstRefresh()
         events: list[dict[str, object]] = []
+        database = tmp_path / "resume-refresh.sqlite3"
         engine = await FluxFold.open(
-            db_path=str(tmp_path / "resume-refresh.sqlite3"),
+            db_path=str(database),
             generation_provider=generation,
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
@@ -260,12 +526,10 @@ def test_failed_summary_refresh_is_local_and_a_later_link_rewrites_it(tmp_path) 
             event_sink=events.append,
         )
         space = await engine.create_or_open_space("test:resume-refresh")
-        await engine.add(
-            space.memory_space_id, _episode("one", "Alice likes hiking.", 0)
-        )
-        second_episode = _episode("two", "Alice bought boots.", 1)
-        second = await engine.add(space.memory_space_id, second_episode)
-        assert second.maintenance == ()
+        episode = _episode("one", "Alice likes hiking.", 0)
+        with pytest.raises(StageFailure) as raised:
+            await engine.add_episode(space.memory_space_id, episode)
+        assert raised.value.error_class == ErrorClass.TRANSIENT_TRANSPORT
         assert any(
             event["event_type"] == "subject_summary_refresh_failed"
             and event["error_class"] == ErrorClass.TRANSIENT_TRANSPORT.value
@@ -279,18 +543,107 @@ def test_failed_summary_refresh_is_local_and_a_later_link_rewrites_it(tmp_path) 
         )
 
         subject_id = engine._store.active_subject_ids(space.memory_space_id)[0]
-        stale = engine._store.subject_snapshot(space.memory_space_id, subject_id)
-        assert stale.summary == "Alice likes hiking."
-
-        third = await engine.add(
-            space.memory_space_id, _episode("three", "Alice planned a trail.", 2)
+        assert (
+            engine._store.subject_snapshot(space.memory_space_id, subject_id).summary
+            is None
         )
-        assert [item.operation for item in third.maintenance] == ["summary_refresh"]
-        refreshed = engine._store.subject_snapshot(space.memory_space_id, subject_id)
-        assert "Alice likes hiking." in refreshed.summary
-        assert "Alice bought boots." in refreshed.summary
-        assert "Alice planned a trail." in refreshed.summary
         await engine.close()
+
+        resumed_generation = FakeGenerationProvider()
+        resumed = await FluxFold.open(
+            db_path=str(database),
+            generation_provider=resumed_generation,
+            embedding_provider=FakeEmbeddingProvider(),
+        )
+        replay = await resumed.add_episode(space.memory_space_id, episode)
+        assert replay.replayed is True
+        assert [item.operation for item in replay.maintenance] == ["summary_refresh"]
+        assert {request.stage for request in resumed_generation.requests} == {
+            "subject_summary_refresh"
+        }
+        refreshed = resumed._store.subject_snapshot(space.memory_space_id, subject_id)
+        assert "Alice likes hiking." in refreshed.summary
+        await resumed.close()
+
+    asyncio.run(scenario())
+
+
+def test_replay_only_retries_unfinished_summary_refresh_targets(tmp_path) -> None:
+    class ThreeMemoriesWithOneRefreshFailure(FakeGenerationProvider):
+        def __init__(self) -> None:
+            super().__init__(always_new_subject=True)
+
+        async def generate(self, request: GenerationRequest):
+            if request.stage == "memory_extraction":
+                self.requests.append(request)
+                return GenerationResponse(
+                    text=json.dumps(
+                        {
+                            "result": "memories",
+                            "memories": [
+                                {"content": f"Alice fact {index}."}
+                                for index in range(3)
+                            ],
+                        }
+                    ),
+                    input_tokens=6,
+                    output_tokens=4,
+                    total_tokens=10,
+                    request_id="three-memory-request",
+                )
+            if request.stage == "subject_summary_refresh":
+                payload = json.loads(request.user_prompt)
+                content = payload["subject"]["memories"][0]["content"]
+                if content == "Alice fact 1.":
+                    self.requests.append(request)
+                    raise ProviderError(
+                        ErrorClass.TRANSIENT_TRANSPORT,
+                        "temporary refresh failure",
+                    )
+            return await super().generate(request)
+
+    async def scenario() -> None:
+        database = tmp_path / "partial-refresh-replay.sqlite3"
+        generation = ThreeMemoriesWithOneRefreshFailure()
+        engine = await FluxFold.open(
+            db_path=str(database),
+            generation_provider=generation,
+            embedding_provider=FakeEmbeddingProvider(),
+        )
+        space = await engine.create_or_open_space("test:partial-refresh-replay")
+        episode = _episode("one", "Three Alice facts.")
+
+        with pytest.raises(StageFailure):
+            await engine.add_episode(space.memory_space_id, episode)
+
+        subject_ids = engine._store.active_subject_ids(space.memory_space_id)
+        summaries = [
+            engine._store.subject_snapshot(space.memory_space_id, subject_id).summary
+            for subject_id in subject_ids
+        ]
+        assert sum(summary is None for summary in summaries) == 1
+        assert sum(summary is not None for summary in summaries) == 2
+        await engine.close()
+
+        resumed_generation = FakeGenerationProvider()
+        resumed = await FluxFold.open(
+            db_path=str(database),
+            generation_provider=resumed_generation,
+            embedding_provider=FakeEmbeddingProvider(),
+        )
+        replay = await resumed.add_episode(space.memory_space_id, episode)
+
+        assert replay.replayed is True
+        assert [item.operation for item in replay.maintenance] == ["summary_refresh"]
+        assert [request.stage for request in resumed_generation.requests] == [
+            "subject_summary_refresh"
+        ]
+        assert all(
+            resumed._store.subject_snapshot(space.memory_space_id, subject_id).summary
+            is not None
+            for subject_id in subject_ids
+        )
+        await resumed.close()
 
     asyncio.run(scenario())
 
@@ -304,7 +657,9 @@ def test_rebuild_retrieval_embeddings_switches_model_atomically(tmp_path) -> Non
             embedding_provider=FakeEmbeddingProvider(revision="1"),
         )
         space = await first.create_or_open_space("test:rebuild")
-        await first.add(space.memory_space_id, _episode("one", "Alice likes hiking."))
+        await first.add_episode(
+            space.memory_space_id, _episode("one", "Alice likes hiking.")
+        )
         await first.close()
 
         second = await FluxFold.open(
@@ -353,12 +708,18 @@ def test_subject_split_outcomes(
         space = await engine.create_or_open_space(f"test:{split_result}")
         result = None
         for index in range(episode_count):
-            result = await engine.add(
+            result = await engine.add_episode(
                 space.memory_space_id,
                 _episode(str(index), f"Alice hiking fact {index}.", index),
             )
         assert result is not None
         assert result.maintenance[0].operation == expected_operation
+        split_request = next(
+            request
+            for request in generation.requests
+            if request.stage == "subject_split"
+        )
+        assert "summary" not in json.loads(split_request.user_prompt)["subject"]
         statistics = engine.space_statistics(space.memory_space_id)
         assert statistics["active_subjects"] == expected_active_subjects
         assert statistics["subject_split_count"] == 1
@@ -388,7 +749,7 @@ def test_split_retries_when_a_moved_memory_would_lose_its_direct_link(tmp_path) 
         space = await engine.create_or_open_space("test:split-direct")
         result = None
         for index in range(2):
-            result = await engine.add(
+            result = await engine.add_episode(
                 space.memory_space_id,
                 _episode(str(index), f"Alice hiking fact {index}.", index),
             )
@@ -421,11 +782,11 @@ def test_association_search_is_called_at_most_once(tmp_path) -> None:
             event_sink=events.append,
         )
         space = await engine.create_or_open_space("test:association")
-        await engine.add(
+        await engine.add_episode(
             space.memory_space_id, _episode("one", "Alice likes hiking.", 0)
         )
         generation.association_search_once = True
-        result = await engine.add(
+        result = await engine.add_episode(
             space.memory_space_id, _episode("two", "Alice bought boots.", 1)
         )
         assert result.subjects_created == 0
@@ -457,8 +818,12 @@ def test_no_valuable_memory_is_a_completed_replay(tmp_path) -> None:
             embedding_provider=FakeEmbeddingProvider(),
         )
         space = await engine.create_or_open_space("test:empty")
-        first = await engine.add(space.memory_space_id, _episode("one", "NO_MEMORY"))
-        replay = await engine.add(space.memory_space_id, _episode("one", "NO_MEMORY"))
+        first = await engine.add_episode(
+            space.memory_space_id, _episode("one", "NO_MEMORY")
+        )
+        replay = await engine.add_episode(
+            space.memory_space_id, _episode("one", "NO_MEMORY")
+        )
         assert first.memories_created == 0
         assert first.operation_id is not None
         assert replay.replayed is True
@@ -487,10 +852,10 @@ def test_review_provenance_and_memory_changes(tmp_path, review_mode: str) -> Non
             event_sink=events.append,
         )
         space = await engine.create_or_open_space(f"test:{review_mode}")
-        await engine.add(
+        await engine.add_episode(
             space.memory_space_id, _episode("one", "Alice likes hiking.", 0)
         )
-        result = await engine.add(
+        result = await engine.add_episode(
             space.memory_space_id, _episode("two", "Alice bought boots.", 1)
         )
         assert result.maintenance[0].operation == "review"
@@ -500,6 +865,10 @@ def test_review_provenance_and_memory_changes(tmp_path, review_mode: str) -> Non
             if request.stage == "subject_review"
         ]
         assert len(review_calls) == (2 if review_mode == "provenance_request" else 1)
+        assert all(
+            "summary" not in json.loads(request.user_prompt)["subject"]
+            for request in review_calls
+        )
         review_completed = next(
             event
             for event in events

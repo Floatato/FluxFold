@@ -18,14 +18,26 @@ def test_build_metrics_distinguish_successful_and_failed_llm_calls(tmp_path) -> 
             "event_type": "llm_call",
             "result": "success",
             "total_tokens": 10,
+            "input_tokens": 7,
+            "output_tokens": 3,
         }
     )
-    writer.event({"event_type": "llm_call", "result": "failed", "total_tokens": 7})
+    writer.event(
+        {
+            "event_type": "llm_call",
+            "result": "failed",
+            "total_tokens": 7,
+            "input_tokens": 5,
+            "output_tokens": 2,
+        }
+    )
 
     assert writer.build_metrics() == {
         "successful_llm_call_count": 1,
         "failed_llm_call_count": 1,
-        "write_llm_total_tokens": 17,
+        "build_llm_input_tokens": 12,
+        "build_llm_output_tokens": 5,
+        "build_llm_total_tokens": 17,
         "terminal_failure_count": 0,
     }
 
@@ -132,8 +144,12 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
     sample_text = paths.llm_io_samples.read_text(encoding="utf-8")
     assert "## extract · sample 1" in sample_text
     assert "You are a memory extractor." in sample_text
-    assert generation.max_active_extractions > 1
+    assert generation.max_active_extractions == 1
     build_summary = json.loads(paths.build_summary.read_text(encoding="utf-8"))
     assert build_summary["successful_llm_call_count"] > 0
     assert build_summary["failed_llm_call_count"] == 0
+    assert build_summary["build_llm_input_tokens"] > 0
+    assert build_summary["build_llm_output_tokens"] > 0
+    assert build_summary["build_llm_total_tokens"] > 0
+    assert "write_llm_total_tokens" not in build_summary
     assert "write_llm_calls" not in build_summary

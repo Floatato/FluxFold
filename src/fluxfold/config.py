@@ -26,7 +26,7 @@ class FluxFoldConfig:
     subject_candidate_top_k: int = 8
     subject_candidate_min_similarity: float = 0.25
     subject_candidate_attached_memory_k: int = 1
-    memory_candidate_top_k: int = 16
+    memory_candidate_top_k: int = 8
     memory_candidate_min_similarity: float = 0.35
     memory_candidate_attached_subject_k: int = 1
     association_search_enabled: bool = True
@@ -61,7 +61,8 @@ class FluxFoldConfig:
     retry_multiplier: float = 2.0
     embedding_batch_size: int = 100
     embedding_request_timeout_seconds: float = 60
-    embedding_max_concurrency: int = 4
+    embedding_batch_concurrency_per_operation: int = 4
+    subject_summary_refresh_concurrency_per_episode: int = 5
     exact_scan_batch_rows: int = 8_192
     sqlite_busy_timeout_ms: int = 5_000
     sqlite_transaction_max_retries: int = 5
@@ -69,7 +70,6 @@ class FluxFoldConfig:
     sqlite_transaction_retry_multiplier: float = 2.0
     sqlite_wal_autocheckpoint_pages: int = 1_000
     benchmark_memory_space_build_concurrency: int = 10
-    benchmark_extraction_concurrency_per_space: int = 10
     benchmark_search_concurrency: int = 5
     benchmark_seed: int = 42
     benchmark_memory_space_build_timeout_seconds: float = 7_200
@@ -100,6 +100,12 @@ class FluxFoldConfig:
             )
             and field.name not in {"association_search_max_calls"}
         }
+        positive_names.update(
+            {
+                "embedding_batch_concurrency_per_operation",
+                "subject_summary_refresh_concurrency_per_episode",
+            }
+        )
         for name in positive_names:
             value = getattr(self, name)
             if isinstance(value, (int, float)) and value <= 0:

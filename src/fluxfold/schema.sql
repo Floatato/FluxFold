@@ -116,7 +116,7 @@ CREATE TABLE IF NOT EXISTS subjects (
     subject_id TEXT PRIMARY KEY,
     memory_space_id TEXT NOT NULL REFERENCES memory_spaces(memory_space_id) ON DELETE RESTRICT,
     name TEXT NOT NULL,
-    summary TEXT NOT NULL,
+    summary TEXT,
     lifecycle_status TEXT NOT NULL CHECK (lifecycle_status IN ('active', 'retired')),
     new_memory_count INTEGER NOT NULL CHECK (new_memory_count >= 0),
     summary_revision INTEGER NOT NULL CHECK (summary_revision >= 0),
@@ -187,6 +187,13 @@ CREATE TABLE IF NOT EXISTS domain_operation_effects (
     object_id TEXT NOT NULL,
     effect_type TEXT NOT NULL,
     metadata_json TEXT CHECK (metadata_json IS NULL OR json_valid(metadata_json))
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS episode_summary_refresh_targets (
+    add_operation_id TEXT NOT NULL REFERENCES domain_operations(operation_id) ON DELETE RESTRICT,
+    subject_id TEXT NOT NULL REFERENCES subjects(subject_id) ON DELETE RESTRICT,
+    completed_by_operation_id TEXT REFERENCES domain_operations(operation_id) ON DELETE RESTRICT,
+    PRIMARY KEY (add_operation_id, subject_id)
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS ix_episode_space_sequence ON situational_episodes(memory_space_id, source_sequence);

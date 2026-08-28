@@ -79,23 +79,33 @@ class FakeGenerationProvider:
                     text=json.dumps(
                         {"result": "association_search", "query": "Alice activities"}
                     ),
+                    input_tokens=6,
+                    output_tokens=4,
                     total_tokens=10,
                     request_id="fake-request",
                 )
-            candidates = payload["candidates_by_memory"]["memory_1"]["subjects"]
+            memory_ref = payload["new_memories"][0]["memory_ref"]
+            candidates = payload["candidates_by_memory"][memory_ref]["subjects"]
+            provisional = payload["provisional_subjects"]
             if candidates and not self.always_new_subject:
                 subject = {
                     "kind": "existing",
                     "subject_id": candidates[0]["subject_id"],
                 }
                 new_subjects: list[dict[str, str]] = []
+            elif provisional and not self.always_new_subject:
+                subject = {
+                    "kind": "provisional",
+                    "subject_ref": provisional[0]["subject_ref"],
+                }
+                new_subjects = []
             else:
-                subject = {"kind": "new", "subject_ref": "alice_hiking"}
+                subject_ref = f"alice_hiking_{memory_ref}"
+                subject = {"kind": "new", "subject_ref": subject_ref}
                 new_subjects = [
                     {
-                        "subject_ref": "alice_hiking",
+                        "subject_ref": subject_ref,
                         "name": "Alice's hiking",
-                        "summary": "Alice likes hiking.",
                     }
                 ]
             text = json.dumps(
@@ -104,7 +114,7 @@ class FakeGenerationProvider:
                     "new_subjects": new_subjects,
                     "links": [
                         {
-                            "memory_ref": "memory_1",
+                            "memory_ref": memory_ref,
                             "subject": subject,
                             "basis": "direct",
                         }
@@ -139,7 +149,6 @@ class FakeGenerationProvider:
                             }
                         ],
                         "retirements": [memories[1]["memory_id"]],
-                        "summary": "Alice enjoys hiking.",
                     }
                 )
             else:
@@ -148,7 +157,6 @@ class FakeGenerationProvider:
                         "result": "review",
                         "updates": [],
                         "retirements": [],
-                        "summary": payload["subject"]["summary"],
                     }
                 )
         elif request.stage == "subject_summary_refresh":
@@ -179,7 +187,6 @@ class FakeGenerationProvider:
                             {
                                 "subject_ref": "trails",
                                 "name": "Alice's hiking trails",
-                                "summary": "Alice's trail-related hiking memories.",
                                 "links": [
                                     {"memory_id": first, "basis": "direct"},
                                     {"memory_id": second, "basis": "contextual"},
@@ -188,7 +195,6 @@ class FakeGenerationProvider:
                             {
                                 "subject_ref": "equipment",
                                 "name": "Alice's hiking equipment",
-                                "summary": "Alice's hiking equipment and preparation.",
                                 "links": [
                                     {"memory_id": first, "basis": "direct"},
                                     {"memory_id": second, "basis": "contextual"},
@@ -209,13 +215,11 @@ class FakeGenerationProvider:
                             {
                                 "subject_ref": "trails",
                                 "name": "Alice's hiking trails",
-                                "summary": "Alice's trail-related hiking memories.",
                                 "links": links,
                             },
                             {
                                 "subject_ref": "equipment",
                                 "name": "Alice's hiking equipment",
-                                "summary": "Alice's hiking equipment and preparation.",
                                 "links": links,
                             },
                         ],
@@ -225,12 +229,10 @@ class FakeGenerationProvider:
                 text = json.dumps(
                     {
                         "result": "partial_split",
-                        "remaining_summary": "Alice's remaining hiking information.",
                         "new_subjects": [
                             {
                                 "subject_ref": "equipment",
                                 "name": "Alice's hiking equipment",
-                                "summary": "Alice's hiking equipment and preparation.",
                                 "links": [
                                     {"memory_id": memory_id, "basis": "direct"}
                                     for memory_id in memory_ids[:2]
@@ -252,7 +254,13 @@ class FakeGenerationProvider:
             text = '{"label": "CORRECT"}' if '"label"' in request.user_prompt else "yes"
         else:
             raise AssertionError(f"unexpected generation stage: {request.stage}")
-        return GenerationResponse(text=text, total_tokens=10, request_id="fake-request")
+        return GenerationResponse(
+            text=text,
+            input_tokens=6,
+            output_tokens=4,
+            total_tokens=10,
+            request_id="fake-request",
+        )
 
     async def close(self) -> None:
         return None

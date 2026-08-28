@@ -30,10 +30,10 @@ Memory Engine 的核心流程后再开始正式实验。
 
 ### 实验版
 
-- 实验版重点实现记忆添加、整理和检索，包括 memory extraction、批次 Subject linking、
+- 实验版重点实现记忆添加、整理和检索，包括 memory extraction、逐 memory Subject linking、
   Subject review、Subject split 和公开 `search` 的完整流程。详细流程见
   `design_detailed.md` 1.2～1.3 节。
-- 实验版提供能够每次加入一个数据集 session 的 `add` API。数据集 session 作为已经
+- 实验版提供能够每次加入一个数据集 session 的 `add_episode` API。数据集 session 作为已经
   划定边界的输入片段直接进入记忆提取流程。详细入口与规范化协议见
   `design_detailed.md` 1.1.13 和 1.2.1 节。
 - 实验版提供满足 `LongMemEval-S` 与 `LoCoMo_refined` 评测要求的 `search` API，并为
@@ -67,14 +67,14 @@ Memory Engine 的当前行为、数据表示、全部已定配置和处理流程
 
 FluxFold 通过宿主专用 connector 接入可替换的主 Agent。connector 是位于宿主与 FluxFold library API 之间的外围适配层，不是主 Agent 本身；它负责把宿主生命周期事件和消息格式转换为 FluxFold 的统一交互语义。Memory Engine core 不依赖 Claude Code、Codex 或其他特定宿主。
 
-- `add` 与 `search` 是 FluxFold library 对调用方提供的核心 operation。实验版 `add` 接收已经规范化的 dataset episode 并直接进入记忆构建；正式版 `add` 接收宿主无关的结构化交互并委托给内部 `add_into_buffer`。两阶段复用同一套 episode-to-memory 核心逻辑，但入口语义分别遵循 `design_detailed.md` 1.1.13、1.2.1 和 2.2.1 节。`search` 返回可独立渲染的结构化事实结果，详细契约见 1.1.13 和 1.3 节。
+- `add_episode`、正式版 `add` 与 `search` 是三个不同语义层次的 library operation。`add_episode(memory_space_id, episode)` 把一个边界已经确定的 episode 加入 memory store；调用结束时该 episode 已成功、合法地产生零条 memory，或已经持久化可重放的终态失败并抛出异常。实验版 benchmark 直接调用它。正式版 `add` 接收宿主无关的结构化交互，语义是 `add_into_buffer`，durable receive 成功后即返回；之后 boundary detection seal 出 episode，再由后台 coordinator 调用同一个 `add_episode` 核心。`search` 返回可独立渲染的结构化事实结果。详细契约见 `design_detailed.md` 1.1.13、1.2.1、1.3 和 2.2.1 节。
 - library 另提供幂等的 `flush(stream_ref, idempotency_key)` lifecycle control，用于要求系统处理某个 stream 当前 buffer 的尾部。`flush` 不写入新的交互或记忆，不把 stream 永久关闭，因此不作为第三种 memory semantic operation；详细语义见 `design_detailed.md` 2.1.6 和 2.2.7 节。
-- `add_into_buffer` 是正式版 library 内部的 buffer 写入操作，不依赖具体触发方式。正常 Agent 集成由宿主生命周期 Hook 通过 connector 自动调用正式版公共 `add`；实验版 benchmark adapter 则向实验版入口提交规范化 dataset episode。主 Agent 的 LLM 不负责决定自动采集是否发生，也不决定从本轮交互中挑选什么内容写入。
+- `add_into_buffer` 是正式版公共 `add` 的内部实现语义，不依赖具体触发方式。正常 Agent 集成由宿主生命周期 Hook 通过 connector 自动调用正式版公共 `add`；实验版 benchmark runner 则把 adapter 规范化且按来源排序的 episode 提交给公共 `add_episode`。主 Agent 的 LLM 不负责决定自动采集是否发生，也不决定从本轮交互中挑选什么内容写入。
 - `search` 是主动检索通道，以 MCP 或宿主原生工具暴露，由主 Agent 的 LLM 决定何时调用以及 query 内容；正式版接入边界见 `design_detailed.md` 2.3 节。
 - 自动写入通道和主动检索通道职责分离；第一版不向主 Agent 暴露可由模型主动调用的 `add` 或 `add_into_buffer` 工具，避免同一交互经 Hook 和工具重复写入。这里不限制 benchmark、connector 或普通应用代码调用各自阶段的 public library 入口。
 - `add_into_buffer` 在原始交互经过确定性预处理并可靠持久化到 durable inbox 后即可向公共 `add` 的调用方确认接收，不等待基于 embedding 的 situation boundary 检测、situational episode 生成或 `memory unit` 与 `subject` 整理完成。connector 收到成功结果后再结束对应 Hook；详细事务边界见 `design_detailed.md` 2.1.7 和 2.2.1 节。
 - connector 必须支持重复触发或重试下的幂等接收。正式版 receipt、payload hash 与冲突语义见 `design_detailed.md` 2.1.3 和 2.2.1 节；稳定来源身份和 transcript 连续性规则见 2.2.8 节。
-- 正式版不同 streams 可以并行接收；同一 stream 的新 interactions 必须由调用方按来源顺序提交，core 使用 stream version/CAS 防止并发覆盖。FluxFold 不根据调用到达时间猜测来源顺序；详细并发语义和按需单 worker 规则见 `design_detailed.md` 2.1.7、2.2.1 和 2.2.6 节。
+- 正式版不同 streams 可以并行接收；同一 stream 的新 interactions 必须由调用方按来源顺序提交，core 使用 stream version/CAS 防止并发覆盖。每个 memory space 有独立的按需 coordinator：同 space 的 extraction 单并发，stateful link/write/maintenance 单并发，但前一 episode 进入 stateful 阶段后，后一 episode 可以开始 extraction；不同 spaces 可以并行，不设置全局 provider 并发限制。详细语义见 `design_detailed.md` 2.1.7、2.2.1 和 2.2.6 节。
 - 外部模型服务统称 model provider，其中生成记忆结构化结果的是 generation provider，生成
   retrieval 或 boundary vector 的是 embedding provider。provider adapter 将厂商错误归一化
   为公共 `error_class`：临时传输、限流和服务不可用执行有限重试，耗尽后临时暂停；认证、
@@ -95,14 +95,12 @@ FluxFold 通过宿主专用 connector 接入可替换的主 Agent。connector �
   尚未接收的完整 transcript records，再以最后一个 block 为 watermark 请求处理当前 stream
   的全部完整尾部。强制终止、宿主崩溃或断电无法保证即时 Hook，遗留 durable 状态在下次
   FluxFold 活动时恢复处理。
-- 每个 Claude Code session 使用独立 `stream_id` 和 buffer；resume 同一个 session 时继续使用
-  原 `stream_id`，不同 session 的 messages 不进入同一个 situational episode。
+- `stream` 表示一条线性对话分支。没有发生分叉的 resume 继续使用原 `stream_id`；从同一历史点产生不同后续的 fork/resume 必须建立新 stream，绝不能把两条分支的 messages 交错进同一个 situational episode。
 - 第一版正式版按 user 建立默认 memory space；同一 user 的多个 streams 可以共享记忆组织和检索范围，但不能混用 buffer。
 - FluxFold 通过由 Claude Code 启动的本地 stdio MCP server 暴露 `search`，由 Claude Code 的 LLM 主动调用。
 - Hook 可以作为短生命周期子进程运行，stdio MCP server 可以作为由宿主管理的会话期子进程运行；二者使用同一个持久化存储，不要求共享 Python 进程内存。
 - 这种宿主管理的本地进程不视为 FluxFold 提供独立常驻 service；当前仍不引入 daemon、网络监听端口或需要单独部署的服务。
-- 每次成功接收或显式 flush 都确保按需本地 worker 已被唤醒；多个入口通过跨进程互斥只允许
-  一个顺序 worker 推进 durable pending 状态，队列排空后 worker 退出。
+- 每次成功接收或显式 flush 都确保相关 memory space 的按需 coordinator 已被唤醒；跨进程互斥保证每个 space 同时最多有一个临时 pipeline owner。owner 只负责该次队列推进，队列排空后退出，不形成某个 space 对进程的永久绑定。
 - Claude Code connector 随主 package 发布，由 FluxFold CLI 显式安装、检查、更新和卸载。
   安装只合并 FluxFold 自己的 Hook、MCP 和使用说明，修改前建立可恢复备份；卸载只移除
   FluxFold 能确认拥有的配置，不删除数据库和 memories。
@@ -326,14 +324,14 @@ FluxFold 当前优先采用能够尽快形成端到端闭环的简单方案。�
 
 | 当前方案 | 需要重新评估或开展实验的条件 | 实验或演进方向 |
 | --- | --- | --- |
-| 每个 interaction stream 使用有界 SQLite durable ring buffer，单顺序 worker 从 SQLite pending state 恢复；model provider 临时错误、配置阻塞和终态单项失败按统一 `error_class` 区分。详细规则见 `design_detailed.md` 1.1.12、2.1.4、2.2.3 和 2.2.6 节 | 持续吞吐、宿主退出或多进程协调使单 worker 和固定容量淘汰无法满足真实使用，或错误分类在真实 provider 上无法稳定归一化 | 先调整 provider adapter、诊断和本地 worker coordination；达到多机规模后再评估消息队列 |
+| 每个 interaction stream 使用有界 SQLite durable ring buffer；每个 memory space 由按需 coordinator 以单 extraction lane 和单 stateful lane 从 SQLite pending state 恢复，两个 lanes 可跨相邻 episodes 流水重叠。model provider 临时错误、配置阻塞和终态单项失败按统一 `error_class` 区分。详细规则见 `design_detailed.md` 1.1.12、2.1.4、2.2.3 和 2.2.6 节 | 持续吞吐、宿主退出或多进程协调使 per-space coordinator 和固定容量淘汰无法满足真实使用，或错误分类在真实 provider 上无法稳定归一化 | 先调整 provider adapter、诊断和本地 coordinator；演进为多租户或达到多机规模后再引入全局 provider admission control 并评估消息队列 |
 | 正式版仅在合法的 `assistant final → user` 候选点上比较 message embedding 差值，并按 soft、hard 与 flush 规则选择候选边界或整体 seal。详细规则见 `design_detailed.md` 2.2.4 节 | 带标注样本或端到端任务持续出现过切、欠切、延迟过高或成本不可接受 | 调整 embedding、阈值和 buffer 策略；必要时将 LLM situation boundary detection 作为对照方案 |
 | memory extractor 按未来价值与独立生命周期提取 `0..N` 条自包含记忆，并保留 situational episode provenance。详细规则见 `design_detailed.md` 1.2.2 节 | 数据集或真实交互出现持续的提取遗漏、噪声、粒度不稳定、时间状态错误或来源归属错误 | 调整提取规则、结构化输出、字符数上限和 provenance 使用方式，并增加对应的定向评测 |
 | 写入阶段的 Subject 通道仅使用 `subject name` 召回候选。详细规则见 `design_detailed.md` 1.1.7 和 1.2.3 节 | Subject 候选召回持续遗漏相关组织单元，或 summary 能够提供有效区分信息 | 对比仅使用 `subject name` 与使用 `subject name + subject summary` 的召回效果 |
-| 写入阶段分别为新 memories 召回 Subject 与 Memory 候选，再由 LLM 对同一 episode 的整个组织批次一次性输出 links 和新 subjects；每条 memory 通常建立 `1～4` 个 link，并以 `direct` 或 `contextual` 记录依据。详细规则见 `design_detailed.md` 1.2.3 节 | 候选数量或相似度门槛造成漏召回、候选噪声，或两类 link 的判定不稳定 | 对召回参数和两个通道做消融，并分别评估漏链、错链与 `link_basis` 分类质量 |
-| 写入阶段可配置一次主动 `association_search`。详细规则见 `design_detailed.md` 1.2.3 节 | 语义相似度较低但具有实质影响的关系持续漏链，或主动检索引入过多 link 和推理成本 | 对关闭与开启主动关联性检索做消融实验，并评估关联召回率、错误 link 和调用成本 |
+| 写入阶段按提取顺序分别为每条新 memory 召回 Subject 与 Memory 候选，并各调用一次 linking LLM；先前调用提出的新 subject 以 provisional ref 供后续 memory 复用，全部结果仍按 episode 原子提交。每条 memory 通常建立 `1～4` 个 link，并以 `direct` 或 `contextual` 记录依据。详细规则见 `design_detailed.md` 1.2.3 节 | 候选数量或相似度门槛造成漏召回、候选噪声，provisional subject 复用不稳定，或两类 link 的判定不稳定 | 对召回参数和两个通道做消融，并分别评估漏链、错链、重复新 subject 与 `link_basis` 分类质量 |
+| 写入阶段可配置一次主动 `association_search`。query 写成这条记忆可能改变或约束的另一主题的名称（如 `Mike's dietary preferences`），而非复述新记忆；搜到的可以是漏掉的 direct home 或 contextual 目标。详细规则见 `design_detailed.md` 1.2.3 节 | 常识上会跨主题约束的记忆持续漏链，或主动检索引入过多 link 和推理成本 | 对关闭与开启主动关联性检索做消融实验，并评估关联召回率、错误 link 和调用成本 |
 | 新建 subject 时只建立当前 episode 组织批次中由 LLM 选定的 memory links，不回填更早 episode 的 memories。详细规则见 `design_detailed.md` 1.2.3 节 | 写入顺序导致早期记忆持续缺少后来才成立的 subject link | 评估有限回填本次候选中的旧 memory；采用前验证其是否造成零碎 subject、冗余 link 或 top-k 结果挤占 |
-| subject 新增记忆达到阈值后，审核全部当前 active 关联记忆，并最多按需读取一次 provenance。详细规则见 `design_detailed.md` 1.2.4 节 | 去重、冲突处理、summary 质量、审核成本或一次来源读取无法满足要求 | 调整触发阈值、审核 schema、来源读取条件和允许的记忆修改范围 |
+| subject 新增记忆达到阈值后，审核全部当前 active 关联记忆：除去重、冲突与退役外，还用同 subject 内其他记忆补全指代、把约束写回被影响的 memory、规范化平行实例、上提类别词，并最多按需读取一次 provenance。详细规则见 `design_detailed.md` 1.2.4 节 | 去重、冲突处理、summary 质量、正文编译质量、审核成本或一次来源读取无法满足要求 | 调整触发阈值、审核 schema、来源读取条件和允许的记忆修改范围 |
 | 审核只拼接共同描述同一个且不可独立更新的事实。详细规则见 `design_detailed.md` 1.2.4 节 | 数据集或真实查询表明紧密逻辑、因果或时序关系因分散存储而难以召回和使用 | 实验更大的拼接粒度，允许将不同但紧密关联的事实组成更丰富的 memory unit，并配套更复杂的更新措施，与当前方案比较 |
 | subject 达到 memory 数量或 content 字符软阈值后尝试 split；结果可以是 full split、partial split 或有明确理由的 defer split，实验版不设 subject 硬容量。详细规则见 `design_detailed.md` 1.2.5 节 | split 后仍频繁超限、结果碎片化、分组高度重叠、重要跨域 link 丢失，或参数无法跨 workload 泛化 | 调整触发阈值、最小记忆数量、结果 subject 规模目标、命名与多归属规则 |
 | 公开 `search` 为每个 subject 同时维护 name 与 name + summary embedding，默认使用 name embedding。详细规则见 `design_detailed.md` 1.1.7 和 1.3.1 节 | Subject 召回质量不足，或 summary 能补充 name 无法表达的检索信号 | 对比两种 subject embedding，并按数据集问题类型分析收益与 summary 陈旧带来的影响 |

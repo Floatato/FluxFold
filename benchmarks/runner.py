@@ -20,7 +20,7 @@ from benchmarks.runtime import (
 from benchmarks.scoring import score_predictions
 from fluxfold.config import FluxFoldConfig
 from fluxfold.engine import FluxFold
-from fluxfold.errors import ErrorClass, ProviderError, StageFailure, ValidationError
+from fluxfold.errors import ErrorClass, StageFailure, ValidationError
 from fluxfold.models import AddResult, NormalizedEpisode
 from fluxfold.providers import GenerationRequest
 
@@ -103,16 +103,6 @@ async def build_run(
                         "memory_space_id": memory_space.memory_space_id,
                     }
                 )
-                extraction_semaphore = asyncio.Semaphore(
-                    config.benchmark_extraction_concurrency_per_space
-                )
-
-                async def prepare(episode: NormalizedEpisode) -> object:
-                    async with extraction_semaphore:
-                        return await engine._prepare_add(
-                            memory_space.memory_space_id, episode
-                        )
-
                 last_completed_sequence = int(
                     last_episode_by_space.get(space.source_id, -1)
                 )
@@ -121,32 +111,37 @@ async def build_run(
                     for episode in space.episodes
                     if episode.source_sequence > last_completed_sequence
                 )
-                preparation_tasks = [
-                    asyncio.create_task(prepare(episode))
+
+                async def add_episode(episode: NormalizedEpisode) -> AddResult:
+                    writer.event(
+                        {
+                            "event_type": "episode_processing_started",
+                            "severity": "info",
+                            "timestamp_ms": int(time.time() * 1000),
+                            "space_key": space.space_key,
+                            "memory_space_id": memory_space.memory_space_id,
+                            "source_sequence": episode.source_sequence,
+                            "source_key": episode.source_key,
+                        }
+                    )
+                    return await engine.add_episode(
+                        memory_space.memory_space_id, episode
+                    )
+
+                add_tasks = [
+                    asyncio.create_task(add_episode(episode))
                     for episode in pending_episodes
                 ]
                 try:
-                    for episode, preparation_task in zip(
-                        pending_episodes, preparation_tasks, strict=True
+                    for episode, add_task in zip(
+                        pending_episodes, add_tasks, strict=True
                     ):
-                        writer.event(
-                            {
-                                "event_type": "episode_processing_started",
-                                "severity": "info",
-                                "timestamp_ms": int(time.time() * 1000),
-                                "space_key": space.space_key,
-                                "memory_space_id": memory_space.memory_space_id,
-                                "source_sequence": episode.source_sequence,
-                                "source_key": episode.source_key,
-                            }
-                        )
-                        first_attempt = _finish_prepared_add(engine, preparation_task)
                         result, failure = await _finish_add_item(
                             engine=engine,
                             memory_space_id=memory_space.memory_space_id,
                             episode=episode,
                             writer=writer,
-                            first_attempt=first_attempt,
+                            first_attempt=add_task,
                         )
                         if result is None:
                             assert failure is not None
@@ -175,10 +170,10 @@ async def build_run(
                                 last_episode_by_space,
                             )
                 finally:
-                    for preparation_task in preparation_tasks:
-                        if not preparation_task.done():
-                            preparation_task.cancel()
-                    await asyncio.gather(*preparation_tasks, return_exceptions=True)
+                    for add_task in add_tasks:
+                        if not add_task.done():
+                            add_task.cancel()
+                    await asyncio.gather(*add_tasks, return_exceptions=True)
                 summary[space.source_id] = engine.space_statistics(
                     memory_space.memory_space_id
                 )
@@ -410,26 +405,9 @@ async def _finish_add_item(
     try:
         if first_attempt is not None:
             return await first_attempt, None
-        return await engine.add(memory_space_id, episode), None
-    except (ProviderError, StageFailure) as error:
-        failure = (
-            error
-            if isinstance(error, StageFailure)
-            else StageFailure("embedding", error.error_class, error.message)
-        )
+        return await engine.add_episode(memory_space_id, episode), None
+    except StageFailure as failure:
         if failure.error_class in terminal_item:
-            engine.record_episode_terminal_failure(memory_space_id, episode, failure)
-            writer.event(
-                {
-                    "event_type": "episode_terminal_failure",
-                    "severity": "error",
-                    "timestamp_ms": int(time.time() * 1000),
-                    "memory_space_id": memory_space_id,
-                    "source_sequence": episode.source_sequence,
-                    "error_class": failure.error_class.value,
-                    "reason": failure.message,
-                }
-            )
             return None, failure
         event_type = (
             "memory_space_build_paused"
@@ -447,16 +425,7 @@ async def _finish_add_item(
                 "reason": failure.message,
             }
         )
-        if isinstance(error, StageFailure):
-            raise
-        raise failure from error
-
-
-async def _finish_prepared_add(
-    engine: FluxFold, preparation_task: asyncio.Task[object]
-) -> AddResult:
-    prepared = await preparation_task
-    return await engine._commit_prepared_add(prepared)  # type: ignore[arg-type]
+        raise
 
 
 def _load_checkpoint(path: Path) -> dict[str, object]:
