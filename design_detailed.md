@@ -685,8 +685,8 @@ Canonical payload 是确定性规范化后实际保存的 episode，包含 paylo
 ```text
 episode
 → memory extraction
-→ 按提取顺序对每条新 memory 分别召回候选并执行一次 Subject linking
-→ 后续 memory 可复用本 episode 先前 linking 已提出的 provisional subjects
+→ 每条新 memory 召回 subject name，合并为批次候选池
+→ 为整批新 memories 执行一个 Subject linking agent loop
 → 原子写入 memory、provenance、embedding、subject、links 和 operation
 → 先执行已触发的 Subject split / Subject review
 → 构造并持久化本 episode 的 summary refresh targets
@@ -699,7 +699,7 @@ LLM 与 embedding 在事务外运行。`episode_extractions` 以 episode input h
 
 同一 memory space 内的调用必须按 `source_sequence` 顺序提交。公共入口使用两个单并发
 lane：Stage A 校验并持久化 episode、执行 memory extraction 并生成新 memory embedding；
-Stage B 执行逐 memory 候选召回与 linking、原子提交和全部后续 maintenance。Stage A 完成
+Stage B 执行批次候选召回与 linking、原子提交和全部后续 maintenance。Stage A 完成
 episode N 后立即释放 extraction lane，因此 N 在 Stage B 运行时，N+1 可以开始 Stage A；
 Stage B 仍按 Stage A 的完成队列顺序进入，后序 episode 不能越过前序 episode。runner 可以
 提交同一 space 的全部待处理 `add_episode`，已完成 extraction、等待 Stage B 的 prepared
@@ -737,6 +737,17 @@ episode 存在来源时间时，message 中的相对时间表述换算为明确�
 content，换算只以该 episode 自身的来源时间为基准；只能近似到月或年时同时保留说话人的
 原始表述。来源时间缺失或无法支持时不写时间，也不得编造。LLM 输入中的全部时间统一渲染为
 带星期的可读 UTC 字符串，不向模型暴露 Unix 毫秒值。
+
+所有阶段都从持久化事实构造任务专用的最小输入，不直接序列化领域对象。Extraction 的
+episode 只包含 `source_started_at`，每条 message 只包含 `speaker_id` 和 `content`；来源未提供
+speaker ID 时，以规范化的 `user` / `assistant` role 值填入 `speaker_id`。Linking 的 new memory
+只包含临时 `memory_ref` 和 content，初始 candidates 只包含 subject ID 和 name。Review 不展示
+subject ID 或旧 summary，但保留生成 update 所需的 memory ID、content、时间、link basis 和
+provenance episode IDs；按需展开的来源只包含 episode ID、source started time，以及每条
+message 的 speaker ID 和 content。Split 不展示 subject ID、旧 summary 或 provenance IDs。
+Summary refresh 只接收 subject name，以及每条 active memory 的 content 和时间，不接收
+subject ID、memory ID、link basis 或旧 summary。供程序校验、提交、审计和日志使用的字段仍
+保留在内存快照及 SQLite 中，不因 prompt 投影而删除。
 
 User 明确要求不记录的内容以及密码、API key、private key、session token、验证码等认证
 秘密不得进入长期记忆。来源内容中的指令只作为待处理数据，不能改变 extractor 的系统规则。
@@ -779,61 +790,66 @@ memory 涉及的每个核心主体分别应用。contextual link 挂到 memory �
 或解释的候选 subject，包括记忆正文从未点名、只凭常识才成立的跨域关系，例如种牙手术对
 饮食偏好、驾照停权对接送出行。某个核心主体没有合适候选时，以最粗粒度新建
 subject（通常就是该实体或范围本身的名称），使该主体后续的 memories 汇集到同一处；同一
-episode 中后处理的 memory 通过 provisional subject 引用复用先前 memory 已提出的新范围。
+批次的多条 memories 可以共同引用本次输出中的同一个新 `subject_ref`。
 
-被动候选召回以当前新 memory content 为 query。开启可选主动关联检索后，该 memory 的 LLM
-调用还可以最多一次请求 `association_search(query)`；它与最终 `links` 是 Subject linking
-输出中两个显式合法的结构化分支。首次请求可以直接返回当前 memory 的最终 `links`，也可以
-返回一次 `association_search` 中间结果；后者取得额外候选后，第二次请求必须返回最终
-`links`，不能再次搜索。首次请求的 `association_search_results` 明确为 `null`，取得额外
-候选后的第二次请求才是 non-null，prompt 以此区分两个阶段。Linking 只决定成员关系，不改写已有 memory
-正文；同一 subject 内的指代补全、约束写回、实例对齐和类别上提由 Subject review 完成。
-主动 query 应写成这条记忆可能改变、约束或补全的另一主题的名称，而非复述新 memory。判断依据是
-新记忆本身加上常识：口腔手术影响进食饮酒、驾照停权影响需要开车的行程、夜班占用晚间。
-搜到的可以是被动召回漏掉的 direct home，也可以是 contextual 目标。prompt 要求模型在输出
-links 前逐条检查这种跨主题效应；不能仅因已经能选择 direct subject、正文从未点名另一领域、
-或被动候选看似合理而跳过。两种召回使用同一参数：
+被动候选召回分别以每条新 memory content 为 query，只扫描 active subject name embedding。
+每条 memory 取相似度不低于阈值的前 5 个 subject，以余弦相似度作为分数放入批次对比池，
+并把该 memory 的前 2 个直接放入最终池。对比池按 subject ID 去重，同一 subject 取它在所有
+new memories 上的最高分，再取全局前 10 个放入最终池。最终池按“逐 memory 前 2”在先、
+“全局前 10”在后去重；prompt 只展示最终池中每个 subject 的 ID 和 name，不展示分数、
+summary、关联 memory 或按 memory 分组的候选视图。
+
+本 episode 的全部新 memories 共用一个 Subject linking agent loop。模型每一轮可以返回整批
+最终 `links`，也可以返回一个 `association_search(query)` 工具请求；单次 loop 最多执行 5 次
+主动检索，第 6 个模型回合必须在已经累积的结果上给出最终 links。每次主动检索的候选展示
+保持详细的 Subject + Memory 双通道结构：Subject 通道包含 subject name、相似度和最相关的
+一条关联 memory，Memory 通道包含 memory content、相似度、时间和最相关的关联 subject；
+结果按 query 分轮累积，之前轮次不会被后续结果覆盖。
+
+主动 query 应写成某条新记忆可能改变、约束或补全的另一主题名称，而非复述 new memory。
+判断依据是新记忆本身加上常识：口腔手术影响进食饮酒、驾照停权影响需要开车的行程、夜班
+占用晚间。搜到的可以是被动召回漏掉的 direct home，也可以是 contextual 目标。prompt 要求
+模型在输出 links 前逐条检查这种跨主题效应；不能仅因已经能选择 direct subject、正文从未
+点名另一领域、或被动候选看似合理而跳过。Linking 只决定成员关系，不改写已有 memory 正文；
+同一 subject 内的指代补全、约束写回、实例对齐和类别上提由 Subject review 完成。
 
 
 | 配置项                                        | 值    | 含义                                             |
 | ------------------------------------------ | ---- | ---------------------------------------------- |
-| `subject_candidate_top_k`                  | 8    | Subject 通道最多保留的 subject 数                      |
+| `subject_candidate_top_k`                  | 5    | 每条 new memory 进入初始对比池的 subject 上限              |
+| `subject_candidate_direct_top_k`           | 2    | 每条 new memory 直接进入最终池的 subject 数                |
+| `subject_candidate_pool_top_k`             | 10   | 按 subject 最高分进入最终池的全局上限                       |
 | `subject_candidate_min_similarity`         | 0.25 | Subject 通道允许候选进入结果的最低 query-subject name 余弦相似度 |
+| `association_subject_candidate_top_k`      | 8    | 每次主动检索 Subject 通道的 subject 上限                  |
 | `subject_candidate_attached_memory_k`      | 1    | 每个 Subject 通道候选附带的关联 memory 数                  |
 | `memory_candidate_top_k`                   | 8    | Memory 通道最多保留的 memory 数                        |
 | `memory_candidate_min_similarity`          | 0.35 | Memory 通道允许候选进入结果的最低 query-memory 余弦相似度        |
 | `memory_candidate_attached_subject_k`      | 1    | 每个 Memory 通道候选附带的关联 subject 数                  |
-| `association_search_max_calls`             | 1    | 一次关联决策中最多执行的主动 association search 次数           |
+| `association_search_max_calls`             | 5    | 一个批次 linking agent loop 的主动检索调用上限              |
 | `memory_link_preferred_min`                | 1    | Prompt 建议一条 memory 通常至少链接的 subject 数           |
 | `memory_link_preferred_max`                | 4    | Prompt 建议一条 memory 通常最多链接的 subject 数           |
 | `memory_active_subject_link_max`           | 5    | 一条 memory 可以同时拥有的 active subject link 硬上限      |
 
 
-Subject 通道按 query 与 active subject name embedding 取前 8 个，再删除相似度低于 0.25
-的 subject。每个保留 subject 附带其 active memories 中与 query 最相似的 1 条；没有
-linked memory 时只提供 subject。
+主动检索的 Subject 通道按 query 与 active subject name embedding 取前 8 个，再删除相似度
+低于 0.25 的 subject。每个保留 subject 附带其 active memories 中与 query 最相似的 1 条；
+没有 linked memory 时只提供 subject。
 
-Memory 通道按 query 与 active memory content embedding 取前 8 条，再删除相似度低于
+主动检索的 Memory 通道按 query 与 active memory content embedding 取前 8 条，再删除相似度低于
 0.35 的 memory。每条保留 memory 附带其 active subjects 中 name embedding 与 query 最
 相似的 1 个；没有 subject 时只提供 memory。
 
-两个通道完成后，当前 memory 的候选按真实 subject-memory 关系组织成去重的 subject groups；
+主动检索的两个通道完成后，候选按真实 subject-memory 关系组织成去重的 subject groups；
 先列 Subject 通道 subjects，再列仅由 Memory 通道引入的 subjects，同一 subject 和同一组内
 的 memory 只展示一次。不同新 memories 的候选视图互相独立，只在各自视图内去重，不跨
-memory 去重或共享召回上限。link、review 和 split prompt 均不读取或展示任何 subject
-summary；候选只展示 subject name、命中 memory 和相似度。不计算融合分数、不建立更大的
-中间候选池、不重排或再次淘汰。所有检索只使用向量相似度；第一版不使用 BM25、全文或
-关键词匹配。
+memory 去重或共享召回上限。主动结果不展示 subject summary。所有检索只使用向量相似度；
+第一版不使用 BM25、全文或关键词匹配。
 
-程序在 extraction 后为本 episode 的全部新 memories 分配临时 `memory_ref`，再按 extraction
-顺序逐条处理。每条 memory 独立召回候选并执行一次最终 Subject linking LLM 调用；最终输出
-只覆盖当前 memory。该调用新提出的 subject 只有临时 `subject_ref` 和 name，并加入本 episode
-的 provisional subject 列表；后续 memory 的 prompt 会看到这些 provisional subjects，并可用
-`kind = "provisional"` 复用它们，也可以用 `kind = "new"` 提出新的 subject。provisional
-subjects 尚无正式 ID、summary 或 embedding，也不参与向量召回。所有 memories linking
-成功后，程序汇总并校验 links，为新 subjects 分配正式 ID、生成 name embeddings，再把整个
-episode 的 memory、provenance、subjects、links 和 extraction completion 原子提交。因此逐条
-LLM linking 不会暴露逐条正式写入或部分提交。
+程序在 extraction 后为本 episode 的全部新 memories 分配临时 `memory_ref`，完成上述批次
+候选池后启动一次 linking agent loop。最终输出必须覆盖每条 memory；多条 memories 可以通过
+`kind = "new"` 指向同一个新 `subject_ref`。所有 links 校验成功后，程序为新 subjects 分配
+正式 ID、生成 name embeddings，再把整个 episode 的 memory、provenance、subjects、links
+和 extraction completion 原子提交。agent loop 的中间检索轮次不暴露正式写入或部分结果。
 
 LLM 判断应链接哪些已有 subject、是否新建 subject，以及每条 link 的 `direct` 或
 `contextual` basis。`direct` 表示该 subject 是这条 memory 的组织归属。`contextual`
@@ -919,13 +935,13 @@ subject 只附带 1 条 memory，且仅 Subject 通道命中时展示 summary。
 相对时间需要对齐、或仅凭 content 无法判断冲突是否真实时，先请求 provenance。
 
 审核进行一至两次结构化输出。`provenance_request` 与最终 `review` 是两个显式合法的
-结构化分支。首次请求的 `provenance_may_be_requested` 为 true、`requested_provenance`
-为 null；仅在 content 和元数据不足以解决重复、冲突、纠正、状态变化、信息归属或若干
+结构化分支。首次请求的 `requested_provenance` 为 null；仅在 content 和元数据不足以解决
+重复、冲突、纠正、状态变化、信息归属或若干
 memory 必须共享的日期，且来源会改变判断时，首轮可以返回完整的 `provenance_request`
 结果。一次最多请求 8 个不同
 memory IDs，系统返回这些 memories 当前 provenance 涉及的全部 episodes，不设置
-`review_provenance_episode_max`。第二次请求的 `provenance_may_be_requested` 为 false、
-`requested_provenance` 为 non-null，此时只能输出最终 `review`，不能再次请求 provenance。
+`review_provenance_episode_max`。第二次请求的 `requested_provenance` 为 non-null，此时只能
+输出最终 `review`，不能再次请求 provenance。
 
 最终结果只列出 memory updates 和 memory retirements。未列出的 memory 保持不变。update
 可以替换 content、provenance 或两者，但必须至少改变一项；提供
@@ -943,8 +959,8 @@ provenance 时，它表示包含 1--6 个不同有效 episode IDs 的完整替�
 其他 linked subjects。targets 归属于本 episode 的 add operation，并在结构性事务中持久化；
 同一 subject 只保留一个 target。
 
-每个 target 单独调用一次 LLM，输入只包含 subject name 和全部当前 active memories 的 ID、
-content、时间与 link basis，明确不提供旧 summary；输出是基于这些 memories 的完整新
+每个 target 单独调用一次 LLM，输入只包含 subject name 和全部当前 active memories 的
+content 与时间，明确不提供 subject ID、memory ID、link basis 或旧 summary；输出是基于这些 memories 的完整新
 summary。提交时重新校验成员集合、memory content、link basis 和 `summary_revision`，随后
 整体替换 summary、更新 `name_summary` embedding，并原子标记 target 完成。refresh 不清零
 `new_memory_count`，因此不会延后后续 review。
@@ -1141,16 +1157,11 @@ memory_compression_rate = 1 - memory_chars / source_chars
 
 #### 1.2.7 实验版记忆构建日志
 
-每次 memory-space build 生成三份按处理顺序追加的日志：一份 JSONL 结构化事件日志，
-用于机器分析、统计和定位失败；一份 Markdown 高可读性审计日志，用于人工完整复盘 memories
-和 subjects 如何形成及演化；一份 Markdown LLM 输入输出采样日志，用于人工阅读完整 prompt
-与模型输出。结构化事件日志与审计日志共享 build/run ID、memory-space ID、episode ID、
-source sequence、domain operation ID 及正式对象 ID；LLM 采样日志通过 `run_id` 与
-`request_id` 对应到同一次 `llm_call`。
+每次 memory-space build 生成四份日志：一份 JSONL 结构化事件日志，用于机器分析、统计和定位失败；一份 Markdown 高可读性审计日志，用于人工完整复盘 memories 和 subjects 如何形成及演化；一份 Markdown LLM 输入输出采样日志，用于人工阅读完整 prompt 与模型输出；一份覆盖写入的 Markdown 当前记忆库快照，按 memory space 组织展示当前全部 active subjects 的 name 与 summary，以及各自 active linked memories 的 content。结构化事件日志与审计日志共享 build/run ID、memory-space ID、episode ID、source sequence、domain operation ID 及正式对象 ID；LLM 采样日志通过 `run_id` 与 `request_id` 对应到同一次 `llm_call`。记忆库快照不进入结构化事件 JSONL。
 
-这三份日志是实验产物，不是 SQLite 正式数据或可写事实源，不能反向驱动记忆状态，也不能
-进入后续 LLM 输入。高可读性日志包含完整 benchmark 对话、memory 内容以及完整 LLM prompt
-与输出，必须按包含原始对话数据的敏感实验产物保存。
+这四份日志是实验产物，不是 SQLite 正式数据或可写事实源，不能反向驱动记忆状态，也不能
+进入后续 LLM 输入。高可读性日志和记忆库快照包含完整 memory 内容；审计日志还包含完整
+benchmark 对话以及完整 LLM prompt 与输出，必须按包含原始对话数据的敏感实验产物保存。
 
 ##### 结构化事件日志
 
@@ -1160,11 +1171,10 @@ source sequence、domain operation ID 及正式对象 ID；LLM 采样日志通�
 - memory-space build 的开始、完成、暂停、恢复和失败；
 - episode 开始处理、extraction 完成、Subject linking 完成和原子提交；
 - 一次 episode 提取、创建和写入的 memory 数，新建 subject 数及新建 link 数；
-- 本 episode 各条 Subject linking 最终决策 prompt 合计涉及的唯一 candidate memory 数；
-每条新 memory 的实际候选视图只在其 Subject/Memory 双通道之间去重，不因该聚合日志指标而
-跨新 memories 合并。若至少一次调用 association search，还记录
-`association_search_called = true`，以及主动结果相对全部被动结果额外引入的唯一 candidate
-memory 数；
+- 本 episode 的 association search 详细结果合计涉及的唯一 candidate memory 数；初始
+name-only candidates 不包含 memory，因此未调用主动检索时该值为 0。若至少一次调用
+association search，还记录 `association_search_called = true`，以及主动结果相对初始候选额外
+引入的唯一 candidate memory 数；
 - 记忆写入与整理阶段每次 LLM 调用的阶段、attempt、success/failed 结果、耗时，以及
 `input_tokens`、`output_tokens` 和 `total_tokens`；不记录 generation provider
 使用的其他 token 子类别；
@@ -1232,14 +1242,24 @@ repair 包装）和完整模型输出。需要 structured-output 修复才成功
 
 - `extract`、`link`、`review`、`split`、`summary` 各 2 次。`link` 只采未调用
 `association_search` 的单轮路径；`review` 只采未请求 provenance 的单轮路径。
-- 若发生 `association_search`，额外采样 1 次完整两轮：第 1 轮 linking prompt 与
-`association_search` 请求，第 2 轮带上 association 候选后的 linking prompt 与最终 linking
-结果。
+- 若发生 `association_search`，额外采样 1 个完整 agent loop：记录每次 linking prompt、对应
+的 `association_search` 请求，以及累积全部 association 候选后的最终 linking 结果；轮数为
+实际工具调用次数加一，最多 6 轮。
 - 若发生 `provenance_viewed`，额外采样 1 次完整两轮：第 1 轮 review prompt 与
 provenance 请求，第 2 轮带上来源 episodes 后的 review prompt 与最终 review 结果。
 
 某类调用在本次 build 中未出现则该项空缺。显式恢复续跑时，已写入文件的样本计入配额，
 不因引擎重启而重复超过上限。JSON 形态的 prompt 与输出按缩进展开，便于阅读。
+
+##### 当前记忆库快照
+
+每次 episode 的 extraction、linking 与本 episode 维护全部成功完成后，覆盖写入
+`memory_bank.md`。整次 memory-space build 成功结束时再写一次最终快照。该文件只展示当前
+正式状态：按 `space_key` 分组的全部 active subjects，每个 subject 给出 name 和 summary，
+其下列出当前 active linked memories 的 content。不包含 subject ID、memory ID、link basis、
+retired 对象、来源 episode 或过程事件。同一 memory 若同时链到多个 subjects，在每个
+subject 下各出现一次。新建尚未 refresh 的 subject 可以没有 summary 正文。该快照反映写完
+当下的 SQLite 状态，不是按时间追加的过程日志。
 
 ### 1.3 记忆检索
 
@@ -1320,11 +1340,10 @@ Extraction 使用判别结果明确区分提取成功与“没有有价值的记
 生成的正式 memory ID。畸形对象、缺失判别字段或 `result = "memories"` 但数组为空均不是
 `no_valuable_memory`。
 
-#### 1.4.2 Per-memory Subject linking
+#### 1.4.2 Batched Subject linking
 
-每次最终 linking 结果只覆盖当前一条 memory。新 subject 使用本 episode 内稳定的
-`subject_ref`；后续 memory 可通过 `provisional` 目标引用先前调用提出的 subject。当前调用
-通过 `new` 目标引用自己提出的新 subject：
+一个最终 linking 结果覆盖本 episode 的全部 new memories。新 subject 使用本次输出内稳定的
+`subject_ref`，多条 memory 可以通过 `new` 目标共同引用它：
 
 ```json
 {
@@ -1345,27 +1364,27 @@ Extraction 使用判别结果明确区分提取成功与“没有有价值的记
       "memory_ref": "memory_1",
       "subject": {"kind": "new", "subject_ref": "new_subject_1"},
       "basis": "direct"
+    },
+    {
+      "memory_ref": "memory_2",
+      "subject": {"kind": "new", "subject_ref": "new_subject_1"},
+      "basis": "direct"
     }
   ]
 }
 ```
 
-如果当前 memory 使用一次可选的主动关联检索，中间请求可以采用以下形状；获得结果后仍需
-返回只覆盖当前 memory 的最终 linking 结果：
+如果 agent loop 使用主动关联检索，每轮中间请求采用以下形状；一个 loop 最多返回 5 次该
+形状，随后仍需返回覆盖整批 memories 的最终 linking 结果：
 
 ```json
 {"result": "association_search", "query": "the other topic this memory could change"}
 ```
 
-后续 memory 复用先前 provisional subject 时，link 目标形状为：
-
-```json
-{"kind": "provisional", "subject_ref": "new_subject_1"}
-```
-
-程序校验所有临时引用、已有 IDs、当前 memory 的 direct link 和 link 数量约束，并在应用前
-验证 existing IDs 属于当前 prompt 的候选集合、provisional refs 属于先前调用已经提出的集合。
-linking 输入中的 existing candidates 和 provisional subjects 均不包含 summary。
+程序校验所有临时引用、已有 IDs、每条 memory 的 direct link 和 link 数量约束，并在应用前
+验证 existing IDs 属于初始 `candidates` 或任一累积的 `association_search_results`。初始
+candidates 只包含 subject ID 和 name；主动结果保留详细的 Subject/Memory 双通道候选，但
+仍不包含 subject summary。
 
 #### 1.4.3 Subject review
 
@@ -1471,8 +1490,9 @@ subject 缺少 direct，或移出后某条 memory 不再有任何 active direct�
 
 #### 1.4.5 Subject summary refresh
 
-输入仅包含 subject ID、name 和全部当前 active memories，不包含旧 summary。输出整体替换
-summary。该阶段是唯一生成 subject summary 的阶段：
+输入仅包含 subject name，以及全部当前 active memories 的 content 和时间；不包含 subject
+ID、memory ID、link basis 或旧 summary。输出整体替换 summary。该阶段是唯一生成 subject
+summary 的阶段：
 
 ```json
 {

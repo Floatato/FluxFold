@@ -7,12 +7,16 @@ from pydantic import TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
 from fluxfold import EpisodeBlock, FluxFold, NormalizedEpisode, Role
-from fluxfold.models import LinkingStageOutput
+from fluxfold.models import LinkingStageOutput, MemorySnapshot, SubjectSnapshot
 from fluxfold.prompts import (
     LINKING_SYSTEM,
     REVIEW_SYSTEM,
     SPLIT_SYSTEM,
+    extraction_input,
     repair_input,
+    review_input,
+    split_input,
+    summary_refresh_input,
     validation_feedback,
 )
 from fluxfold.providers import GenerationRequest, GenerationResponse
@@ -49,13 +53,13 @@ class RepairingGenerationProvider(FakeGenerationProvider):
 
 def test_linking_prompt_contains_the_exact_nested_contract() -> None:
     assert "There are exactly two valid shapes" in LINKING_SYSTEM
-    assert "`association_search_results` is null" in LINKING_SYSTEM
     assert '"result":"association_search"' in LINKING_SYSTEM
     assert '"result":"links"' in LINKING_SYSTEM
     assert '"subject":{"kind":"existing","subject_id"' in LINKING_SYSTEM
     assert '"subject":{"kind":"new","subject_ref"' in LINKING_SYSTEM
-    assert "`association_search_results` is non-null" in LINKING_SYSTEM
-    assert "shape 1 is no longer valid" in LINKING_SYSTEM
+    assert "up to five times" in LINKING_SYSTEM
+    assert "final linking result for every supplied memory" in LINKING_SYSTEM
+    assert "provisional" not in LINKING_SYSTEM
     assert "basis is exactly direct or contextual" in LINKING_SYSTEM
 
 
@@ -104,9 +108,8 @@ def test_review_prompt_exposes_both_valid_output_shapes() -> None:
     assert "There are exactly two valid shapes" in REVIEW_SYSTEM
     assert '"result":"provenance_request"' in REVIEW_SYSTEM
     assert '"result":"review"' in REVIEW_SYSTEM
-    assert "`provenance_may_be_requested` is true" in REVIEW_SYSTEM
     assert "`requested_provenance` is null" in REVIEW_SYSTEM
-    assert "`provenance_may_be_requested` is false" in REVIEW_SYSTEM
+    assert "`requested_provenance` is non-null" in REVIEW_SYSTEM
     assert "shape 1 is no longer valid" in REVIEW_SYSTEM
 
 
@@ -117,6 +120,117 @@ def test_review_prompt_compiles_sibling_memories() -> None:
     assert "Normalize parallel instances" in REVIEW_SYSTEM
     assert "classical-music preference" in REVIEW_SYSTEM
     assert "two hops of one later question" in REVIEW_SYSTEM
+
+
+def test_llm_inputs_project_only_task_relevant_fields() -> None:
+    episode = NormalizedEpisode(
+        source_type="test",
+        source_key="session-1",
+        source_sequence=7,
+        payload_version="2",
+        source_started_at=1_694_044_800_000,
+        source_ended_at=1_694_048_400_000,
+        source_timezone="Europe/Paris",
+        blocks=(
+            EpisodeBlock(
+                "block-1",
+                3,
+                Role.USER,
+                "Alice likes hiking.",
+                message_phase="history",
+                speaker_id="alice",
+                speaker_name="Alice Example",
+                observed_at=1_694_045_100_000,
+                metadata={"unused": True},
+                preprocessor_version="9",
+            ),
+        ),
+    )
+    assert json.loads(extraction_input(episode)) == {
+        "episode": {
+            "source_started_at": "2023-09-07T00:00:00Z (Thursday)",
+            "messages": [{"speaker_id": "alice", "content": "Alice likes hiking."}],
+        }
+    }
+
+    snapshot = SubjectSnapshot(
+        "subject-id",
+        "Alice's hiking",
+        "stale summary",
+        4,
+        2,
+        (
+            MemorySnapshot(
+                "memory-id",
+                "Alice likes hiking.",
+                1_694_044_800_000,
+                ("episode-id",),
+                "direct",
+            ),
+        ),
+    )
+    review = json.loads(review_input(snapshot))
+    assert set(review["subject"]) == {"name", "memories"}
+    assert set(review["subject"]["memories"][0]) == {
+        "memory_id",
+        "content",
+        "last_mentioned_at",
+        "link_basis",
+        "provenance_episode_ids",
+    }
+    split = json.loads(split_input(snapshot))
+    assert set(split["subject"]) == {"name", "memories"}
+    assert "provenance_episode_ids" not in split["subject"]["memories"][0]
+    assert json.loads(summary_refresh_input(snapshot)) == {
+        "subject": {
+            "name": "Alice's hiking",
+            "memories": [
+                {
+                    "content": "Alice likes hiking.",
+                    "last_mentioned_at": "2023-09-07T00:00:00Z (Thursday)",
+                }
+            ],
+        }
+    }
+
+
+def test_review_provenance_input_uses_only_source_identity_time_and_content() -> None:
+    snapshot = SubjectSnapshot(
+        "subject-id",
+        "Alice",
+        None,
+        0,
+        0,
+        (MemorySnapshot("memory-id", "Alice moved.", None, ("episode-id",), "direct"),),
+    )
+    provenance = {
+        "memory-id": (
+            {
+                "episode_id": "episode-id",
+                "source_started_at": 1_694_044_800_000,
+                "source_ended_at": 1_694_048_400_000,
+                "blocks": [
+                    {
+                        "role": "user",
+                        "speaker_id": "alice",
+                        "speaker_name": "Alice Example",
+                        "observed_at": 1_694_045_100_000,
+                        "content": "I moved.",
+                    }
+                ],
+            },
+        )
+    }
+    payload = json.loads(review_input(snapshot, provenance))
+    assert payload["requested_provenance"] == {
+        "memory-id": [
+            {
+                "episode_id": "episode-id",
+                "source_started_at": "2023-09-07T00:00:00Z (Thursday)",
+                "blocks": [{"speaker_id": "alice", "content": "I moved."}],
+            }
+        ]
+    }
 
 
 def test_validation_feedback_collapses_repeated_array_errors() -> None:

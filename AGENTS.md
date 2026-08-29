@@ -33,7 +33,7 @@ change the document in the same commit as the code, never silently diverge.
 
 ## Experimental Scope
 
-**In scope:** memory extraction, candidate recall, per-memory subject linking, subject review,
+**In scope:** memory extraction, candidate recall, batched subject linking, subject review,
 subject split, public `search`, SQLite persistence, embedding management, dataset adapters for
 `LongMemEval-S` and `LoCoMo_refined`, benchmark runner, build logs, tests.
 
@@ -78,8 +78,8 @@ Always run tools through `uv run`. All four checks must pass before a change is 
 dataset session
 → normalize + persist immutable episode (content_hash, source_sequence)
 → memory extraction                 (0..N self-contained memories, or no_valuable_memory)
-→ per-memory candidate recall       (Subject channel + Memory channel, optional 1 association_search)
-→ per-memory Subject linking        (one LLM output per new memory; provisional subjects shared)
+→ per-memory subject-name recall    (top 5 above threshold; direct top 2 + batch top 10 pool)
+→ batched Subject linking           (one agent loop per episode; up to 5 association_search calls)
 → atomic commit                     (memories, versions, provenance, embeddings, subjects, links, completion)
 → Subject split / Subject review    (split first when both are due)
 → Subject summary refresh           (durable episode targets, up to 5 concurrent rewrites)

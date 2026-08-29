@@ -25,6 +25,8 @@ from fluxfold.models import (
     CandidateMemory,
     CandidateSubject,
     EpisodeBlock,
+    MemoryBankSpace,
+    MemoryBankSubject,
     MemorySnapshot,
     MemorySpace,
     NormalizedEpisode,
@@ -1016,6 +1018,29 @@ class Store:
                 )
         return tuple(output)
 
+    def candidate_subject_names(
+        self,
+        memory_space_id: str,
+        query_vector: np.ndarray,
+        *,
+        top_k: int,
+        min_similarity: float,
+    ) -> tuple[CandidateSubject, ...]:
+        """Return name-only subject hits for the initial linking pool."""
+
+        hits = self._scan_subjects(memory_space_id, query_vector, top_k, min_similarity)
+        with self._connect() as connection:
+            return tuple(
+                CandidateSubject(
+                    subject_id,
+                    connection.execute(
+                        "SELECT name FROM subjects WHERE subject_id = ?", (subject_id,)
+                    ).fetchone()["name"],
+                    similarity,
+                )
+                for subject_id, similarity in hits
+            )
+
     def candidate_memories(
         self,
         memory_space_id: str,
@@ -1205,9 +1230,7 @@ class Store:
                             "source_ended_at": episode["source_ended_at"],
                             "blocks": [
                                 {
-                                    "role": block["role"],
-                                    "speaker_name": block["speaker_name"],
-                                    "observed_at": block["observed_at"],
+                                    "speaker_id": block["speaker_id"] or block["role"],
                                     "content": block["content"],
                                 }
                                 for block in blocks
@@ -1821,6 +1844,58 @@ class Store:
         if len(rows) != len(ids):
             raise ValidationError("link count requested for an invalid memory")
         return {row["memory_id"]: row["n"] for row in rows}
+
+    def memory_bank(self) -> tuple[MemoryBankSpace, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    ms.space_key AS space_key,
+                    s.subject_id AS subject_id,
+                    s.name AS name,
+                    s.summary AS summary,
+                    u.memory_id AS memory_id,
+                    v.content AS content
+                FROM memory_spaces ms
+                LEFT JOIN subjects s
+                    ON s.memory_space_id = ms.memory_space_id
+                    AND s.lifecycle_status = 'active'
+                LEFT JOIN subject_memory_links l
+                    ON l.subject_id = s.subject_id AND l.unlinked_at IS NULL
+                LEFT JOIN memory_units u
+                    ON u.memory_id = l.memory_id AND u.lifecycle_status = 'active'
+                LEFT JOIN memory_versions v
+                    ON v.memory_id = u.memory_id AND v.is_latest = 1
+                ORDER BY ms.space_key, s.name, s.subject_id, u.memory_id
+                """
+            ).fetchall()
+        spaces: dict[str, dict[str, MemoryBankSubject]] = {}
+        subject_order: dict[str, list[str]] = {}
+        for row in rows:
+            space_key = str(row["space_key"])
+            spaces.setdefault(space_key, {})
+            subject_order.setdefault(space_key, [])
+            subject_id = row["subject_id"]
+            if subject_id is None:
+                continue
+            current = spaces[space_key].get(subject_id)
+            if current is None:
+                current = MemoryBankSubject(row["name"], row["summary"], ())
+                spaces[space_key][subject_id] = current
+                subject_order[space_key].append(subject_id)
+            if row["memory_id"] is not None:
+                spaces[space_key][subject_id] = MemoryBankSubject(
+                    current.name,
+                    current.summary,
+                    (*current.memory_contents, row["content"]),
+                )
+        return tuple(
+            MemoryBankSpace(
+                space_key,
+                tuple(spaces[space_key][subject_id] for subject_id in subject_ids),
+            )
+            for space_key, subject_ids in subject_order.items()
+        )
 
     def space_statistics(self, memory_space_id: str) -> dict[str, int | float]:
         with self._connect() as connection:

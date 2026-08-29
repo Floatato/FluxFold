@@ -145,6 +145,14 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
     assert "## extract · sample 1" in sample_text
     assert "You are a memory extractor." in sample_text
     assert generation.max_active_extractions == 1
+    bank_text = paths.memory_bank.read_text(encoding="utf-8")
+    assert bank_text.count("# Memory bank") == 1
+    assert "after build completed" in bank_text
+    assert f"## `{spaces[0].space_key}`" in bank_text
+    assert "### Alice's hiking" in bank_text
+    assert "- Alice likes hiking." in bank_text
+    assert "- Alice owns hiking boots." in bank_text
+    assert "- Alice hikes on weekends." in bank_text
     build_summary = json.loads(paths.build_summary.read_text(encoding="utf-8"))
     assert build_summary["successful_llm_call_count"] > 0
     assert build_summary["failed_llm_call_count"] == 0

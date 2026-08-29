@@ -7,6 +7,7 @@ import pytest
 
 from fluxfold import EpisodeBlock, FluxFold, FluxFoldConfig, NormalizedEpisode, Role
 from fluxfold.errors import ErrorClass, ProviderError, SourceConflictError, StageFailure
+from fluxfold.models import CandidateSubject
 from fluxfold.providers import GenerationRequest, GenerationResponse
 from tests.fakes import FakeEmbeddingProvider, FakeGenerationProvider
 
@@ -43,6 +44,13 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
         assert first.memories_created == 1
         assert first.subjects_created == 1
         assert first.links_created == 1
+        bank = engine.memory_bank()
+        assert len(bank) == 1
+        assert bank[0].space_key == "test:alice"
+        assert [(subject.name, subject.summary) for subject in bank[0].subjects] == [
+            ("Alice's hiking", "Alice likes hiking.")
+        ]
+        assert bank[0].subjects[0].memory_contents == ("Alice likes hiking.",)
         decision = next(
             event for event in events if event["event_type"] == "audit_episode_decision"
         )
@@ -182,9 +190,7 @@ def test_add_episode_extraction_lanes_are_independent_between_spaces(tmp_path) -
     asyncio.run(scenario())
 
 
-def test_episode_links_each_memory_separately_and_reuses_provisional_subject(
-    tmp_path,
-) -> None:
+def test_episode_links_all_new_memories_in_one_batch(tmp_path) -> None:
     class TwoMemoryExtraction(FakeGenerationProvider):
         async def generate(self, request: GenerationRequest):
             if request.stage == "memory_extraction":
@@ -209,11 +215,11 @@ def test_episode_links_each_memory_separately_and_reuses_provisional_subject(
     async def scenario() -> None:
         generation = TwoMemoryExtraction()
         engine = await FluxFold.open(
-            db_path=str(tmp_path / "per-memory-linking.sqlite3"),
+            db_path=str(tmp_path / "batch-linking.sqlite3"),
             generation_provider=generation,
             embedding_provider=FakeEmbeddingProvider(),
         )
-        space = await engine.create_or_open_space("test:per-memory-linking")
+        space = await engine.create_or_open_space("test:batch-linking")
 
         result = await engine.add_episode(
             space.memory_space_id, _episode("one", "Alice hiking facts.")
@@ -224,18 +230,130 @@ def test_episode_links_each_memory_separately_and_reuses_provisional_subject(
             for request in generation.requests
             if request.stage == "subject_linking"
         ]
-        assert len(linking_requests) == 2
-        first = json.loads(linking_requests[0].user_prompt)
-        second = json.loads(linking_requests[1].user_prompt)
-        assert [item["memory_ref"] for item in first["new_memories"]] == ["memory_1"]
-        assert [item["memory_ref"] for item in second["new_memories"]] == ["memory_2"]
-        assert first["provisional_subjects"] == []
-        assert second["provisional_subjects"] == [
-            {"subject_ref": "alice_hiking_memory_1", "name": "Alice's hiking"}
+        assert len(linking_requests) == 1
+        payload = json.loads(linking_requests[0].user_prompt)
+        assert [item["memory_ref"] for item in payload["new_memories"]] == [
+            "memory_1",
+            "memory_2",
         ]
+        assert payload["candidates"] == []
+        assert payload["association_search_results"] == []
+        assert payload["association_searches_remaining"] == 5
         assert result.memories_created == 2
         assert result.subjects_created == 1
         assert result.links_created == 2
+        await engine.close()
+
+    asyncio.run(scenario())
+
+
+def test_initial_subject_candidates_union_per_memory_direct_and_global_pool(
+    tmp_path, monkeypatch
+) -> None:
+    async def scenario() -> None:
+        engine = await FluxFold.open(
+            db_path=str(tmp_path / "candidate-pool.sqlite3"),
+            generation_provider=FakeGenerationProvider(),
+            embedding_provider=FakeEmbeddingProvider(),
+        )
+        space = await engine.create_or_open_space("test:candidate-pool")
+        batches = iter(
+            tuple(
+                CandidateSubject(
+                    f"subject-{batch}-{rank}",
+                    f"Subject {batch}-{rank}",
+                    1.0 - batch * 0.1 - rank * 0.01,
+                )
+                for rank in range(5)
+            )
+            for batch in range(6)
+        )
+
+        def candidate_subject_names(*args, **kwargs):
+            del args
+            assert kwargs["top_k"] == 5
+            assert kwargs["min_similarity"] == 0.25
+            return next(batches)
+
+        monkeypatch.setattr(
+            engine._store, "candidate_subject_names", candidate_subject_names
+        )
+        candidates, legal = engine._recall_initial_subject_candidates(
+            space.memory_space_id, [object() for _ in range(6)]
+        )
+
+        direct_ids = [
+            f"subject-{batch}-{rank}" for batch in range(6) for rank in range(2)
+        ]
+        assert [candidate["subject_id"] for candidate in candidates[:12]] == direct_ids
+        assert set(direct_ids) <= legal
+        assert len(candidates) == 18
+        assert all(set(candidate) == {"subject_id", "name"} for candidate in candidates)
+        await engine.close()
+
+    asyncio.run(scenario())
+
+
+def test_link_agent_allows_five_association_search_calls(tmp_path) -> None:
+    class FiveAssociationSearches(FakeGenerationProvider):
+        async def generate(self, request: GenerationRequest):
+            if request.stage == "subject_linking":
+                payload = json.loads(request.user_prompt)
+                if payload["association_searches_remaining"] > 0:
+                    self.requests.append(request)
+                    call_number = len(payload["association_search_results"]) + 1
+                    return GenerationResponse(
+                        text=json.dumps(
+                            {
+                                "result": "association_search",
+                                "query": f"Alice related topic {call_number}",
+                            }
+                        ),
+                        input_tokens=6,
+                        output_tokens=4,
+                        total_tokens=10,
+                        request_id=f"association-{call_number}",
+                    )
+            return await super().generate(request)
+
+    async def scenario() -> None:
+        generation = FiveAssociationSearches()
+        engine = await FluxFold.open(
+            db_path=str(tmp_path / "five-association-searches.sqlite3"),
+            generation_provider=generation,
+            embedding_provider=FakeEmbeddingProvider(),
+        )
+        space = await engine.create_or_open_space("test:five-association-searches")
+
+        result = await engine.add_episode(
+            space.memory_space_id, _episode("one", "Alice likes hiking.")
+        )
+
+        linking_requests = [
+            request
+            for request in generation.requests
+            if request.stage == "subject_linking"
+        ]
+        assert len(linking_requests) == 6
+        payloads = [json.loads(request.user_prompt) for request in linking_requests]
+        assert [payload["association_searches_remaining"] for payload in payloads] == [
+            5,
+            4,
+            3,
+            2,
+            1,
+            0,
+        ]
+        assert [len(payload["association_search_results"]) for payload in payloads] == [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+        ]
+        assert result.memories_created == 1
+        assert result.links_created == 1
         await engine.close()
 
     asyncio.run(scenario())
@@ -396,7 +514,7 @@ def test_existing_subject_link_triggers_review(tmp_path) -> None:
             if event["event_type"] == "subject_linking_completed"
         ]
         assert linking_events[0]["candidate_memory_count"] == 0
-        assert linking_events[1]["candidate_memory_count"] == 1
+        assert linking_events[1]["candidate_memory_count"] == 0
         assert linking_events[1]["association_search_called"] is False
         assert linking_events[1]["association_additional_candidate_memory_count"] == 0
         await engine.close()
@@ -486,12 +604,10 @@ def test_search_groups_subjects_and_only_exposes_five_summaries(tmp_path) -> Non
                 if request.stage == "subject_linking"
             ][-1]
         )
-        candidate_groups = linking_payload["candidates_by_memory"]["memory_1"][
-            "subjects"
-        ]
-        assert len(candidate_groups) == 8
-        assert len({group["subject_id"] for group in candidate_groups}) == 8
-        assert all("summary" not in group for group in candidate_groups)
+        candidates = linking_payload["candidates"]
+        assert len(candidates) == 5
+        assert len({candidate["subject_id"] for candidate in candidates}) == 5
+        assert all(set(candidate) == {"subject_id", "name"} for candidate in candidates)
         await engine.close()
 
     asyncio.run(scenario())
@@ -767,7 +883,7 @@ def test_split_retries_when_a_moved_memory_would_lose_its_direct_link(tmp_path) 
     asyncio.run(scenario())
 
 
-def test_association_search_is_called_at_most_once(tmp_path) -> None:
+def test_association_search_results_keep_the_detailed_candidate_view(tmp_path) -> None:
     async def scenario() -> None:
         generation = FakeGenerationProvider()
         events: list[dict[str, object]] = []
@@ -803,7 +919,7 @@ def test_association_search_is_called_at_most_once(tmp_path) -> None:
         ]
         assert linking_events[1]["candidate_memory_count"] == 1
         assert linking_events[1]["association_search_called"] is True
-        assert linking_events[1]["association_additional_candidate_memory_count"] == 0
+        assert linking_events[1]["association_additional_candidate_memory_count"] == 1
         await engine.close()
 
     asyncio.run(scenario())

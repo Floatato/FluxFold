@@ -23,14 +23,17 @@ class FluxFoldConfig:
     episode_chars_max: int = 96_000
     message_chars_max: int = 32_000
     longmemeval_message_chars_max: int = 80_000
-    subject_candidate_top_k: int = 8
+    subject_candidate_top_k: int = 5
+    subject_candidate_direct_top_k: int = 2
+    subject_candidate_pool_top_k: int = 10
     subject_candidate_min_similarity: float = 0.25
+    association_subject_candidate_top_k: int = 8
     subject_candidate_attached_memory_k: int = 1
     memory_candidate_top_k: int = 8
     memory_candidate_min_similarity: float = 0.35
     memory_candidate_attached_subject_k: int = 1
     association_search_enabled: bool = True
-    association_search_max_calls: int = 1
+    association_search_max_calls: int = 5
     memory_link_preferred_min: int = 1
     memory_link_preferred_max: int = 4
     memory_active_subject_link_max: int = 5
@@ -119,8 +122,14 @@ class FluxFoldConfig:
             value = getattr(self, name)
             if not -1.0 <= value <= 1.0:
                 raise ValidationError(f"cosine threshold must be in [-1, 1]: {name}")
-        if self.association_search_max_calls not in {0, 1}:
-            raise ValidationError("association_search_max_calls must be zero or one")
+        if not 0 <= self.association_search_max_calls <= 5:
+            raise ValidationError(
+                "association_search_max_calls must be between zero and five"
+            )
+        if self.subject_candidate_direct_top_k > self.subject_candidate_top_k:
+            raise ValidationError(
+                "direct subject candidate count exceeds the per-memory count"
+            )
         if self.memory_link_preferred_max > self.memory_active_subject_link_max:
             raise ValidationError("preferred link maximum exceeds the hard maximum")
 

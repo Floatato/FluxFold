@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from fluxfold.engine import LLM_IO_SAMPLE_QUOTAS
-from fluxfold.models import AddResult, NormalizedEpisode
+from fluxfold.models import AddResult, MemoryBankSpace, NormalizedEpisode
 
 _LLM_IO_SAMPLE_HEADING = re.compile(r"^## ([a-z_]+) · sample (\d+)\s*$")
 _LLM_IO_SAMPLE_HEADER = """# LLM I/O samples
@@ -56,6 +56,10 @@ class RunPaths:
     @property
     def llm_io_samples(self) -> Path:
         return self.root / "llm_io_samples.md"
+
+    @property
+    def memory_bank(self) -> Path:
+        return self.root / "memory_bank.md"
 
     @property
     def checkpoint(self) -> Path:
@@ -259,6 +263,20 @@ class ArtifactWriter:
             with self.paths.audit.open("a", encoding="utf-8") as handle:
                 handle.write("\n".join(lines))
 
+    def write_memory_bank(
+        self,
+        spaces: tuple[MemoryBankSpace, ...],
+        *,
+        updated_after: str,
+    ) -> None:
+        text = _render_memory_bank(spaces, updated_after=updated_after)
+        with self._lock:
+            temporary = self.paths.memory_bank.with_suffix(
+                self.paths.memory_bank.suffix + ".tmp"
+            )
+            temporary.write_text(text, encoding="utf-8")
+            temporary.replace(self.paths.memory_bank)
+
     def write_json(self, path: Path, value: Any) -> None:
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.write_text(
@@ -271,6 +289,47 @@ class ArtifactWriter:
 def append_jsonl(path: Path, value: dict[str, object]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _render_memory_bank(
+    spaces: tuple[MemoryBankSpace, ...],
+    *,
+    updated_after: str,
+) -> str:
+    lines = [
+        "# Memory bank",
+        "",
+        f"Active subjects and memories after {updated_after}.",
+        "",
+    ]
+    if not spaces:
+        lines.extend(["_(no memory spaces)_", ""])
+        return "\n".join(lines)
+    for space in spaces:
+        lines.extend([f"## `{space.space_key}`", ""])
+        if not space.subjects:
+            lines.extend(["_(no active subjects)_", ""])
+            continue
+        for subject in space.subjects:
+            lines.extend([f"### {_heading_text(subject.name)}", ""])
+            if subject.summary:
+                lines.extend([subject.summary, ""])
+            if not subject.memory_contents:
+                lines.extend(["_(no active memories)_", ""])
+                continue
+            for content in subject.memory_contents:
+                lines.append(_bullet(content))
+            lines.append("")
+    return "\n".join(lines)
+
+
+def _heading_text(value: str) -> str:
+    return " ".join(value.split()) or "(unnamed)"
+
+
+def _bullet(text: str) -> str:
+    lines = text.splitlines() or [""]
+    return "\n".join([f"- {lines[0]}", *(f"  {line}" for line in lines[1:])])
 
 
 def _llm_io_sample_counts(path: Path) -> Counter[str]:

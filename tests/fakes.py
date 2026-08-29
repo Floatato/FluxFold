@@ -84,40 +84,48 @@ class FakeGenerationProvider:
                     total_tokens=10,
                     request_id="fake-request",
                 )
-            memory_ref = payload["new_memories"][0]["memory_ref"]
-            candidates = payload["candidates_by_memory"][memory_ref]["subjects"]
-            provisional = payload["provisional_subjects"]
+            memories = payload["new_memories"]
+            candidates = payload["candidates"]
             if candidates and not self.always_new_subject:
-                subject = {
-                    "kind": "existing",
-                    "subject_id": candidates[0]["subject_id"],
-                }
+                subjects = [
+                    {
+                        "kind": "existing",
+                        "subject_id": candidates[0]["subject_id"],
+                    }
+                ] * len(memories)
                 new_subjects: list[dict[str, str]] = []
-            elif provisional and not self.always_new_subject:
-                subject = {
-                    "kind": "provisional",
-                    "subject_ref": provisional[0]["subject_ref"],
-                }
-                new_subjects = []
+            elif self.always_new_subject:
+                new_subjects = [
+                    {
+                        "subject_ref": f"alice_hiking_{memory['memory_ref']}",
+                        "name": f"Alice's hiking {memory['memory_ref']}",
+                    }
+                    for memory in memories
+                ]
+                subjects = [
+                    {"kind": "new", "subject_ref": subject["subject_ref"]}
+                    for subject in new_subjects
+                ]
             else:
-                subject_ref = f"alice_hiking_{memory_ref}"
-                subject = {"kind": "new", "subject_ref": subject_ref}
+                subject_ref = "alice_hiking"
                 new_subjects = [
                     {
                         "subject_ref": subject_ref,
                         "name": "Alice's hiking",
                     }
                 ]
+                subjects = [{"kind": "new", "subject_ref": subject_ref}] * len(memories)
             text = json.dumps(
                 {
                     "result": "links",
                     "new_subjects": new_subjects,
                     "links": [
                         {
-                            "memory_ref": memory_ref,
+                            "memory_ref": memory["memory_ref"],
                             "subject": subject,
                             "basis": "direct",
                         }
+                        for memory, subject in zip(memories, subjects, strict=True)
                     ],
                 }
             )

@@ -189,7 +189,7 @@ FluxFold 的核心工程判断是：**读取路径不使用 LLM，全部 LLM 成
 
 公开 `search(query)` 只做精确向量检索——两个通道分别计算 query 与 active subject name embedding、active memory content embedding 的 cosine 相似度，按 top-k 和最低相似度阈值筛选，合并后只按真实 link 去重整理，不计算融合分数、不重排、不做第二轮筛选，也不改写 query。按 §3.3 的量级分组，这把检索成本放在“纯向量”一档，同时避免了 §1.3 的路由单点失效。
 
-相应地，写入阶段承担五类 LLM 调用：memory extraction、逐 memory Subject linking、Subject review、Subject split、统一 Subject summary refresh。这个取舍的合理性依赖一个前提：**在写入时把关系整理清楚，检索时就不必用 LLM 临时重建关系。** 这个前提是否成立，需要实验验证；§6.6 列出了它可能不成立的情形。
+相应地，写入阶段承担五类 LLM 调用：memory extraction、批量 Subject linking、Subject review、Subject split、统一 Subject summary refresh。这个取舍的合理性依赖一个前提：**在写入时把关系整理清楚，检索时就不必用 LLM 临时重建关系。** 这个前提是否成立，需要实验验证；§6.6 列出了它可能不成立的情形。
 
 ### 6.2 设计一：subject 作为有界、可自我具体化的动态组织单元
 
@@ -226,15 +226,15 @@ FluxFold 把 memory version、provenance 和 active link 作为事实源，subje
 
 针对 §2 的问题，以及 §3.2 中 LoCoMo multi-hop / open-domain 与 LongMemEval multi-session 的难点，FluxFold 在写入阶段把「装箱」和「编译」分开：
 
-**双通道被动召回。** 以每条新 memory content 为 query，Subject 通道按 subject name embedding 取前 8 个（相似度 ≥ 0.25），每个附带 1 条最相似的关联 memory；Memory 通道取前 8 条 memory（相似度 ≥ 0.35），每条附带 1 个最相似的关联 subject。两个通道完成后按真实 subject–memory 关系去重并组织成该 memory 自己的 subject groups；不同新 memories 的候选视图不跨组去重。linking prompt 只展示 subject name 和候选 memory，不展示任何 subject summary，也不计算融合分数或建立更大的中间候选池。相比 A-MEM 的 5 个 dense 近邻，这让 LLM 同时看到“与新记忆相似的记忆”和“与新记忆相似的组织单元及其代表记忆”两种视角。
+**name-only 被动召回。** 以每条新 memory content 为 query，按 subject name embedding 取相似度 ≥ 0.25 的前 5 个。每条 memory 的前 2 个直接保留；所有命中再按 subject 聚合，以跨 memories 的最高相似度排序取全局前 10。两部分合并去重后，linking prompt 只展示 subject ID 和 name，不展示相似度、候选 memory 或 subject summary。相比 A-MEM 的 5 个 dense memory 近邻，这一入口直接比较组织单元，并通过批次聚合让多条相关 memories 共同扩大有限候选池。
 
-**每条 memory 一次可选的主动关联检索。** 开启后，LLM 在做该 memory 的 linking 决策前最多调用一次 `association_search(query)`。query 必须写成这条新记忆本身（加上常识）会改变或约束的另一主题的名称，而不是复述新记忆：种牙去找 `Mike's dietary preferences` / `Mike's diet plan`，驾照停权去找 `Mike's travel plans` / `Mike's commute`，夜班去找 `Mike's evening plans` / `Mike's sleep schedule`。这是与 §2.1 表格中所有机制的实质差别：其余系统的候选集完全由新条目自身的向量决定。搜到的可以是漏掉的 direct home，也可以是 contextual 目标。Linking 只决定成员关系，不改写已有正文。
+**最多五次主动关联检索。** 批量 linking 作为一个 agent loop，最多调用 5 次 `association_search(query)`。query 必须写成某条新记忆本身（加上常识）会改变或约束的另一主题名称，而不是复述新记忆：种牙去找 `Mike's dietary preferences` / `Mike's diet plan`，驾照停权去找 `Mike's travel plans` / `Mike's commute`，夜班去找 `Mike's evening plans` / `Mike's sleep schedule`。主动结果保留原来的双通道详细展示：Subject 通道带代表 memory，Memory 通道带关联 subject；各轮结果累积供最终决策使用。搜到的可以是漏掉的 direct home，也可以是 contextual 目标。Linking 只决定成员关系，不改写已有正文。
 
-**逐 memory 决策、episode 原子提交。** 程序为本 episode 的全部新 memory 分配临时 `memory_ref`，按 extraction 顺序逐条召回和调用 linking LLM。先前 memory 提出的新 subject 作为只有 ref 与 name 的 provisional subject 暴露给后续 memory，因此后续可以复用同一范围；所有调用结束后才分配正式 subject ID，并把整批 memory、provenance、links 和 extraction completion 原子提交。这样既缩小单次 linking 上下文，又不暴露逐条正式写入或部分结果。
+**批量决策、episode 原子提交。** 程序为本 episode 的全部新 memory 分配临时 `memory_ref`，合并初始候选后用一个 agent loop 输出整批 links。多条 memory 可以共同引用同一个新 subject ref；最终校验完成后才分配正式 subject ID，并把整批 memory、provenance、links 和 extraction completion 原子提交，因此工具轮次不会暴露部分正式结果。
 
 每条 link 记录 `direct` 或 `contextual` 依据：`direct` 表示该 subject 是这条 memory 的组织归属；`contextual` 表示 memory 会具体补全、约束、更新或解释该 subject 下已归档的信息。`contextual` 不表示较低优先级，两类 link 都参与 review、summary 和 search，第一版不据此调整检索分数。把文本不相似、但会被这条新记忆改变或约束的记录收进同一 subject，正是通过这次装箱完成的。
 
-需要说明的是，`association_search` 目前上限为 1 次调用，且 design.md 已将“对关闭与开启主动关联性检索做消融，评估关联召回率、错误 link 和调用成本”列为待验证项。按 §5 的结论，这项消融必须通过**重建 memory space** 进行，不能在固定记忆库上关闭读取通道。
+需要说明的是，`association_search` 目前上限为 5 次调用，且 design.md 已将“对关闭、单轮与多轮主动关联性检索做消融，评估关联召回率、错误 link 和调用成本”列为待验证项。按 §5 的结论，这项消融必须通过**重建 memory space** 进行，不能在固定记忆库上关闭读取通道。
 
 ### 6.4 设计三：episode 级 provenance 作为演化依据
 

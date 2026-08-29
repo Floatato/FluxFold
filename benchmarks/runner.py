@@ -163,6 +163,16 @@ async def build_run(
                             last_episode_by_space[space.source_id] = (
                                 episode.source_sequence
                             )
+                            if result is not None:
+                                _write_memory_bank(
+                                    writer,
+                                    engine,
+                                    updated_after=(
+                                        f"episode `{episode.source_key}` in "
+                                        f"`{space.space_key}` (source sequence "
+                                        f"{episode.source_sequence})"
+                                    ),
+                                )
                             _write_build_checkpoint(
                                 writer,
                                 run_paths,
@@ -201,6 +211,7 @@ async def build_run(
 
     try:
         await asyncio.gather(*(build_space(space) for space in spaces))
+        _write_memory_bank(writer, engine, updated_after="build completed")
         writer.write_json(
             run_paths.build_summary,
             {
@@ -441,6 +452,12 @@ def _load_checkpoint(path: Path) -> dict[str, object]:
             for key, sequence in value.get("last_episode_by_space", {}).items()
         },
     }
+
+
+def _write_memory_bank(
+    writer: ArtifactWriter, engine: FluxFold, *, updated_after: str
+) -> None:
+    writer.write_memory_bank(engine.memory_bank(), updated_after=updated_after)
 
 
 def _write_build_checkpoint(

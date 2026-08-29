@@ -6,6 +6,7 @@ import json
 from benchmarks.artifacts import ArtifactWriter, RunPaths
 
 from fluxfold import EpisodeBlock, FluxFold, FluxFoldConfig, NormalizedEpisode, Role
+from fluxfold.models import MemoryBankSpace, MemoryBankSubject
 from fluxfold.prompts import (
     EXTRACTION_SYSTEM,
     LINKING_SYSTEM,
@@ -193,8 +194,8 @@ def test_association_search_records_both_rounds(tmp_path) -> None:
             "query": "Alice activities",
         }
         second_prompt = json.loads(str(second["user_prompt"]))
-        assert (
-            second_prompt["association_search_results"]["query"] == "Alice activities"
+        assert second_prompt["association_search_results"][0]["query"] == (
+            "Alice activities"
         )
         assert json.loads(str(second["output"]))["result"] == "links"
         await engine.close()
@@ -316,3 +317,46 @@ def test_artifact_writer_renders_readable_samples_and_enforces_quota(tmp_path) -
     resumed.event(extract)
     resumed_text = resumed.paths.llm_io_samples.read_text(encoding="utf-8")
     assert resumed_text.count("## extract · sample") == 2
+
+
+def test_artifact_writer_overwrites_memory_bank_snapshot(tmp_path) -> None:
+    writer = ArtifactWriter(RunPaths(tmp_path / "run"))
+    first = (
+        MemoryBankSpace(
+            "space-a",
+            (
+                MemoryBankSubject(
+                    "Hiking",
+                    "Alice hikes.",
+                    ("Alice likes hiking.",),
+                ),
+            ),
+        ),
+    )
+    second = (
+        MemoryBankSpace(
+            "space-a",
+            (
+                MemoryBankSubject(
+                    "Hiking",
+                    "Alice hikes and owns boots.",
+                    ("Alice likes hiking.", "Alice owns hiking boots."),
+                ),
+            ),
+        ),
+        MemoryBankSpace("space-b", ()),
+    )
+    writer.write_memory_bank(first, updated_after="episode `s-1` in `space-a`")
+    writer.write_memory_bank(second, updated_after="build completed")
+    text = writer.paths.memory_bank.read_text(encoding="utf-8")
+    assert text.count("# Memory bank") == 1
+    assert "after build completed" in text
+    assert "episode `s-1`" not in text
+    assert "### Hiking" in text
+    assert "Alice hikes and owns boots." in text
+    assert "- Alice likes hiking." in text
+    assert "- Alice owns hiking boots." in text
+    assert "## `space-b`" in text
+    assert "_(no active subjects)_" in text
+    assert "subject_id" not in text
+    assert "memory_id" not in text

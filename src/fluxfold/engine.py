@@ -36,6 +36,7 @@ from fluxfold.models import (
     LinkingStageOutput,
     MaintenanceResult,
     MemoriesExtraction,
+    MemoryBankSpace,
     MemorySpace,
     NormalizedEpisode,
     ProvenanceRequestOutput,
@@ -546,6 +547,11 @@ class FluxFold:
 
         return self._store.space_statistics(memory_space_id)
 
+    def memory_bank(self) -> tuple[MemoryBankSpace, ...]:
+        """Return active subjects and memories of every space for inspect logs."""
+
+        return self._store.memory_bank()
+
     async def _link_memories(
         self,
         memory_space_id: str,
@@ -553,113 +559,124 @@ class FluxFold:
         contents: Sequence[str],
         vectors: Sequence[Any],
     ) -> tuple[LinkingOutput, _LinkingMetrics]:
-        new_subjects: list[Any] = []
-        links: list[Any] = []
-        passive_memory_ids: set[str] = set()
+        candidates, legal_subject_ids = self._recall_initial_subject_candidates(
+            memory_space_id, vectors
+        )
+        legal_by_memory = {
+            memory_ref: set(legal_subject_ids) for memory_ref in memory_refs
+        }
+        new_memories = [
+            {"memory_ref": memory_ref, "content": content}
+            for memory_ref, content in zip(memory_refs, contents, strict=True)
+        ]
+        association_results: list[dict[str, Any]] = []
         association_memory_ids: set[str] = set()
-        association_called = False
-        for memory_ref, content, vector in zip(
-            memory_refs, contents, vectors, strict=True
-        ):
-            output, passive_ids, active_ids, called = await self._link_memory(
-                memory_space_id,
-                memory_ref,
-                content,
-                vector,
-                new_subjects,
-            )
-            new_subjects.extend(output.new_subjects)
-            links.extend(output.links)
-            passive_memory_ids.update(passive_ids)
-            association_memory_ids.update(active_ids)
-            association_called = association_called or called
-        return LinkingOutput(new_subjects=new_subjects, links=links), _LinkingMetrics(
-            len(passive_memory_ids | association_memory_ids),
-            association_called,
-            len(association_memory_ids - passive_memory_ids),
+        turns: list[_LlmTurn] = []
+        max_searches = (
+            self.config.association_search_max_calls
+            if self.config.association_search_enabled
+            else 0
         )
 
-    async def _link_memory(
+        while True:
+            searches_remaining = max_searches - len(association_results)
+
+            def validate(value: LinkingStageOutput) -> None:
+                if isinstance(value, AssociationSearchOutput):
+                    if searches_remaining == 0:
+                        raise ValidationError(
+                            "association_search call limit has been reached"
+                        )
+                    if not value.query.strip():
+                        raise ValidationError(
+                            "association_search query must not be blank"
+                        )
+                    return
+                self._validate_linking(value, memory_refs, legal_by_memory)
+
+            output, turn = await self._structured_output(
+                stage="subject_linking",
+                system_prompt=LINKING_SYSTEM,
+                user_prompt=linking_input(
+                    new_memories,
+                    candidates,
+                    association_results,
+                    searches_remaining,
+                ),
+                adapter=TypeAdapter(LinkingStageOutput),
+                temperature=self.config.linking_temperature,
+                validator=validate,
+            )
+            turns.append(turn)
+            output = cast(LinkingStageOutput, output)
+            if isinstance(output, LinkingOutput):
+                sample_kind = (
+                    "link_association_search" if association_results else "link"
+                )
+                self._offer_llm_sample(sample_kind, *turns)
+                return output, _LinkingMetrics(
+                    len(association_memory_ids),
+                    bool(association_results),
+                    len(association_memory_ids),
+                )
+
+            association_vector = (await self._embed_queries([output.query]))[0]
+            association_candidates, association_legal = (
+                self._recall_association_candidates(
+                    memory_space_id,
+                    memory_refs,
+                    [association_vector] * len(memory_refs),
+                )
+            )
+            association_memory_ids.update(_candidate_memory_ids(association_candidates))
+            for memory_ref, subject_ids in association_legal.items():
+                legal_by_memory[memory_ref].update(subject_ids)
+            association_results.append(
+                {
+                    "query": output.query,
+                    "candidates_by_memory": association_candidates,
+                }
+            )
+
+    def _recall_initial_subject_candidates(
         self,
         memory_space_id: str,
-        memory_ref: str,
-        content: str,
-        vector: Any,
-        provisional_subjects: Sequence[Any],
-    ) -> tuple[LinkingOutput, set[str], set[str], bool]:
-        candidates, legal_by_memory = self._recall_candidates(
-            memory_space_id, [memory_ref], [vector]
-        )
-        passive_candidate_memory_ids = _candidate_memory_ids(candidates)
-        new_memories = [{"memory_ref": memory_ref, "content": content}]
-        provisional_view = [
-            {"subject_ref": subject.subject_ref, "name": subject.name}
-            for subject in provisional_subjects
-        ]
-        provisional_refs = {subject.subject_ref for subject in provisional_subjects}
-
-        def validate_initial(value: LinkingStageOutput) -> None:
-            if isinstance(value, AssociationSearchOutput):
-                if not self.config.association_search_enabled:
-                    raise ValidationError("association_search is disabled")
-                if not value.query.strip():
-                    raise ValidationError("association_search query must not be blank")
-                return
-            self._validate_linking(
-                value, memory_ref, legal_by_memory[memory_ref], provisional_refs
+        vectors: Sequence[Any],
+    ) -> tuple[list[dict[str, str]], set[str]]:
+        scores: dict[str, float] = {}
+        names: dict[str, str] = {}
+        direct_order: list[str] = []
+        for vector in vectors:
+            subjects = self._store.candidate_subject_names(
+                memory_space_id,
+                vector,
+                top_k=self.config.subject_candidate_top_k,
+                min_similarity=self.config.subject_candidate_min_similarity,
             )
+            for index, subject in enumerate(subjects):
+                names[subject.subject_id] = subject.name
+                scores[subject.subject_id] = max(
+                    scores.get(subject.subject_id, -1.0), subject.similarity
+                )
+                if (
+                    index < self.config.subject_candidate_direct_top_k
+                    and subject.subject_id not in direct_order
+                ):
+                    direct_order.append(subject.subject_id)
 
-        first, first_turn = await self._structured_output(
-            stage="subject_linking",
-            system_prompt=LINKING_SYSTEM,
-            user_prompt=linking_input(new_memories, candidates, provisional_view),
-            adapter=TypeAdapter(LinkingStageOutput),
-            temperature=self.config.linking_temperature,
-            validator=validate_initial,
-        )
-        first = cast(LinkingStageOutput, first)
-        if isinstance(first, LinkingOutput):
-            self._offer_llm_sample("link", first_turn)
-            return first, passive_candidate_memory_ids, set(), False
-        association_vector = (await self._embed_queries([first.query]))[0]
-        association_candidates, association_legal = self._recall_candidates(
-            memory_space_id, [memory_ref], [association_vector]
-        )
-        association_candidate_memory_ids = _candidate_memory_ids(association_candidates)
-        legal_by_memory[memory_ref].update(association_legal[memory_ref])
-
-        def validate_final(value: LinkingStageOutput) -> None:
-            if isinstance(value, AssociationSearchOutput):
-                raise ValidationError("association_search may only be requested once")
-            self._validate_linking(
-                value, memory_ref, legal_by_memory[memory_ref], provisional_refs
-            )
-
-        final, final_turn = await self._structured_output(
-            stage="subject_linking",
-            system_prompt=LINKING_SYSTEM,
-            user_prompt=linking_input(
-                new_memories,
-                candidates,
-                provisional_view,
-                {
-                    "query": first.query,
-                    "candidates_by_memory": association_candidates,
-                },
-            ),
-            adapter=TypeAdapter(LinkingStageOutput),
-            temperature=self.config.linking_temperature,
-            validator=validate_final,
-        )
-        self._offer_llm_sample("link_association_search", first_turn, final_turn)
+        pooled = sorted(
+            scores, key=lambda subject_id: (-scores[subject_id], subject_id)
+        )[: self.config.subject_candidate_pool_top_k]
+        final_ids = list(dict.fromkeys([*direct_order, *pooled]))
         return (
-            cast(LinkingOutput, final),
-            passive_candidate_memory_ids,
-            association_candidate_memory_ids,
-            True,
+            [
+                {"subject_id": subject_id, "name": names[subject_id]}
+                for subject_id in final_ids
+            ],
+            set(final_ids),
         )
 
-    def _recall_candidates(
+    def _recall_association_candidates(
         self,
         memory_space_id: str,
         memory_refs: Sequence[str],
@@ -671,7 +688,7 @@ class FluxFold:
             subjects = self._store.candidate_subjects(
                 memory_space_id,
                 vector,
-                top_k=self.config.subject_candidate_top_k,
+                top_k=self.config.association_subject_candidate_top_k,
                 min_similarity=self.config.subject_candidate_min_similarity,
             )
             memories = self._store.candidate_memories(
@@ -731,34 +748,27 @@ class FluxFold:
     def _validate_linking(
         self,
         output: LinkingOutput,
-        memory_ref: str,
-        legal_existing_subject_ids: set[str],
-        provisional_refs: set[str],
+        memory_refs: Sequence[str],
+        legal_by_memory: dict[str, set[str]],
     ) -> None:
+        expected = set(memory_refs)
         subject_refs = [subject.subject_ref for subject in output.new_subjects]
         if len(subject_refs) != len(set(subject_refs)):
             raise ValidationError("new subject_ref values must be unique")
         new_refs = set(subject_refs)
-        if new_refs & provisional_refs:
-            raise ValidationError("new subject_ref collides with a provisional subject")
         referenced_new: set[str] = set()
         seen_pairs: set[tuple[str, str, str]] = set()
         by_memory: defaultdict[str, list[Any]] = defaultdict(list)
         for link in output.links:
-            if link.memory_ref != memory_ref:
+            if link.memory_ref not in expected:
                 raise ValidationError(f"unknown memory_ref: {link.memory_ref}")
             if link.subject.kind == "existing":
                 target = link.subject.subject_id
-                if target not in legal_existing_subject_ids:
+                if target not in legal_by_memory[link.memory_ref]:
                     raise ValidationError(
                         f"subject {target} was not a candidate for {link.memory_ref}"
                     )
                 target_kind = "existing"
-            elif link.subject.kind == "provisional":
-                target = link.subject.subject_ref
-                if target not in provisional_refs:
-                    raise ValidationError(f"unknown provisional subject_ref: {target}")
-                target_kind = "provisional"
             else:
                 target = link.subject.subject_ref
                 if target not in new_refs:
@@ -769,16 +779,17 @@ class FluxFold:
             if pair in seen_pairs:
                 raise ValidationError("duplicate memory-subject link")
             seen_pairs.add(pair)
-            by_memory[memory_ref].append(link)
+            by_memory[link.memory_ref].append(link)
         if referenced_new != new_refs:
-            raise ValidationError(
-                "every new subject must be linked to an episode memory"
-            )
-        memory_links = by_memory[memory_ref]
-        if not memory_links or not any(link.basis == "direct" for link in memory_links):
-            raise ValidationError(f"{memory_ref} needs at least one direct link")
-        if len(memory_links) > self.config.memory_active_subject_link_max:
-            raise ValidationError(f"{memory_ref} exceeds the active link maximum")
+            raise ValidationError("every new subject must be linked to a batch memory")
+        for memory_ref in expected:
+            memory_links = by_memory[memory_ref]
+            if not memory_links or not any(
+                link.basis == "direct" for link in memory_links
+            ):
+                raise ValidationError(f"{memory_ref} needs at least one direct link")
+            if len(memory_links) > self.config.memory_active_subject_link_max:
+                raise ValidationError(f"{memory_ref} exceeds the active link maximum")
         for subject in output.new_subjects:
             self._validate_subject_name(subject.name)
 
@@ -820,7 +831,7 @@ class FluxFold:
             if link.subject.kind == "existing":
                 subject_id = link.subject.subject_id
                 existing_link_counts[subject_id] += 1
-            elif link.subject.kind in {"new", "provisional"}:
+            else:
                 subject_id = new_ref_to_id[link.subject.subject_ref]
             prepared_links.append(
                 PreparedLink(ref_to_memory_id[link.memory_ref], subject_id, link.basis)

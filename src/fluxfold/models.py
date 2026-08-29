@@ -257,14 +257,8 @@ class NewSubjectTarget(StrictModel):
     subject_ref: str
 
 
-class ProvisionalSubjectTarget(StrictModel):
-    kind: Literal["provisional"]
-    subject_ref: str
-
-
 SubjectTarget = Annotated[
-    ExistingSubjectTarget | NewSubjectTarget | ProvisionalSubjectTarget,
-    Field(discriminator="kind"),
+    ExistingSubjectTarget | NewSubjectTarget, Field(discriminator="kind")
 ]
 
 
@@ -411,3 +405,16 @@ class SubjectSnapshot:
     new_memory_count: int
     summary_revision: int
     memories: tuple[MemorySnapshot, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryBankSubject:
+    name: str
+    summary: str | None
+    memory_contents: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryBankSpace:
+    space_key: str
+    subjects: tuple[MemoryBankSubject, ...]
