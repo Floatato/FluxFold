@@ -11,12 +11,17 @@ from benchmarks.runtime import (
     DEFAULT_LOCOMO_QUESTIONS_PATH,
     DEFAULT_LONGMEMEVAL_PATH,
     PROJECT_ROOT,
+    embedding_provider,
     generation_provider,
     load_env_file,
 )
 
 from fluxfold.config import FluxFoldConfig
 from fluxfold.errors import ValidationError
+from fluxfold.providers import (
+    LocalMiniLMEmbeddingProvider,
+    OpenAICompatibleEmbeddingProvider,
+)
 
 
 def test_default_dataset_paths_are_under_data() -> None:
@@ -88,6 +93,28 @@ def test_generation_provider_requires_stage_model(monkeypatch) -> None:
     monkeypatch.delenv("FLUXFOLD_BUILD_MODEL", raising=False)
     with pytest.raises(ValidationError, match="FLUXFOLD_BUILD_MODEL"):
         generation_provider(FluxFoldConfig(), stage="build")
+
+
+def test_embedding_provider_defaults_to_local(monkeypatch) -> None:
+    monkeypatch.delenv("FLUXFOLD_EMBEDDING_PROVIDER", raising=False)
+    provider = embedding_provider(FluxFoldConfig())
+    assert isinstance(provider, LocalMiniLMEmbeddingProvider)
+
+
+def test_embedding_provider_supports_openai_compatible(monkeypatch) -> None:
+    monkeypatch.setenv("FLUXFOLD_EMBEDDING_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("FLUXFOLD_EMBEDDING_MODEL", "embedding-model")
+    monkeypatch.setenv("FLUXFOLD_EMBEDDING_DIMENSION", "12")
+    provider = embedding_provider(FluxFoldConfig())
+    assert isinstance(provider, OpenAICompatibleEmbeddingProvider)
+    assert provider.model_info.model == "embedding-model"
+    assert provider.model_info.dimension == 12
+
+
+def test_embedding_provider_rejects_unknown_kind(monkeypatch) -> None:
+    monkeypatch.setenv("FLUXFOLD_EMBEDDING_PROVIDER", "unknown")
+    with pytest.raises(ValidationError, match="FLUXFOLD_EMBEDDING_PROVIDER"):
+        embedding_provider(FluxFoldConfig())
 
 
 def test_missing_dataset_file_explains_setup(tmp_path: Path) -> None:

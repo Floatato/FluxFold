@@ -231,9 +231,16 @@ async def answer_run(
     run_paths: RunPaths,
     config: FluxFoldConfig,
 ) -> None:
-    _validate_manifest(run_paths, dataset, spaces, config)
-    _remove_if_exists(run_paths.predictions)
-    _remove_if_exists(run_paths.search_results)
+    _validate_manifest(run_paths, dataset, spaces)
+    completed = _completed_question_ids(run_paths.predictions, dataset)
+    pending = [
+        (space, question_index)
+        for space in spaces
+        for question_index in range(len(space.questions))
+        if space.questions[question_index].question_id not in completed
+    ]
+    if not pending:
+        return
     generation = generation_provider(config, stage="answer")
     embedding = embedding_provider(config)
     engine = await FluxFold.open(
@@ -244,66 +251,62 @@ async def answer_run(
         benchmark_seed=config.benchmark_seed,
     )
     semaphore = asyncio.Semaphore(config.benchmark_search_concurrency)
+    write_lock = asyncio.Lock()
     opened_spaces = {
         space.space_key: await engine.create_or_open_space(space.space_key)
         for space in spaces
     }
 
-    async def answer_one(
-        space: BenchmarkSpace, question_index: int
-    ) -> tuple[dict[str, object], dict[str, object]]:
+    async def answer_one(space: BenchmarkSpace, question_index: int) -> None:
         question = space.questions[question_index]
         memory_space = opened_spaces[space.space_key]
 
         async def work() -> tuple[dict[str, object], dict[str, object]]:
-            async with semaphore:
-                started = time.perf_counter()
-                result = await engine.search(
-                    memory_space.memory_space_id, question.question
+            started = time.perf_counter()
+            result = await engine.search(
+                memory_space.memory_space_id, question.question
+            )
+            search_latency = time.perf_counter() - started
+            prompt = _answer_user_prompt(
+                dataset, question.question, question.question_date, result.render()
+            )
+            response = await generation.generate(
+                GenerationRequest(
+                    stage="benchmark_answer",
+                    user_prompt=prompt,
+                    temperature=0.0,
+                    timeout_seconds=config.benchmark_search_sample_timeout_seconds,
+                    seed=config.benchmark_seed,
                 )
-                search_latency = time.perf_counter() - started
-                prompt = _answer_user_prompt(
-                    dataset, question.question, question.question_date, result.render()
-                )
-                response = await generation.generate(
-                    GenerationRequest(
-                        stage="benchmark_answer",
-                        user_prompt=prompt,
-                        temperature=0.0,
-                        timeout_seconds=config.benchmark_search_sample_timeout_seconds,
-                        seed=config.benchmark_seed,
-                    )
-                )
-                prediction = (
-                    {"question_id": question.question_id, "hypothesis": response.text}
-                    if dataset == "longmemeval"
-                    else {
-                        "qa_id": question.question_id,
-                        "predicted_answer": response.text,
-                    }
-                )
-                search_record = {
-                    "question_id": question.question_id,
-                    "space_key": space.space_key,
-                    "search_latency_seconds": search_latency,
-                    "search_result": asdict(result),
+            )
+            prediction = (
+                {"question_id": question.question_id, "hypothesis": response.text}
+                if dataset == "longmemeval"
+                else {
+                    "qa_id": question.question_id,
+                    "predicted_answer": response.text,
                 }
-                return prediction, search_record
+            )
+            search_record = {
+                "question_id": question.question_id,
+                "space_key": space.space_key,
+                "search_latency_seconds": search_latency,
+                "search_result": asdict(result),
+            }
+            return prediction, search_record
 
-        return await asyncio.wait_for(
-            work(), timeout=config.benchmark_search_sample_timeout_seconds
-        )
-
-    try:
-        tasks = [
-            asyncio.create_task(answer_one(space, question_index))
-            for space in spaces
-            for question_index in range(len(space.questions))
-        ]
-        for task in tasks:
-            prediction, search_record = await task
+        async with semaphore:
+            prediction, search_record = await asyncio.wait_for(
+                work(), timeout=config.benchmark_search_sample_timeout_seconds
+            )
+        async with write_lock:
             append_jsonl(run_paths.predictions, prediction)
             append_jsonl(run_paths.search_results, search_record)
+
+    try:
+        await asyncio.gather(
+            *(answer_one(space, question_index) for space, question_index in pending)
+        )
     finally:
         await engine.close()
 
@@ -315,7 +318,7 @@ async def score_run(
     run_paths: RunPaths,
     config: FluxFoldConfig,
 ) -> None:
-    _validate_manifest(run_paths, dataset, spaces, config)
+    _validate_manifest(run_paths, dataset, spaces)
     predictions = _load_predictions(run_paths.predictions, dataset)
     questions = tuple(question for space in spaces for question in space.questions)
     generation = generation_provider(config, stage="score")
@@ -368,30 +371,38 @@ def _validate_manifest(
     run_paths: RunPaths,
     dataset: str,
     spaces: tuple[BenchmarkSpace, ...],
-    config: FluxFoldConfig,
 ) -> None:
     manifest = json.loads(run_paths.manifest.read_text(encoding="utf-8"))
     if manifest["dataset"] != dataset:
         raise ValidationError("dataset does not match build manifest")
-    if manifest["config_signature"] != config.signature:
-        raise ValidationError("configuration does not match build manifest")
     if list(manifest["selected_space_ids"]) != [space.source_id for space in spaces]:
         raise ValidationError("space selection does not match build manifest")
 
 
 def _load_predictions(path: Path, dataset: str) -> dict[str, str]:
     output: dict[str, str] = {}
+    key_field, value_field = _prediction_fields(dataset)
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         item = json.loads(line)
-        key_field = "question_id" if dataset == "longmemeval" else "qa_id"
-        value_field = "hypothesis" if dataset == "longmemeval" else "predicted_answer"
         question_id = str(item[key_field])
         if question_id in output:
             raise ValidationError(f"duplicate prediction: {question_id}")
         output[question_id] = str(item[value_field])
     return output
+
+
+def _completed_question_ids(path: Path, dataset: str) -> set[str]:
+    if not path.exists():
+        return set()
+    return set(_load_predictions(path, dataset))
+
+
+def _prediction_fields(dataset: str) -> tuple[str, str]:
+    if dataset == "longmemeval":
+        return "question_id", "hypothesis"
+    return "qa_id", "predicted_answer"
 
 
 async def _finish_add_item(

@@ -24,17 +24,15 @@ uv sync
 
 ## Library usage
 
-`FluxFold` is asynchronous. Applications provide one generation provider and one embedding provider; OpenAI-compatible adapters are included.
+`FluxFold` is asynchronous. Applications provide a generation provider. Retrieval uses the local `sentence-transformers/all-MiniLM-L6-v2` model by default; the model is downloaded from Hugging Face on first use and then reused from the local cache. An OpenAI-compatible embedding adapter remains available for explicit configuration.
 
 ```python
 import asyncio
 
 from fluxfold import (
-    EmbeddingModelInfo,
     EpisodeBlock,
     FluxFold,
     NormalizedEpisode,
-    OpenAICompatibleEmbeddingProvider,
     OpenAICompatibleGenerationProvider,
     Role,
 )
@@ -45,19 +43,9 @@ async def main() -> None:
         model="gpt-4.1-mini",
         api_key="...",
     )
-    embedding = OpenAICompatibleEmbeddingProvider(
-        model_info=EmbeddingModelInfo(
-            provider="openai-compatible",
-            model="text-embedding-3-small",
-            revision="unspecified",
-            dimension=1536,
-        ),
-        api_key="...",
-    )
     async with await FluxFold.open(
         db_path="fluxfold.sqlite3",
         generation_provider=generation,
-        embedding_provider=embedding,
     ) as engine:
         space = await engine.create_or_open_space("example")
         await engine.add_episode(
@@ -92,7 +80,7 @@ cp .env.example .env
 ```
 
 Fill the empty values in `.env` for the three generation groups (`FLUXFOLD_BUILD_*`,
-`FLUXFOLD_ANSWER_*`, `FLUXFOLD_SCORE_*`) and the embedding provider, then:
+`FLUXFOLD_ANSWER_*`, `FLUXFOLD_SCORE_*`). The benchmark uses the bundled local embedding model unless `.env` explicitly selects `openai-compatible`, then:
 
 ```bash
 uv run python -m benchmarks.scripts.build_sample --dataset longmemeval
@@ -107,9 +95,3 @@ uv run python -m benchmarks.scripts.score_sample --dataset locomo_refined
 ```
 
 `build` without `--run-dir` creates `runs/{dataset}_{month}.{day}_{HH:MM}_{seq}` using local time, for example `runs/longmemeval_8.27_21:02_1`. A second build in the same minute becomes `_2`. `answer` and `score` without `--run-dir` use the latest run of that dataset and mode. Pass `--run-dir` to override. Replace `_sample` with `_full` for complete datasets. Optional `--config` TOML overrides go under `[fluxfold]`.
-
-## Design
-
-- [Project design](design.md)
-- [Experimental Memory Engine design](design_detailed.md)
-- [Design background and unverified assumptions](background.md)

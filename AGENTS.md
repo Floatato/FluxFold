@@ -22,12 +22,12 @@ bounded, self-specializing organization units that are reviewed and split as the
 
 | Document                      | Role                                                                                                                                          |
 | ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `design_detailed.md` §1.1–1.4 | **The implementation source of truth** for the experimental version: data model, storage, config values, pipelines, structured-output shapes. |
-| `design.md`                   | Project-level delivery form, toolchain, quality baseline, evolution conditions.                                                               |
-| `background.md`               | Why each mechanism exists, and which assumptions are still unverified.                                                                        |
+| `docs/design_detailed.md` §1.1–1.4 | **The implementation source of truth** for the experimental version: data model, storage, config values, pipelines, structured-output shapes. |
+| `docs/design.md`                   | Project-level delivery form, toolchain, quality baseline, evolution conditions.                                                               |
+| `docs/background.md`               | Why each mechanism exists, and which assumptions are still unverified.                                                                        |
 
 
-`design_detailed.md` §2.x is **official-version** design — out of scope, do not implement.
+`docs/design_detailed.md` §2.x is **official-version** design — out of scope, do not implement.
 When a document and the code disagree, the document wins; if the design is genuinely wrong,
 change the document in the same commit as the code, never silently diverge.
 
@@ -50,8 +50,9 @@ benchmarks/             # dataset adapters + runner; depends on the library, nev
 data/                   # cloned LongMemEval and LoCoMo_refined; gitignored
 runs/                   # local benchmark artifacts; gitignored
 scripts/setup-dev.sh    # one-time local environment bootstrap
+docs/                   # design source of truth and design rationale
 pyproject.toml uv.lock .python-version LICENSE README.md .env.example
-design.md design_detailed.md background.md AGENTS.md AGENTS_CH.md
+AGENTS.md AGENTS_CH.md
 ```
 
 Dependency direction is one-way: `benchmarks/` → `src/fluxfold/`. Dataset adapters only
@@ -105,7 +106,7 @@ no commented-out leftovers, unused imports, or dead helpers.
 
 ## Documentation Duties
 
-- Behavior changes go into `design_detailed.md` (Memory Engine) or `design.md` (project-level)  
+- Behavior changes go into `docs/design_detailed.md` (Memory Engine) or `docs/design.md` (project-level)
 in the same change. A code change without the matching doc update is incomplete.
 - Describe only the resulting current design. Delete superseded descriptions instead of
 recording that something is no longer used; git holds the history.

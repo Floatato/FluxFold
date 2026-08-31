@@ -323,7 +323,14 @@ memory 退役时关闭它的所有 active links，但保留 link rows 作为历�
 `embedding_model_signatures` 保存 provider、model ID、revision、dimension、dtype、
 normalization 和 query/document encoding mode。配置不同即视为不同 signature。
 
-模型不在本设计中硬编码。每个 memory space 按用途选择 active signature：
+实验版 library 默认使用进程内的
+`sentence-transformers/all-MiniLM-L6-v2`，固定 revision
+`1110a243fdf4706b3f48f1d95db1a4f5529b4d41`，输出 384 维 L2 归一化向量；query 与
+document 都直接编码原文。模型在第一次实际编码时加载，首次使用时由 Sentence Transformers
+模型仓库的 ONNX 权重和 tokenizer 下载到 Hugging Face 本地缓存，后续运行通过 ONNX Runtime
+在 CPU 上复用缓存。输入按模型约束截断到 256 tokens，并使用 attention-mask mean pooling。
+默认关闭 ONNX Runtime telemetry。调用方仍可显式传入其他 embedding
+provider。每个 memory space 按用途选择 active signature：
 
 - `retrieval`：memory、subject 和 query 检索；
 - `boundary`：正式版的 message boundary detection。
@@ -557,7 +564,7 @@ Subject split 无法形成合法语义分组时使用明确的
 | 配置项                                         | 值           | 含义                                              |
 | ------------------------------------------- | ----------- | ----------------------------------------------- |
 | `embedding_batch_size`                      | 100         | 一次 embedding provider 请求最多编码的文本数                |
-| `embedding_request_timeout_seconds`         | 60 秒        | 单次 embedding provider 请求的 timeout               |
+| `embedding_request_timeout_seconds`         | 60 秒        | 单次远程 embedding provider 请求的 timeout             |
 | `embedding_transport_max_retries`           | 5           | embedding 初次传输失败后的额外重试次数                        |
 | `embedding_batch_concurrency_per_operation` | 4           | 单个 embedding 逻辑操作内部同时执行的 batch 请求上限            |
 | `subject_summary_refresh_concurrency_per_episode` | 5     | 一个 episode 内同时执行的 subject summary refresh 上限          |
@@ -577,6 +584,9 @@ memory 或 subject 创建、相关文本更新时立即计算对应 embedding。
 provider 只有归一化为 `transient_transport`、`rate_limited` 或 `service_unavailable` 的错误
 才执行额外 5 次重试，并复用 generation transport retry 的退避参数；配置、权限、硬配额和
 非法请求错误遵守上表的阻塞规则。
+
+默认本地 embedding 在工作线程中执行，避免阻塞 asyncio event loop；同一 provider instance
+串行调用底层模型编码。它没有网络 request，因此不应用 request timeout 或 transport retry。
 
 SQLite 固定使用 WAL、`synchronous=NORMAL`。事务冲突最多额外重试 5 次，使用 full
 jitter，不设置退避最大时间。同一 memory space 的 extraction lane 和 stateful lane 各为
@@ -781,16 +791,42 @@ Extraction 不设置每 episode 的建议 memory 数、硬数量上限、总 mem
 或其他可独立组织范围的一组记忆；初始名称保持宏观、简短、可独立理解，后续可以由 split
 形成更具体的领域或关系 subject。
 
-direct link 的必要条件是目标 subject 是当前 memory 的组织归属：memory 属于该 subject
-要收的那种事实、事件、状态、决定或目标，依据 subject 收的是哪类东西判断，而不是记忆
-是否碰巧提到它。一条 memory 必须用 direct link 覆盖它涉及的每个核心主体；同一主体
-存在多个粒度不同的候选 subjects 时，只能 direct link 到该 memory 真正归属的最细粒度
-候选，存在合适的更细归属时不得退回或同时 direct link 到更粗 subject。这一规则对
-memory 涉及的每个核心主体分别应用。contextual link 挂到 memory 会具体补全、约束、更新
-或解释的候选 subject，包括记忆正文从未点名、只凭常识才成立的跨域关系，例如种牙手术对
-饮食偏好、驾照停权对接送出行。某个核心主体没有合适候选时，以最粗粒度新建
-subject（通常就是该实体或范围本身的名称），使该主体后续的 memories 汇集到同一处；同一
-批次的多条 memories 可以共同引用本次输出中的同一个新 `subject_ref`。
+linking 首先识别每条 memory 的全部核心锚点（core anchors）。核心锚点是 memory 直接断言
+或更新其事实、事件、关系、状态、决定或目标，并值得独立检索的实体或范围；一段关系可以
+同时有多个核心锚点。地点、物品、属性、例子或偶然上下文中的普通提及不自动成为核心锚点，
+只有 memory 对它建立了可独立使用的信息时才算。数据库中的 subject 是承接锚点 memories
+的组织容器，不与核心锚点混用同一个概念。
+
+direct link 的必要条件是目标 subject 是当前 memory 对某一核心锚点的组织归属：memory
+属于该 subject 要收的那种事实、事件、状态、决定或目标，依据 subject 收的是哪类东西判断，
+而不是记忆是否碰巧提到它。每个核心锚点独立执行以下顺序，一个锚点已有合适 subject 不能
+替另一个锚点完成归档：
+
+1. 只考察范围可能承接当前锚点的 candidates；属于其他锚点的合适候选不参与本锚点决策。
+2. 存在合适 candidates 时，只选择 memory 真正归属的最细粒度候选；不得选择并不适合的
+   更细 subject，不得为该锚点新建 subject，也不得为了重复同一归属而同时 direct 或
+   contextual link 到其更粗父级。
+3. 从细到粗没有任何 candidate 合适时，才以最粗可用粒度新建 subject，通常就是该实体或
+   范围本身的名称，使后续 memories 汇集到同一处。
+
+新 subject 是累积容器，不是当前 memory 的摘要；名称不得加入仅属于单次经历的日期、年份、
+一次 trip、show、meeting 或 incident 等细节。只有 event 或 project 本身就是需要独立跟踪的
+核心锚点时，才直接使用其名称。细粒度 subject 由多条 memories 提供稳定边界的证据后通过
+split 形成，而不从单条 memory 的具体程度推导。同一批次的多条 memories 可以共同引用本次
+输出中的同一个新 `subject_ref`。
+
+例如已有 `Mike`、`Mike's Beijing trip`、`Mike's dietary preferences` 和
+`John's diet habits` 时，`Mike and John are good friends` 同时以 Mike 和 John 为核心锚点：
+Mike 侧 direct link 到 `Mike`；`John's diet habits` 不承接这段友情，因此 John 侧新建最粗
+粒度的 `John`，不能因为 Mike 已有合适候选而遗漏 John。若已有范围同时覆盖双方的
+`Mike and John's friendship`，一个 direct link 可以解决两个锚点。只有 `Melanie` 候选时，
+`Melanie's family saw the Perseid meteor shower while camping in 2022` direct link 到
+`Melanie`，不得新建 `Melanie's family 2022 camping trip`。
+
+全部核心锚点决定 direct targets 后，先合并去重，再判断 contextual links。contextual link
+挂到 memory 会具体补全、约束、更新或解释的既有候选 subject，包括记忆正文从未点名、只凭
+常识才成立的跨域关系，例如种牙手术对饮食偏好、驾照停权对接送出行。缺失的 contextual
+范围本身不触发新建，除非它同时是尚未解决的核心锚点。
 
 被动候选召回分别以每条新 memory content 为 query，只扫描 active subject name embedding。
 每条 memory 取相似度不低于阈值的前 5 个 subject，以余弦相似度作为分数放入批次对比池，
@@ -983,8 +1019,8 @@ review 而更新或退役、或没有新增 link 的其他容量变化，不触�
 | `subject_split_total_memory_chars_threshold` | 8,000 字符 | subject 下 active memory latest content 总字符数触发 split 的阈值             |
 | `subject_split_result_subject_min`           | 2         | full split 的新 subjects 数或 partial split 的原 subject 加新 subjects 总数下限 |
 | `subject_split_result_subject_max`           | 5         | full split 的新 subjects 数或 partial split 的原 subject 加新 subjects 总数上限 |
-| `subject_split_result_min_memories`          | 2         | 每个新建结果 subject 至少必须包含的 memory 数                                     |
-| `subject_split_result_target_memory_max`     | 20        | 每个新建结果 subject 的目标 memory 容量上限                                      |
+| `subject_split_result_min_memories`          | 3         | 每个新建结果 subject 至少必须包含的 memory 数                                     |
+| `subject_split_result_target_memory_max`     | 20        | 每个新建结果 subject 的 memory 数硬上限                                          |
 | `subject_split_memory_membership_max`        | 2         | 一条输入 memory 最多可以归属的本次新建 subject 数                                   |
 
 
@@ -993,21 +1029,28 @@ active memory 数达到 24，或 latest contents 总字符数达到 8,000，即�
 最终关联的 memory 数量或总字符数，不设置硬容量、动态阈值、冷却期或封存状态。每次又有
 memory link 到已达到任一阈值的 subject 时，都重新尝试 split。
 
-split 的结构化结果只能是 `full_split`、`partial_split` 或 `defer_split`：
+split 的结构化结果只能是 `full_split`、`partial_split` 或 `defer_split`，按以下排他顺序选择；
+仅在结构上能凑出分组不代表该分组具有组织意义：
 
-- **full split** 创建 2--5 个更具体且可独立理解的新 subjects。原 subject 的每条 active
-memory 至少进入一个、最多进入两个新 subjects；原 subject 被完整替换并退役。
-- **partial split** 创建 1--4 个更具体的新 subjects，同时保留原 subject 的 ID、name 和
-active 状态。LLM 只列出新 subjects 的 name，以及应移入它们的 memory IDs 和 link basis。程序取
+- **full split** 仅用于全部输入 memories 都能自然归入 2--5 个有意义、可独立检索、更新和
+增长的更细 subjects，且没有仍需原粗粒度 subject 承接的残余 memory。原 subject 的每条
+active memory 至少进入一个、最多进入两个新 subjects；原 subject 被完整替换并退役。不得为
+覆盖完整而把离群 memory 强塞进某组或创建 catch-all。
+- 无法 full split 时，**partial split** 仅用于 1--4 个有意义、可独立增长的群组已经突出，
+但其余 memories 没有共同的更细范围、仍需原粗粒度 subject 承接。它创建新 subjects，同时
+保留原 subject 的 ID、name 和 active 状态。LLM 只列出新 subjects 的 name，以及应移入
+它们的 memory IDs 和 link basis。程序取
 所有被列出 memory IDs 的并集，关闭它们指向原 subject 的 links；未被列出的 memories
 继续留在原 subject。移出集合必须非空且不是原集合，原 subject 至少保留一条 memory；
-否则结果应表达为 full split 或 defer split。
-- **defer split** 表示当前 memories 无法形成满足约束且具有实际组织意义的分组。它是合法
+不得为扩大新群组而把残余 memories 强行移出。
+- 以上两者都不适用时使用 **defer split**，包括没有连 3 条 memories 都能组成的连贯群组、
+有意义的分组会违反任一结果约束，或表面群组不是值得独立检索、更新和增长的稳定范围。它是合法
 业务结果，不修改 subjects、memories、links 或计数，并记录 warning；下次又有 memory
 link 到原 subject 且容量仍达到阈值时再次尝试。它计入 Subject split 触发次数，不计入
 benchmark 失败样本数。
 
-每个新 subject 至少包含 2 条 memories，目标不超过 20 条，并且至少有一条 `direct` link。
+每个新 subject 必须包含 3--20 条不同 memories，并且至少有一条 `direct` link；上下限均由
+程序硬校验。
 被移出原 subject 的每条 memory，在关闭指向原 subject 的 link 之后，仍必须至少有一条 active
 `direct` link：来自本次新 subjects 的新 direct，或仍指向 split 范围之外其他 subjects 的既有
 direct。一条 memory 在本次新 subjects 中最多出现两次；partial split 中出现在任一新 subject 的
@@ -1048,7 +1091,7 @@ JSON、schema、字段类型或非法 ID 错误归入 `invalid_structured_output
 | `benchmark_search_concurrency`                 | 5       | 同时执行的 benchmark search/QA 样例数                                     |
 | `benchmark_seed`                               | 42      | generation provider 支持 seed 时 benchmark 使用的固定 seed                |
 | `benchmark_memory_space_build_timeout_seconds` | 7,200 秒 | 构建一个 memory space 的总 timeout                                      |
-| `benchmark_search_sample_timeout_seconds`      | 300 秒   | 一条 benchmark search/QA 样例的 timeout                                |
+| `benchmark_search_sample_timeout_seconds`      | 300 秒   | 一条 benchmark search/QA 样例拿到并发槽之后，search + 生成的 timeout；不含排队等待 |
 | `benchmark_checkpoint_interval_items`          | 1       | 每完成多少个项目保存一次 checkpoint 和结果                                       |
 
 
@@ -1066,6 +1109,10 @@ Benchmark runner 按 session `source_sequence` 创建公共 `add_episode` 调用
 
 不设置整次 benchmark 总 timeout。每完成一个 episode ingestion、space ingestion 或一条
 QA 都原子保存 checkpoint；prepared extraction 不写 checkpoint，崩溃恢复后重新 extraction。
+answer 以 `predictions.jsonl` 中已写入的 question ID 为 checkpoint：每完成一题立即追加
+prediction 与对应 `search_results.jsonl` 记录；再次运行同一 run 的 answer 时跳过这些 ID，
+不删除已有预测。`benchmark_search_sample_timeout_seconds` 从该题拿到
+`benchmark_search_concurrency` 槽之后起算，只覆盖这一题的 search 与生成，排队等待不计入。
 Benchmark runner 不提供完整 item 外层 retry；generation transport、
 embedding transport、structured-output repair 和 SQLite transaction 只执行各自所属操作内
 的有限重试。模型给出的结构和业务均有效但错误的答案不重试。一次 full 或 sample 脚本只
@@ -1075,16 +1122,18 @@ embedding transport、structured-output repair 和 SQLite transaction 只执行�
 `runs/longmemeval_8.27_21:02_2`。answer 与 score 未指定 `--run-dir` 时，使用同一
 dataset、同一 mode（sample 或 full）下按该命名解析出的最新目录；目录名无法解析、缺少
 manifest，或 manifest 的 dataset/mode 不匹配的项不参与选择。未指定 `--run-dir` 时必须
-提供 `--dataset`。需要指向特定 run 或恢复未完成的 build 时显式传入 `--run-dir`。
+提供 `--dataset`。需要指向特定 run，或恢复未完成的 build / answer 时，显式传入 `--run-dir`。
 runner 不内置重复次数，也不跨 run 计算均值或标准差。
 
 每套数据集提供 `build`、`answer`、`score` 三个独立 stage，并分别提供 full 与 sample
 薄脚本，共六个可直接通过 `python -m benchmarks.scripts.<stage>_<mode>` 运行的模块。
 build 只构建数据库和写入审计产物；answer 从同一 run manifest 和数据库执行 public
 search 并生成官方字段形状的 predictions；score 独立读取 predictions 生成逐题结果和汇总。
-stage 之间使用不可变 manifest 校验数据文件 hash、选择范围、配置签名、
-embedding signature 和 seed。manifest 记录 build 使用的 generation model，供复盘写入侧；
-answer 和 score 各自读取独立的 generation provider 配置，不要求与 build model 相同。
+build 把 dataset hash、选择范围、配置签名、embedding model 和 seed 写入不可变
+manifest，供复盘。answer 和 score 只校验 dataset 与 space 选择与 manifest 一致，不要求
+当前 FluxFoldConfig 与 build 时相同。manifest 记录 build 使用的 generation model，供复盘
+写入侧；answer 和 score 各自读取独立的 generation provider 配置，不要求与 build model
+相同。
 数据集由 `./scripts/setup-dev.sh` clone 到 `data/`：
 `LoCoMo_refined` 与 `LongMemEval` 来自其上游 Git 仓库，LongMemEval-S 的
 `longmemeval_s_cleaned.json` 另从 Hugging Face 下载。build 默认读取这些本地文件，可用
@@ -1099,7 +1148,9 @@ LoCoMo_refined sample 必须选择一个 conversation ID 或零基位置，并�
 
 build、answer 和 score 分别从 `.env` 读取一组 generation provider 配置
 （`FLUXFOLD_BUILD_*`、`FLUXFOLD_ANSWER_*`、`FLUXFOLD_SCORE_*`，每组包含 `MODEL`、
-`API_KEY`、`BASE_URL`）；retrieval embedding 使用独立 embedding model 配置。
+`API_KEY`、`BASE_URL`）。retrieval embedding 默认使用上述本地模型；设置
+`FLUXFOLD_EMBEDDING_PROVIDER=openai-compatible` 时，改为读取独立的 embedding model、
+dimension、revision、API key、base URL 和 query/document encoding mode 配置。
 LongMemEval 输出 `question_id`/`hypothesis`，使用官方 `evaluate_qa.py` 的 yes/no LLM judge prompt。
 LoCoMo_refined 输出 `qa_id`/`predicted_answer`，使用官方 `refined` LLM judge prompt、token F1 和 BLEU-1；多个合法 reference 取最佳
 匹配。answer 阶段按数据集选择 prompt：LoCoMo_refined 要求短短语、尽量使用记忆原文、保持时间粒度并把相对时间锚定到记忆日期；LongMemEval 要求覆盖全部所需事实，并在有 `question_date` 时写入 `Current Date`。检索结果渲染为 subject 分组，每条 memory 带上 `latest_source_at` 对应的日期（`D Month YYYY`）。
@@ -1154,6 +1205,16 @@ memory_compression_rate = 1 - memory_chars / source_chars
 `source_chars` 包含作为正文输入的图片描述，不包含 role、时间、metadata 或评测字段。
 `memory_chars` 不包含 retired memories、历史 memory versions 或 retired subjects；这些对象
 只用于审计和追溯。实验逐 memory space 报告 `source_chars`、`memory_chars` 和压缩率。
+
+`build_summary.json` 还按 memory space 报告当前组织快照：`episode_count`、`active_subjects`、
+`direct_links`、`contextual_links`、`retired_memories`、`retired_subjects`、`rewritten_memories`
+（latest version 号大于 1 的 active memories）、`max_links_per_memory`、
+`max_direct_links_per_memory`、`max_contextual_links_per_memory`、`mean_links_per_memory`、
+`max_memories_per_subject`、`mean_memories_per_subject`、`max_provenance_per_memory`，以及
+`subjects` 列表。列表按 name 再按 subject ID 排序，每项只含 `name`、`direct_links` 和
+`contextual_links`。link 与 provenance 计数只包含 active memories 指向 active subjects 的
+active links，以及 latest memory version 的 provenance。没有 active memories 或 active
+subjects 时，对应 max/mean 为 0。
 
 #### 1.2.7 实验版记忆构建日志
 
@@ -1442,15 +1503,17 @@ Full split 输出全部新 subjects 及其完整成员关系：
       "name": "Mike's dietary preferences",
       "links": [
         {"memory_id": "memory-uuid-1", "basis": "direct"},
-        {"memory_id": "memory-uuid-2", "basis": "direct"}
+        {"memory_id": "memory-uuid-2", "basis": "direct"},
+        {"memory_id": "memory-uuid-3", "basis": "direct"}
       ]
     },
     {
       "subject_ref": "new_subject_2",
       "name": "Mike's travel plans",
       "links": [
-        {"memory_id": "memory-uuid-2", "basis": "contextual"},
-        {"memory_id": "memory-uuid-3", "basis": "direct"}
+        {"memory_id": "memory-uuid-4", "basis": "contextual"},
+        {"memory_id": "memory-uuid-5", "basis": "direct"},
+        {"memory_id": "memory-uuid-6", "basis": "direct"}
       ]
     }
   ]
@@ -1469,7 +1532,8 @@ Partial split 只列出新 subjects 和要移走的 memories；原 subject 的�
       "name": "Mike's dietary preferences",
       "links": [
         {"memory_id": "memory-uuid-1", "basis": "direct"},
-        {"memory_id": "memory-uuid-2", "basis": "direct"}
+        {"memory_id": "memory-uuid-2", "basis": "direct"},
+        {"memory_id": "memory-uuid-3", "basis": "direct"}
       ]
     }
   ]

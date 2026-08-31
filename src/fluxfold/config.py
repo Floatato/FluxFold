@@ -44,7 +44,7 @@ class FluxFoldConfig:
     subject_split_total_memory_chars_threshold: int = 8_000
     subject_split_result_subject_min: int = 2
     subject_split_result_subject_max: int = 5
-    subject_split_result_min_memories: int = 2
+    subject_split_result_min_memories: int = 3
     subject_split_result_target_memory_max: int = 20
     subject_split_memory_membership_max: int = 2
     search_subject_top_k: int = 5
@@ -132,6 +132,13 @@ class FluxFoldConfig:
             )
         if self.memory_link_preferred_max > self.memory_active_subject_link_max:
             raise ValidationError("preferred link maximum exceeds the hard maximum")
+        if (
+            self.subject_split_result_min_memories
+            > self.subject_split_result_target_memory_max
+        ):
+            raise ValidationError(
+                "split result minimum exceeds the target memory maximum"
+            )
 
     def with_overrides(self, **overrides: Any) -> FluxFoldConfig:
         """Return a validated copy containing explicit overrides."""

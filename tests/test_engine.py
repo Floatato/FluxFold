@@ -6,7 +6,13 @@ import json
 import pytest
 
 from fluxfold import EpisodeBlock, FluxFold, FluxFoldConfig, NormalizedEpisode, Role
-from fluxfold.errors import ErrorClass, ProviderError, SourceConflictError, StageFailure
+from fluxfold.errors import (
+    ErrorClass,
+    ProviderError,
+    SourceConflictError,
+    StageFailure,
+    ValidationError,
+)
 from fluxfold.models import CandidateSubject
 from fluxfold.providers import GenerationRequest, GenerationResponse
 from tests.fakes import FakeEmbeddingProvider, FakeGenerationProvider
@@ -19,6 +25,17 @@ def _episode(key: str, content: str, sequence: int = 0) -> NormalizedEpisode:
         source_sequence=sequence,
         blocks=(EpisodeBlock(f"{key}:0", 0, Role.USER, content),),
     )
+
+
+def test_split_result_memory_minimum_cannot_exceed_maximum() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="split result minimum exceeds the target memory maximum",
+    ):
+        FluxFoldConfig().with_overrides(
+            subject_split_result_min_memories=4,
+            subject_split_result_target_memory_max=3,
+        )
 
 
 def test_add_search_replay_and_source_conflict(tmp_path) -> None:
@@ -51,6 +68,28 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
             ("Alice's hiking", "Alice likes hiking.")
         ]
         assert bank[0].subjects[0].memory_contents == ("Alice likes hiking.",)
+        statistics = engine.space_statistics(space.memory_space_id)
+        assert statistics["active_subjects"] == 1
+        assert statistics["episode_count"] == 1
+        assert statistics["direct_links"] == 1
+        assert statistics["contextual_links"] == 0
+        assert statistics["max_links_per_memory"] == 1
+        assert statistics["max_direct_links_per_memory"] == 1
+        assert statistics["max_contextual_links_per_memory"] == 0
+        assert statistics["max_memories_per_subject"] == 1
+        assert statistics["max_provenance_per_memory"] == 1
+        assert statistics["mean_links_per_memory"] == 1.0
+        assert statistics["mean_memories_per_subject"] == 1.0
+        assert statistics["retired_memories"] == 0
+        assert statistics["retired_subjects"] == 0
+        assert statistics["rewritten_memories"] == 0
+        assert statistics["subjects"] == [
+            {
+                "name": "Alice's hiking",
+                "direct_links": 1,
+                "contextual_links": 0,
+            }
+        ]
         decision = next(
             event for event in events if event["event_type"] == "audit_episode_decision"
         )
@@ -796,9 +835,9 @@ def test_rebuild_retrieval_embeddings_switches_model_atomically(tmp_path) -> Non
 @pytest.mark.parametrize(
     ("split_result", "episode_count", "expected_active_subjects", "expected_operation"),
     [
-        ("full_split", 2, 2, "full_split"),
-        ("partial_split", 3, 2, "partial_split"),
-        ("defer_split", 2, 1, "defer_split"),
+        ("full_split", 3, 2, "full_split"),
+        ("partial_split", 4, 2, "partial_split"),
+        ("defer_split", 3, 1, "defer_split"),
     ],
 )
 def test_subject_split_outcomes(
@@ -857,14 +896,14 @@ def test_split_retries_when_a_moved_memory_would_lose_its_direct_link(tmp_path) 
             config=FluxFoldConfig().with_overrides(
                 subject_candidate_min_similarity=-1.0,
                 memory_candidate_min_similarity=-1.0,
-                subject_split_memory_count_threshold=2,
+                subject_split_memory_count_threshold=3,
                 subject_review_new_memory_threshold=10,
             ),
             event_sink=events.append,
         )
         space = await engine.create_or_open_space("test:split-direct")
         result = None
-        for index in range(2):
+        for index in range(3):
             result = await engine.add_episode(
                 space.memory_space_id,
                 _episode(str(index), f"Alice hiking fact {index}.", index),
@@ -878,6 +917,44 @@ def test_split_retries_when_a_moved_memory_would_lose_its_direct_link(tmp_path) 
         ]
         assert [event["result"] for event in split_calls] == ["failed", "success"]
         assert engine.space_statistics(space.memory_space_id)["active_subjects"] == 2
+        await engine.close()
+
+    asyncio.run(scenario())
+
+
+def test_split_retries_when_a_result_subject_exceeds_memory_max(tmp_path) -> None:
+    async def scenario() -> None:
+        generation = FakeGenerationProvider(
+            split_result="full_split", split_oversized_first=True
+        )
+        engine = await FluxFold.open(
+            db_path=str(tmp_path / "split-memory-max.sqlite3"),
+            generation_provider=generation,
+            embedding_provider=FakeEmbeddingProvider(),
+            config=FluxFoldConfig().with_overrides(
+                subject_candidate_min_similarity=-1.0,
+                memory_candidate_min_similarity=-1.0,
+                subject_split_memory_count_threshold=4,
+                subject_split_result_target_memory_max=3,
+                subject_review_new_memory_threshold=10,
+            ),
+        )
+        space = await engine.create_or_open_space("test:split-memory-max")
+        result = None
+        for index in range(4):
+            result = await engine.add_episode(
+                space.memory_space_id,
+                _episode(str(index), f"Alice hiking fact {index}.", index),
+            )
+        assert result is not None
+        assert result.maintenance[0].operation == "full_split"
+        split_requests = [
+            request
+            for request in generation.requests
+            if request.stage == "subject_split"
+        ]
+        assert len(split_requests) == 2
+        assert "a split subject has too many memories" in split_requests[1].user_prompt
         await engine.close()
 
     asyncio.run(scenario())

@@ -21,12 +21,12 @@ FluxFold 是从零构建的 agent memory system。核心判断：**把全部 LLM
 
 | 文档                            | 作用                                       |
 | ----------------------------- | ---------------------------------------- |
-| `design_detailed.md` §1.1–1.4 | 实验版的**实现事实源**：数据模型、存储、配置数值、处理流程、结构化输出形状。 |
-| `design.md`                   | 项目级交付形态、工具链、质量基线、演进条件。                   |
-| `background.md`               | 每个机制存在的原因，以及哪些假设尚未验证。                    |
+| `docs/design_detailed.md` §1.1–1.4 | 实验版的**实现事实源**：数据模型、存储、配置数值、处理流程、结构化输出形状。 |
+| `docs/design.md`                   | 项目级交付形态、工具链、质量基线、演进条件。                   |
+| `docs/background.md`               | 每个机制存在的原因，以及哪些假设尚未验证。                    |
 
 
-`design_detailed.md` §2.x 属于**正式版**设计，不在范围内，不要实现。
+`docs/design_detailed.md` §2.x 属于**正式版**设计，不在范围内，不要实现。
 文档与代码冲突时以文档为准；如果设计确实有误，在同一次提交中修改文档，绝不静默偏离。
 
 ## 实验版范围
@@ -48,8 +48,9 @@ benchmarks/             # dataset adapters + runner；依赖 library，不可反
 data/                   # clone 的 LongMemEval 与 LoCoMo_refined；gitignored
 runs/                   # 本地 benchmark 产物；gitignored
 scripts/setup-dev.sh    # 一次性本地环境 bootstrap
+docs/                   # 设计事实源与设计依据
 pyproject.toml uv.lock .python-version LICENSE README.md .env.example
-design.md design_detailed.md background.md AGENTS.md AGENTS_CH.md
+AGENTS.md AGENTS_CH.md
 ```
 
 依赖方向单向：`benchmarks/` → `src/fluxfold/`。Dataset adapter 只把来源记录规范化为 episode，
@@ -101,7 +102,7 @@ migration、shim 或 feature flag。
 
 ## 文档义务
 
-- 行为变化必须在同一次改动中写入 `design_detailed.md`（Memory Engine）或 `design.md`（项目级）。  
+- 行为变化必须在同一次改动中写入 `docs/design_detailed.md`（Memory Engine）或 `docs/design.md`（项目级）。
 没有配套文档更新的代码改动是不完整的。
 - 只描述最终的当前设计。删除被取代的描述，而不是记录“某机制已不再使用”；历史由 git 保存。
 - `AGENTS.md` 与 `AGENTS_CH.md` 必须同步更新并保持等价。

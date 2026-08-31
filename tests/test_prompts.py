@@ -71,12 +71,8 @@ def test_linking_prompt_distinguishes_direct_granularity_from_contextual_links()
         in LINKING_SYSTEM
     )
     assert "kind of thing the subject is for" in LINKING_SYSTEM
-    assert (
-        "never also a direct or contextual link to that coarser subject"
-        in LINKING_SYSTEM
-    )
-    assert "Apply this rule separately to every core subject" in LINKING_SYSTEM
-    assert "This restriction is specific to direct links" in LINKING_SYSTEM
+    assert "never also direct- or contextual-link a coarser parent" in LINKING_SYSTEM
+    assert "After resolving every core anchor" in LINKING_SYSTEM
     assert "A contextual link is a retrieval bridge" in LINKING_SYSTEM
     assert "too dissimilar for vector recall" in LINKING_SYSTEM
     assert "without treating the affected subject as a home" in LINKING_SYSTEM
@@ -92,6 +88,23 @@ def test_linking_prompt_distinguishes_direct_granularity_from_contextual_links()
     assert "better direct home that passive recall missed" in LINKING_SYSTEM
 
 
+def test_linking_prompt_resolves_each_core_anchor_before_creating_subjects() -> None:
+    assert "First identify every core anchor in each memory" in LINKING_SYSTEM
+    assert "A relationship may have multiple core anchors" in LINKING_SYSTEM
+    assert (
+        "a fitting subject for one anchor never removes the need to resolve another"
+        in LINKING_SYSTEM
+    )
+    assert "Do not treat a candidate that fits a different anchor" in LINKING_SYSTEM
+    assert "create no new subject for that anchor" in LINKING_SYSTEM
+    assert "Only when zero candidates are fitting homes" in LINKING_SYSTEM
+    assert "an accumulation container, not a summary" in LINKING_SYSTEM
+    assert "Fine-grained subjects emerge later through split" in LINKING_SYSTEM
+    assert "The fitting Mike candidate does not resolve John" in LINKING_SYSTEM
+    assert "do not create `Melanie's family 2022 camping trip`" in LINKING_SYSTEM
+    assert "A missing contextual scope never justifies creating" in LINKING_SYSTEM
+
+
 def test_split_prompt_explains_link_basis_against_result_subjects() -> None:
     assert "Input `link_basis` is relative to the original subject" in SPLIT_SYSTEM
     assert "do not copy it" in SPLIT_SYSTEM
@@ -102,6 +115,16 @@ def test_split_prompt_explains_link_basis_against_result_subjects() -> None:
     assert "memories you do not list stay in the original" in SPLIT_SYSTEM
     assert "links to subjects outside this split are preserved" in SPLIT_SYSTEM
     assert "Keep together memories that a later question will need" in SPLIT_SYSTEM
+
+
+def test_split_prompt_defines_outcome_order_and_result_size_bounds() -> None:
+    assert "Every new subject holds three to twenty distinct memories" in SPLIT_SYSTEM
+    assert "Choose the result by this order" in SPLIT_SYSTEM
+    assert "no residual memory needs the original broad subject" in SPLIT_SYSTEM
+    assert "Move a non-empty proper subset" in SPLIT_SYSTEM
+    assert "leave at least one memory in the original" in SPLIT_SYSTEM
+    assert "no coherent group reaches three memories" in SPLIT_SYSTEM
+    assert "never force an outlier into a group" in SPLIT_SYSTEM
 
 
 def test_review_prompt_exposes_both_valid_output_shapes() -> None:

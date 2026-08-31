@@ -4,11 +4,50 @@ import asyncio
 import json
 
 from benchmarks.adapters import load_longmemeval
-from benchmarks.artifacts import ArtifactWriter, RunPaths
+from benchmarks.artifacts import ArtifactWriter, RunPaths, append_jsonl
 from benchmarks.runner import answer_run, build_run, score_run
 
 from fluxfold import FluxFoldConfig
 from tests.fakes import FakeEmbeddingProvider, FakeGenerationProvider
+
+
+def _alice_record(question_id: str) -> dict[str, object]:
+    return {
+        "question_id": question_id,
+        "question_type": "single-session-user",
+        "question": "What does Alice like?",
+        "answer": "Alice likes hiking.",
+        "haystack_session_ids": ["s-1", "s-2", "s-3"],
+        "haystack_dates": ["2025-01-01", "2025-01-02", "2025-01-03"],
+        "haystack_sessions": [
+            [{"role": "user", "content": "Alice likes hiking."}],
+            [{"role": "user", "content": "Alice owns hiking boots."}],
+            [{"role": "user", "content": "Alice hikes on weekends."}],
+        ],
+    }
+
+
+def _search_config() -> FluxFoldConfig:
+    return FluxFoldConfig().with_overrides(
+        subject_candidate_min_similarity=-1.0,
+        memory_candidate_min_similarity=-1.0,
+        search_subject_min_similarity=-1.0,
+        search_memory_min_similarity=-1.0,
+    )
+
+
+def _patch_providers(monkeypatch, generation: FakeGenerationProvider) -> None:
+    monkeypatch.setenv("FLUXFOLD_BUILD_MODEL", "fake-generation")
+    monkeypatch.setenv("FLUXFOLD_ANSWER_MODEL", "fake-generation")
+    monkeypatch.setenv("FLUXFOLD_SCORE_MODEL", "fake-generation")
+    monkeypatch.setattr(
+        "benchmarks.runner.generation_provider",
+        lambda ignored_config, **_kwargs: generation,
+    )
+    monkeypatch.setattr(
+        "benchmarks.runner.embedding_provider",
+        lambda ignored_config: FakeEmbeddingProvider(),
+    )
 
 
 def test_build_metrics_distinguish_successful_and_failed_llm_calls(tmp_path) -> None:
@@ -44,46 +83,12 @@ def test_build_metrics_distinguish_successful_and_failed_llm_calls(tmp_path) -> 
 
 def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
     dataset_path = tmp_path / "longmemeval.json"
-    dataset_path.write_text(
-        json.dumps(
-            [
-                {
-                    "question_id": "q-1",
-                    "question_type": "single-session-user",
-                    "question": "What does Alice like?",
-                    "answer": "Alice likes hiking.",
-                    "haystack_session_ids": ["s-1", "s-2", "s-3"],
-                    "haystack_dates": ["2025-01-01", "2025-01-02", "2025-01-03"],
-                    "haystack_sessions": [
-                        [{"role": "user", "content": "Alice likes hiking."}],
-                        [{"role": "user", "content": "Alice owns hiking boots."}],
-                        [{"role": "user", "content": "Alice hikes on weekends."}],
-                    ],
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
+    dataset_path.write_text(json.dumps([_alice_record("q-1")]), encoding="utf-8")
     spaces = load_longmemeval(dataset_path)
     paths = RunPaths(tmp_path / "run")
-    config = FluxFoldConfig().with_overrides(
-        subject_candidate_min_similarity=-1.0,
-        memory_candidate_min_similarity=-1.0,
-        search_subject_min_similarity=-1.0,
-        search_memory_min_similarity=-1.0,
-    )
-    monkeypatch.setenv("FLUXFOLD_BUILD_MODEL", "fake-generation")
-    monkeypatch.setenv("FLUXFOLD_ANSWER_MODEL", "fake-generation")
-    monkeypatch.setenv("FLUXFOLD_SCORE_MODEL", "fake-generation")
+    config = _search_config()
     generation = FakeGenerationProvider(extraction_delay_seconds=0.01)
-    monkeypatch.setattr(
-        "benchmarks.runner.generation_provider",
-        lambda ignored_config, **_kwargs: generation,
-    )
-    monkeypatch.setattr(
-        "benchmarks.runner.embedding_provider",
-        lambda ignored_config: FakeEmbeddingProvider(),
-    )
+    _patch_providers(monkeypatch, generation)
 
     async def scenario() -> None:
         await build_run(
@@ -123,11 +128,19 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
             for event in resumed_events
             if event["event_type"] == "episode_processing_started"
         ] == [2]
+        later_config = config.with_overrides(subject_split_memory_count_threshold=12)
+        assert later_config.signature != config.signature
         await answer_run(
-            dataset="longmemeval", spaces=spaces, run_paths=paths, config=config
+            dataset="longmemeval",
+            spaces=spaces,
+            run_paths=paths,
+            config=later_config,
         )
         await score_run(
-            dataset="longmemeval", spaces=spaces, run_paths=paths, config=config
+            dataset="longmemeval",
+            spaces=spaces,
+            run_paths=paths,
+            config=later_config,
         )
 
     asyncio.run(scenario())
@@ -161,3 +174,119 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
     assert build_summary["build_llm_total_tokens"] > 0
     assert "write_llm_total_tokens" not in build_summary
     assert "write_llm_calls" not in build_summary
+    space_summary = build_summary["spaces"][spaces[0].source_id]
+    assert space_summary["active_subjects"] == 1
+    assert space_summary["episode_count"] == 3
+    assert space_summary["direct_links"] == 3
+    assert space_summary["contextual_links"] == 0
+    assert space_summary["max_links_per_memory"] == 1
+    assert space_summary["max_direct_links_per_memory"] == 1
+    assert space_summary["max_contextual_links_per_memory"] == 0
+    assert space_summary["max_memories_per_subject"] == 3
+    assert space_summary["max_provenance_per_memory"] == 1
+    assert space_summary["mean_links_per_memory"] == 1.0
+    assert space_summary["mean_memories_per_subject"] == 3.0
+    assert space_summary["retired_memories"] == 0
+    assert space_summary["retired_subjects"] == 0
+    assert space_summary["rewritten_memories"] == 0
+    assert space_summary["subjects"] == [
+        {
+            "contextual_links": 0,
+            "direct_links": 3,
+            "name": "Alice's hiking",
+        }
+    ]
+
+
+def test_answer_timeout_excludes_concurrency_queue(tmp_path, monkeypatch) -> None:
+    question_ids = ("q-1", "q-2", "q-3")
+    dataset_path = tmp_path / "longmemeval.json"
+    dataset_path.write_text(
+        json.dumps([_alice_record(question_id) for question_id in question_ids]),
+        encoding="utf-8",
+    )
+    spaces = load_longmemeval(dataset_path)
+    paths = RunPaths(tmp_path / "run")
+    config = _search_config().with_overrides(
+        benchmark_search_concurrency=1,
+        benchmark_search_sample_timeout_seconds=3,
+    )
+    generation = FakeGenerationProvider(
+        extraction_delay_seconds=0.01, answer_delay_seconds=1.2
+    )
+    _patch_providers(monkeypatch, generation)
+
+    async def scenario() -> None:
+        await build_run(
+            dataset="longmemeval",
+            spaces=spaces,
+            run_paths=paths,
+            data_paths=(str(dataset_path),),
+            mode="sample",
+            config=config,
+        )
+        await answer_run(
+            dataset="longmemeval",
+            spaces=spaces,
+            run_paths=paths,
+            config=config,
+        )
+
+    asyncio.run(scenario())
+    predictions = [
+        json.loads(line)
+        for line in paths.predictions.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert {item["question_id"] for item in predictions} == set(question_ids)
+
+
+def test_answer_run_skips_existing_predictions(tmp_path, monkeypatch) -> None:
+    dataset_path = tmp_path / "longmemeval.json"
+    dataset_path.write_text(
+        json.dumps([_alice_record("q-1"), _alice_record("q-2")]),
+        encoding="utf-8",
+    )
+    spaces = load_longmemeval(dataset_path)
+    paths = RunPaths(tmp_path / "run")
+    config = _search_config()
+    generation = FakeGenerationProvider(extraction_delay_seconds=0.01)
+    _patch_providers(monkeypatch, generation)
+
+    async def scenario() -> None:
+        await build_run(
+            dataset="longmemeval",
+            spaces=spaces,
+            run_paths=paths,
+            data_paths=(str(dataset_path),),
+            mode="sample",
+            config=config,
+        )
+        append_jsonl(
+            paths.predictions,
+            {"question_id": "q-1", "hypothesis": "kept existing answer"},
+        )
+        generation.requests.clear()
+        await answer_run(
+            dataset="longmemeval",
+            spaces=spaces,
+            run_paths=paths,
+            config=config,
+        )
+
+    asyncio.run(scenario())
+    predictions = [
+        json.loads(line)
+        for line in paths.predictions.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert predictions[0] == {
+        "hypothesis": "kept existing answer",
+        "question_id": "q-1",
+    }
+    assert {item["question_id"] for item in predictions} == {"q-1", "q-2"}
+    assert [
+        request.stage
+        for request in generation.requests
+        if request.stage == "benchmark_answer"
+    ] == ["benchmark_answer"]

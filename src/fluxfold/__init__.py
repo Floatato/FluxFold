@@ -27,6 +27,7 @@ from fluxfold.providers import (
     GenerationProvider,
     GenerationRequest,
     GenerationResponse,
+    LocalMiniLMEmbeddingProvider,
     OpenAICompatibleEmbeddingProvider,
     OpenAICompatibleGenerationProvider,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "GenerationProvider",
     "GenerationRequest",
     "GenerationResponse",
+    "LocalMiniLMEmbeddingProvider",
     "MemorySpace",
     "NormalizedEpisode",
     "NotFoundError",

@@ -10,10 +10,13 @@ requires-python = ">=3.12"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = [
+    "huggingface-hub>=0.34",
     "numpy>=2.0",
+    "onnxruntime>=1.22",
     "openai>=1.68",
     "pydantic>=2.10",
     "socksio>=1.0.0",
+    "tokenizers>=0.21",
 ]
 
 [build-system]

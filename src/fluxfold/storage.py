@@ -9,7 +9,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 import numpy as np
@@ -1897,10 +1897,14 @@ class Store:
             for space_key, subject_ids in subject_order.items()
         )
 
-    def space_statistics(self, memory_space_id: str) -> dict[str, int | float]:
+    def space_statistics(self, memory_space_id: str) -> dict[str, Any]:
         with self._connect() as connection:
             source_chars = connection.execute(
                 "SELECT coalesce(sum(source_chars), 0) FROM situational_episodes WHERE memory_space_id = ?",
+                (memory_space_id,),
+            ).fetchone()[0]
+            episode_count = connection.execute(
+                "SELECT count(*) FROM situational_episodes WHERE memory_space_id = ?",
                 (memory_space_id,),
             ).fetchone()[0]
             memory_content_chars = connection.execute(
@@ -1919,8 +1923,16 @@ class Store:
                 "SELECT count(*) FROM memory_units WHERE memory_space_id = ? AND lifecycle_status = 'active'",
                 (memory_space_id,),
             ).fetchone()[0]
+            retired_memories = connection.execute(
+                "SELECT count(*) FROM memory_units WHERE memory_space_id = ? AND lifecycle_status = 'retired'",
+                (memory_space_id,),
+            ).fetchone()[0]
             active_subjects = connection.execute(
                 "SELECT count(*) FROM subjects WHERE memory_space_id = ? AND lifecycle_status = 'active'",
+                (memory_space_id,),
+            ).fetchone()[0]
+            retired_subjects = connection.execute(
+                "SELECT count(*) FROM subjects WHERE memory_space_id = ? AND lifecycle_status = 'retired'",
                 (memory_space_id,),
             ).fetchone()[0]
             review_count = connection.execute(
@@ -1935,17 +1947,112 @@ class Store:
                 "SELECT count(*) FROM domain_operations WHERE memory_space_id = ? AND operation_type = 'refresh_subject_summary'",
                 (memory_space_id,),
             ).fetchone()[0]
+            rewritten_memories = connection.execute(
+                """
+                SELECT count(*) FROM memory_units u
+                JOIN memory_versions v ON v.memory_id = u.memory_id AND v.is_latest = 1
+                WHERE u.memory_space_id = ? AND u.lifecycle_status = 'active'
+                    AND v.version_no > 1
+                """,
+                (memory_space_id,),
+            ).fetchone()[0]
+            memory_link_rows = connection.execute(
+                """
+                SELECT
+                    coalesce(sum(l.link_basis = 'direct'), 0) AS direct_links,
+                    coalesce(sum(l.link_basis = 'contextual'), 0) AS contextual_links
+                FROM memory_units u
+                LEFT JOIN subject_memory_links l
+                    ON l.memory_id = u.memory_id AND l.unlinked_at IS NULL
+                LEFT JOIN subjects s
+                    ON s.subject_id = l.subject_id AND s.lifecycle_status = 'active'
+                WHERE u.memory_space_id = ? AND u.lifecycle_status = 'active'
+                GROUP BY u.memory_id
+                """,
+                (memory_space_id,),
+            ).fetchall()
+            max_provenance_per_memory = connection.execute(
+                """
+                SELECT coalesce(max(n), 0) FROM (
+                    SELECT count(p.episode_id) AS n
+                    FROM memory_units u
+                    JOIN memory_versions v
+                        ON v.memory_id = u.memory_id AND v.is_latest = 1
+                    LEFT JOIN memory_version_provenance p
+                        ON p.memory_version_id = v.memory_version_id
+                    WHERE u.memory_space_id = ? AND u.lifecycle_status = 'active'
+                    GROUP BY u.memory_id
+                )
+                """,
+                (memory_space_id,),
+            ).fetchone()[0]
+            subject_rows = connection.execute(
+                """
+                SELECT
+                    s.name AS name,
+                    coalesce(sum(l.link_basis = 'direct'), 0) AS direct_links,
+                    coalesce(sum(l.link_basis = 'contextual'), 0) AS contextual_links
+                FROM subjects s
+                LEFT JOIN subject_memory_links l
+                    ON l.subject_id = s.subject_id AND l.unlinked_at IS NULL
+                LEFT JOIN memory_units u
+                    ON u.memory_id = l.memory_id AND u.lifecycle_status = 'active'
+                WHERE s.memory_space_id = ? AND s.lifecycle_status = 'active'
+                GROUP BY s.subject_id, s.name
+                ORDER BY s.name, s.subject_id
+                """,
+                (memory_space_id,),
+            ).fetchall()
         memory_chars = memory_content_chars + summary_chars
         rate = 0.0 if source_chars == 0 else 1 - memory_chars / source_chars
+        link_counts = [
+            row["direct_links"] + row["contextual_links"] for row in memory_link_rows
+        ]
+        memories_per_subject = [
+            row["direct_links"] + row["contextual_links"] for row in subject_rows
+        ]
         return {
             "source_chars": source_chars,
             "memory_chars": memory_chars,
             "memory_compression_rate": rate,
             "active_memories": active_memories,
             "active_subjects": active_subjects,
+            "episode_count": episode_count,
+            "direct_links": sum(row["direct_links"] for row in memory_link_rows),
+            "contextual_links": sum(
+                row["contextual_links"] for row in memory_link_rows
+            ),
+            "max_links_per_memory": max(link_counts, default=0),
+            "max_direct_links_per_memory": max(
+                (row["direct_links"] for row in memory_link_rows), default=0
+            ),
+            "max_contextual_links_per_memory": max(
+                (row["contextual_links"] for row in memory_link_rows), default=0
+            ),
+            "mean_links_per_memory": (
+                0.0 if not link_counts else sum(link_counts) / len(link_counts)
+            ),
+            "max_memories_per_subject": max(memories_per_subject, default=0),
+            "mean_memories_per_subject": (
+                0.0
+                if not memories_per_subject
+                else sum(memories_per_subject) / len(memories_per_subject)
+            ),
+            "max_provenance_per_memory": max_provenance_per_memory,
+            "retired_memories": retired_memories,
+            "retired_subjects": retired_subjects,
+            "rewritten_memories": rewritten_memories,
             "subject_review_count": review_count,
             "subject_split_count": split_count,
             "subject_summary_refresh_count": refresh_count,
+            "subjects": [
+                {
+                    "name": row["name"],
+                    "direct_links": row["direct_links"],
+                    "contextual_links": row["contextual_links"],
+                }
+                for row in subject_rows
+            ],
         }
 
     def _load_search_subjects(

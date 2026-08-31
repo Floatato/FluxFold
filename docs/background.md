@@ -300,4 +300,4 @@ FluxFold 不维护常驻的用户画像。它对 §4.2 作用域问题的处理�
 - Graphiti 冲突消解 prompt：`graphiti/graphiti_core/prompts/dedupe_edges.py`
 - Mem0 记忆更新 prompt：`mem0/mem0/configs/prompts.py`
 - SYNAPSE 等预算 recall 消融：`synapse/RESULTS.md`、`synapse/results/recall_ablation.json`
-- FluxFold 设计：`FluxFold/design.md`、`FluxFold/design_detailed.md`
+- FluxFold 设计：`docs/design.md`、`docs/design_detailed.md`

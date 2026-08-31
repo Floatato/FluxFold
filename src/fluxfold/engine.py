@@ -69,6 +69,7 @@ from fluxfold.providers import (
     GenerationProvider,
     GenerationRequest,
     GenerationResponse,
+    LocalMiniLMEmbeddingProvider,
 )
 from fluxfold.storage import (
     ExistingSubjectTouch,
@@ -170,7 +171,7 @@ class FluxFold:
         *,
         db_path: str,
         generation_provider: GenerationProvider,
-        embedding_provider: EmbeddingProvider,
+        embedding_provider: EmbeddingProvider | None = None,
         config: FluxFoldConfig | None = None,
         event_sink: EventSink | None = None,
         benchmark_seed: int | None = None,
@@ -178,10 +179,11 @@ class FluxFold:
         """Open or initialize one SQLite-backed engine."""
 
         resolved = config or FluxFoldConfig()
+        resolved_embedding = embedding_provider or LocalMiniLMEmbeddingProvider()
         return cls(
             store=Store(db_path, resolved),
             generation_provider=generation_provider,
-            embedding_provider=embedding_provider,
+            embedding_provider=resolved_embedding,
             config=resolved,
             event_sink=event_sink,
             benchmark_seed=benchmark_seed,
@@ -542,7 +544,7 @@ class FluxFold:
             len(subject_sources),
         )
 
-    def space_statistics(self, memory_space_id: str) -> dict[str, int | float]:
+    def space_statistics(self, memory_space_id: str) -> dict[str, Any]:
         """Return the experiment metrics derived from final database state."""
 
         return self._store.space_statistics(memory_space_id)
@@ -1358,6 +1360,8 @@ class FluxFold:
                 raise ValidationError("a split subject contains duplicate memories")
             if len(ids) < self.config.subject_split_result_min_memories:
                 raise ValidationError("a split subject has too few memories")
+            if len(ids) > self.config.subject_split_result_target_memory_max:
+                raise ValidationError("a split subject has too many memories")
             if not set(ids) <= input_ids:
                 raise ValidationError(
                     "split references a memory outside the input subject"

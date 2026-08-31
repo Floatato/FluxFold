@@ -159,7 +159,7 @@ FluxFold 采用 Python 3.12 及以上版本、`uv`、单 package 和 `src` layou
 - `uv.lock` 应提交到版本控制，以复现本地开发和 CI 环境。
 - FluxFold 作为单个 Python distribution 开发；现阶段不拆分 core、CLI 或其他子 package，也不建立 workspace。
 - 可导入 package 使用 `src/fluxfold/` 目录，公共 import 名称为 `fluxfold`。
-- 实验版运行时依赖包括 NumPy，用于 SQLite 之上的精确向量扫描；以及 `socksio`，供 OpenAI 兼容 HTTP 客户端在 SOCKS 代理下工作。不暴露 CLI entry point，也不加入 Typer 或 Textual。
+- 实验版运行时依赖包括 NumPy，用于 SQLite 之上的精确向量扫描；Hugging Face Hub、Tokenizers 和 ONNX Runtime，用于下载、缓存并运行默认的本地 embedding；以及 `socksio`，供 OpenAI 兼容 HTTP 客户端在 SOCKS 代理下工作。不暴露 CLI entry point，也不加入 Typer 或 Textual。
 - 第一版正式版仍使用同一个 distribution：通过 `pyproject.toml` 的 `[project.scripts]` 暴露 `fluxfold` 命令，并加入 Typer 与 Textual。
 - 首次建立本地开发环境时运行 `scripts/setup-dev.sh`：安装 `.python-version` 指定的 Python、按 `uv.lock` 同步环境、将 `LoCoMo_refined` 与 `LongMemEval` clone 到 `data/` 并下载 LongMemEval-S，然后执行与日常开发相同的质量检查和 `uv build`。该脚本只负责一次性 bootstrap，不是任务运行器；日常开发仍直接使用 `uv run`。
 
@@ -204,15 +204,6 @@ FluxFold 采用 Python 3.12 及以上版本、`uv`、单 package 和 `src` layou
 - 选择 Apache-2.0 是因为它是宽松开源许可，同时包含明确的 copyright 和 patent license 条款，适合作为可嵌入其他 Agent 的基础 library。
 - 初期没有额外 attribution 时不创建空的 `NOTICE`；如果未来引入要求保留 attribution 的内容，则随 distribution 维护准确的 `NOTICE`。
 - license 选择会影响所有贡献和发布，不将换 license 视为常规工程升级；接受外部贡献前应再次确认版权主体和贡献政策。该决定不替代法律意见。
-
-
-
-### README 当前定位
-
-- repository 根目录使用英文 `README.md` 作为面对使用者和新贡献者的项目入口；架构讨论和决策细节继续以本文件为准。
-- README 包含：项目定位、setup、library 最小用法、benchmark 数据集 clone 与运行命令，以及设计文档入口。不写脚本内部步骤、质量检查清单或 provider 字段说明。
-- 不宣称尚未通过 benchmark 验证的性能、准确率或兼容能力。
-- 当 README 因 API reference、connector 指南、配置说明或运维内容变得难以浏览时，将细节迁移到 `docs/`，README 只保留入口和最短路径。
 
 
 

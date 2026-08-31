@@ -23,21 +23,26 @@ class FakeGenerationProvider:
         benchmark_answer: str = "Alice likes hiking.",
         split_result: str | None = None,
         split_missing_direct_first: bool = False,
+        split_oversized_first: bool = False,
         association_search_once: bool = False,
         review_mode: str = "keep",
         extraction_delay_seconds: float = 0.0,
+        answer_delay_seconds: float = 0.0,
         always_new_subject: bool = False,
     ) -> None:
         self.benchmark_answer = benchmark_answer
         self.split_result = split_result
         self.split_missing_direct_first = split_missing_direct_first
+        self.split_oversized_first = split_oversized_first
         self.association_search_once = association_search_once
         self.review_mode = review_mode
         self.extraction_delay_seconds = extraction_delay_seconds
+        self.answer_delay_seconds = answer_delay_seconds
         self.always_new_subject = always_new_subject
         self.requests: list[GenerationRequest] = []
         self._association_requested = False
         self._illegal_split_emitted = False
+        self._oversized_split_emitted = False
         self.active_extractions = 0
         self.max_active_extractions = 0
 
@@ -184,10 +189,16 @@ class FakeGenerationProvider:
             if (
                 self.split_missing_direct_first
                 and not self._illegal_split_emitted
-                and len(memory_ids) >= 2
+                and len(memory_ids) >= 3
             ):
                 self._illegal_split_emitted = True
-                first, second = memory_ids[0], memory_ids[1]
+                links = [
+                    {
+                        "memory_id": memory_id,
+                        "basis": "direct" if index == 0 else "contextual",
+                    }
+                    for index, memory_id in enumerate(memory_ids)
+                ]
                 text = json.dumps(
                     {
                         "result": "full_split",
@@ -195,23 +206,18 @@ class FakeGenerationProvider:
                             {
                                 "subject_ref": "trails",
                                 "name": "Alice's hiking trails",
-                                "links": [
-                                    {"memory_id": first, "basis": "direct"},
-                                    {"memory_id": second, "basis": "contextual"},
-                                ],
+                                "links": links,
                             },
                             {
                                 "subject_ref": "equipment",
                                 "name": "Alice's hiking equipment",
-                                "links": [
-                                    {"memory_id": first, "basis": "direct"},
-                                    {"memory_id": second, "basis": "contextual"},
-                                ],
+                                "links": links,
                             },
                         ],
                     }
                 )
-            elif self.split_result == "full_split":
+            elif self.split_oversized_first and not self._oversized_split_emitted:
+                self._oversized_split_emitted = True
                 links = [
                     {"memory_id": memory_id, "basis": "direct"}
                     for memory_id in memory_ids
@@ -233,6 +239,32 @@ class FakeGenerationProvider:
                         ],
                     }
                 )
+            elif self.split_result == "full_split":
+                first_ids = memory_ids if len(memory_ids) == 3 else memory_ids[:3]
+                second_ids = memory_ids if len(memory_ids) == 3 else memory_ids[-3:]
+                text = json.dumps(
+                    {
+                        "result": "full_split",
+                        "subjects": [
+                            {
+                                "subject_ref": "trails",
+                                "name": "Alice's hiking trails",
+                                "links": [
+                                    {"memory_id": memory_id, "basis": "direct"}
+                                    for memory_id in first_ids
+                                ],
+                            },
+                            {
+                                "subject_ref": "equipment",
+                                "name": "Alice's hiking equipment",
+                                "links": [
+                                    {"memory_id": memory_id, "basis": "direct"}
+                                    for memory_id in second_ids
+                                ],
+                            },
+                        ],
+                    }
+                )
             elif self.split_result == "partial_split":
                 text = json.dumps(
                     {
@@ -243,7 +275,7 @@ class FakeGenerationProvider:
                                 "name": "Alice's hiking equipment",
                                 "links": [
                                     {"memory_id": memory_id, "basis": "direct"}
-                                    for memory_id in memory_ids[:2]
+                                    for memory_id in memory_ids[:3]
                                 ],
                             }
                         ],
@@ -257,6 +289,7 @@ class FakeGenerationProvider:
                     }
                 )
         elif request.stage == "benchmark_answer":
+            await asyncio.sleep(self.answer_delay_seconds)
             text = self.benchmark_answer
         elif request.stage == "benchmark_judge":
             text = '{"label": "CORRECT"}' if '"label"' in request.user_prompt else "yes"

@@ -145,12 +145,12 @@ def test_split_is_sampled_twice(tmp_path) -> None:
             name="split",
             generation=generation,
             events=events,
-            subject_split_memory_count_threshold=2,
+            subject_split_memory_count_threshold=3,
             subject_review_new_memory_threshold=10,
         )
         for space_name in ("one", "two"):
             space = await engine.create_or_open_space(f"test:split-{space_name}")
-            for index in range(2):
+            for index in range(3):
                 await engine.add_episode(
                     space.memory_space_id,
                     _episode(
@@ -247,11 +247,11 @@ def test_repaired_success_is_not_sampled(tmp_path) -> None:
             name="repair",
             generation=generation,
             events=events,
-            subject_split_memory_count_threshold=2,
+            subject_split_memory_count_threshold=3,
             subject_review_new_memory_threshold=10,
         )
         space = await engine.create_or_open_space("test:repair")
-        for index in range(2):
+        for index in range(3):
             await engine.add_episode(
                 space.memory_space_id,
                 _episode(str(index), f"Alice hiking fact {index}.", index),
@@ -317,6 +317,38 @@ def test_artifact_writer_renders_readable_samples_and_enforces_quota(tmp_path) -
     resumed.event(extract)
     resumed_text = resumed.paths.llm_io_samples.read_text(encoding="utf-8")
     assert resumed_text.count("## extract · sample") == 2
+
+
+def test_artifact_writer_renders_multi_round_association_search(tmp_path) -> None:
+    writer = ArtifactWriter(RunPaths(tmp_path / "run"))
+    outputs = (
+        '{"result":"association_search","query":"q1"}',
+        '{"result":"association_search","query":"q2"}',
+        '{"result":"links","new_subjects":[],"links":[]}',
+    )
+    writer.event(
+        {
+            "event_type": "llm_io_sample",
+            "kind": "link_association_search",
+            "timestamp_ms": 1,
+            "rounds": [
+                {
+                    "stage": "subject_linking",
+                    "request_id": f"req-{index}",
+                    "system_prompt": "Link memories.",
+                    "user_prompt": "{}",
+                    "output": output,
+                }
+                for index, output in enumerate(outputs, start=1)
+            ],
+        }
+    )
+    text = writer.paths.llm_io_samples.read_text(encoding="utf-8")
+    assert "### Round 1 — association_search request" in text
+    assert "### Round 2 — association_search request" in text
+    assert "### Round 3 — final linking decision" in text
+    assert '"query": "q1"' in text
+    assert '"query": "q2"' in text
 
 
 def test_artifact_writer_overwrites_memory_bank_snapshot(tmp_path) -> None:

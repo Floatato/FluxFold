@@ -18,19 +18,13 @@ _LLM_IO_SAMPLE_HEADER = """# LLM I/O samples
 
 Sampled first-attempt structured-output successes: the complete system prompt, user prompt, and model output.
 
-Quotas: extract, link (no `association_search`), review (no `provenance_viewed`), split, and summary ×2. Two-round `association_search` and `provenance_viewed` paths are sampled once each if they occur.
+Quotas: extract, link (no `association_search`), review (no `provenance_viewed`), split, and summary ×2. A complete `association_search` agent loop (2–6 rounds) and a two-round `provenance_viewed` path are sampled once each if they occur.
 
 """
-_TWO_ROUND_TITLES = {
-    "link_association_search": (
-        "Round 1 — association_search request",
-        "Round 2 — final linking decision",
-    ),
-    "review_provenance": (
-        "Round 1 — provenance request",
-        "Round 2 — final review decision",
-    ),
-}
+_REVIEW_PROVENANCE_TITLES = (
+    "Round 1 — provenance request",
+    "Round 2 — final review decision",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,11 +350,12 @@ def _render_llm_io_sample(
         lines.append(f"- run_id: `{run_id}`")
     if timestamp_ms is not None:
         lines.append(f"- timestamp_ms: `{timestamp_ms}`")
-    titles = _TWO_ROUND_TITLES.get(kind)
+    round_count = len(rounds)
     for position, round_payload in enumerate(rounds):
         assert isinstance(round_payload, dict)
-        if titles is not None:
-            lines.extend(["", f"### {titles[position]}", ""])
+        heading = _round_heading(kind, position, round_count)
+        if heading is not None:
+            lines.extend(["", f"### {heading}", ""])
         request_id = round_payload.get("request_id")
         stage = round_payload.get("stage")
         meta: list[str] = []
@@ -370,7 +365,7 @@ def _render_llm_io_sample(
             meta.append(f"- request_id: `{request_id}`")
         if meta:
             lines.extend([*meta, ""])
-        heading_prefix = "#### " if titles is not None else "### "
+        heading_prefix = "#### " if heading is not None else "### "
         lines.extend(
             _prompt_section(
                 f"{heading_prefix}System prompt",
@@ -391,6 +386,17 @@ def _render_llm_io_sample(
         )
     lines.extend(["---", "", ""])
     return "\n".join(lines)
+
+
+def _round_heading(kind: str, position: int, round_count: int) -> str | None:
+    if kind == "review_provenance":
+        return _REVIEW_PROVENANCE_TITLES[position]
+    if kind == "link_association_search":
+        number = position + 1
+        if position == round_count - 1:
+            return f"Round {number} — final linking decision"
+        return f"Round {number} — association_search request"
+    return None
 
 
 def _prompt_section(heading: str, text: str) -> list[str]:

@@ -1,14 +1,16 @@
-"""Model-provider protocols and an OpenAI-compatible implementation."""
+"""Model-provider protocols and bundled provider implementations."""
 
 from __future__ import annotations
 
 import asyncio
+import os
 import random
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 
 import numpy as np
 from openai import (
@@ -90,6 +92,170 @@ class EmbeddingProvider(Protocol):
     ) -> EmbeddingResponse: ...
 
     async def close(self) -> None: ...
+
+
+DEFAULT_LOCAL_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_LOCAL_EMBEDDING_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+
+
+class _LocalEmbeddingModel(Protocol):
+    def encode(
+        self,
+        sentences: list[str],
+        *,
+        convert_to_numpy: bool,
+        normalize_embeddings: bool,
+        show_progress_bar: bool,
+    ) -> np.ndarray: ...
+
+
+class _TokenizerEncoding(Protocol):
+    @property
+    def ids(self) -> list[int]: ...
+
+    @property
+    def attention_mask(self) -> list[int]: ...
+
+    @property
+    def type_ids(self) -> list[int]: ...
+
+
+class _Tokenizer(Protocol):
+    def enable_truncation(self, max_length: int) -> None: ...
+
+    def enable_padding(self, *, pad_id: int, pad_token: str) -> None: ...
+
+    def encode_batch(self, input: list[str]) -> list[_TokenizerEncoding]: ...
+
+
+class _InferenceSession(Protocol):
+    def run(
+        self, output_names: None, input_feed: dict[str, np.ndarray]
+    ) -> list[np.ndarray]: ...
+
+
+class _OnnxMiniLMModel:
+    def __init__(self) -> None:
+        os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")
+        from huggingface_hub import hf_hub_download
+        from onnxruntime import InferenceSession  # type: ignore[import-untyped]
+        from tokenizers import Tokenizer
+
+        tokenizer_path = hf_hub_download(
+            repo_id=DEFAULT_LOCAL_EMBEDDING_MODEL,
+            filename="tokenizer.json",
+            revision=DEFAULT_LOCAL_EMBEDDING_REVISION,
+        )
+        model_path = hf_hub_download(
+            repo_id=DEFAULT_LOCAL_EMBEDDING_MODEL,
+            filename="onnx/model.onnx",
+            revision=DEFAULT_LOCAL_EMBEDDING_REVISION,
+        )
+        self._tokenizer = cast(_Tokenizer, Tokenizer.from_file(tokenizer_path))
+        self._tokenizer.enable_truncation(max_length=256)
+        self._tokenizer.enable_padding(pad_id=0, pad_token="[PAD]")
+        self._session = cast(
+            _InferenceSession,
+            InferenceSession(model_path, providers=["CPUExecutionProvider"]),
+        )
+
+    def encode(
+        self,
+        sentences: list[str],
+        *,
+        convert_to_numpy: bool,
+        normalize_embeddings: bool,
+        show_progress_bar: bool,
+    ) -> np.ndarray:
+        if not convert_to_numpy or not normalize_embeddings or show_progress_bar:
+            raise ValueError("unsupported local embedding encode options")
+        encoded = self._tokenizer.encode_batch(sentences)
+        attention_mask = np.asarray(
+            [item.attention_mask for item in encoded], dtype=np.int64
+        )
+        outputs = self._session.run(
+            None,
+            {
+                "input_ids": np.asarray([item.ids for item in encoded], dtype=np.int64),
+                "attention_mask": attention_mask,
+                "token_type_ids": np.asarray(
+                    [item.type_ids for item in encoded], dtype=np.int64
+                ),
+            },
+        )
+        token_embeddings = np.asarray(outputs[0], dtype=np.float32)
+        mask = attention_mask[..., np.newaxis]
+        pooled = np.sum(token_embeddings * mask, axis=1) / np.clip(
+            np.sum(mask, axis=1), 1, None
+        )
+        norms = np.linalg.norm(pooled, axis=1, keepdims=True)
+        return np.asarray(pooled / norms, dtype=np.float32)
+
+
+class LocalMiniLMEmbeddingProvider:
+    """In-process all-MiniLM-L6-v2 embeddings using ONNX Runtime."""
+
+    def __init__(self) -> None:
+        self._model_info = EmbeddingModelInfo(
+            provider="sentence-transformers",
+            model=DEFAULT_LOCAL_EMBEDDING_MODEL,
+            revision=DEFAULT_LOCAL_EMBEDDING_REVISION,
+            dimension=384,
+        )
+        self._model: _LocalEmbeddingModel | None = None
+        self._load_lock = asyncio.Lock()
+        self._encode_lock = threading.Lock()
+
+    @property
+    def model_info(self) -> EmbeddingModelInfo:
+        return self._model_info
+
+    async def embed(
+        self,
+        texts: Sequence[str],
+        *,
+        input_type: str,
+        timeout_seconds: float,
+    ) -> EmbeddingResponse:
+        if input_type not in {"query", "document"}:
+            raise ValueError(f"unknown embedding input_type: {input_type}")
+        if not texts:
+            return EmbeddingResponse(vectors=())
+        del timeout_seconds
+        model = await self._get_model()
+        raw_vectors = await asyncio.to_thread(self._encode, model, tuple(texts))
+        vectors = tuple(
+            _normalize_vector(raw, self._model_info.dimension) for raw in raw_vectors
+        )
+        if len(vectors) != len(texts):
+            raise ProviderError(
+                ErrorClass.INCOMPLETE_OUTPUT,
+                "embedding response count does not match request count",
+            )
+        return EmbeddingResponse(vectors=vectors)
+
+    async def close(self) -> None:
+        return None
+
+    async def _get_model(self) -> _LocalEmbeddingModel:
+        if self._model is not None:
+            return self._model
+        async with self._load_lock:
+            if self._model is None:
+                self._model = await asyncio.to_thread(_load_local_minilm_model)
+            return self._model
+
+    def _encode(
+        self, model: _LocalEmbeddingModel, texts: tuple[str, ...]
+    ) -> np.ndarray:
+        with self._encode_lock:
+            vectors = model.encode(
+                list(texts),
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+        return np.asarray(vectors)
 
 
 class OpenAICompatibleGenerationProvider:
@@ -272,6 +438,10 @@ class OpenAICompatibleEmbeddingProvider:
 
     async def close(self) -> None:
         await self._client.close()
+
+
+def _load_local_minilm_model() -> _LocalEmbeddingModel:
+    return _OnnxMiniLMModel()
 
 
 _TRANSIENT_ERRORS = {

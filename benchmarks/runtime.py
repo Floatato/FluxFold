@@ -10,6 +10,8 @@ from fluxfold.config import FluxFoldConfig
 from fluxfold.errors import ValidationError
 from fluxfold.providers import (
     EmbeddingModelInfo,
+    EmbeddingProvider,
+    LocalMiniLMEmbeddingProvider,
     OpenAICompatibleEmbeddingProvider,
     OpenAICompatibleGenerationProvider,
 )
@@ -68,7 +70,14 @@ def generation_provider(
     )
 
 
-def embedding_provider(config: FluxFoldConfig) -> OpenAICompatibleEmbeddingProvider:
+def embedding_provider(config: FluxFoldConfig) -> EmbeddingProvider:
+    provider = os.environ.get("FLUXFOLD_EMBEDDING_PROVIDER", "local")
+    if provider == "local":
+        return LocalMiniLMEmbeddingProvider()
+    if provider != "openai-compatible":
+        raise ValidationError(
+            "FLUXFOLD_EMBEDDING_PROVIDER must be 'local' or 'openai-compatible'"
+        )
     dimension_value = _required_env("FLUXFOLD_EMBEDDING_DIMENSION")
     try:
         dimension = int(dimension_value)
