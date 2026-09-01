@@ -89,8 +89,10 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
     config = _search_config()
     generation = FakeGenerationProvider(extraction_delay_seconds=0.01)
     _patch_providers(monkeypatch, generation)
+    first_elapsed = 0.0
 
     async def scenario() -> None:
+        nonlocal first_elapsed
         await build_run(
             dataset="longmemeval",
             spaces=spaces,
@@ -100,11 +102,16 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
             config=config,
         )
         event_count = len(paths.events.read_text(encoding="utf-8").splitlines())
+        first_summary = json.loads(paths.build_summary.read_text(encoding="utf-8"))
+        first_elapsed = float(first_summary["elapsed_seconds"])
+        assert first_elapsed > 0
+        previous_checkpoint = json.loads(paths.checkpoint.read_text(encoding="utf-8"))
         paths.checkpoint.write_text(
             json.dumps(
                 {
                     "completed_space_ids": [],
                     "last_episode_by_space": {spaces[0].source_id: 1},
+                    "elapsed_seconds": previous_checkpoint["elapsed_seconds"],
                 }
             ),
             encoding="utf-8",
@@ -172,6 +179,7 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
     assert build_summary["build_llm_input_tokens"] > 0
     assert build_summary["build_llm_output_tokens"] > 0
     assert build_summary["build_llm_total_tokens"] > 0
+    assert build_summary["elapsed_seconds"] >= first_elapsed
     assert "write_llm_total_tokens" not in build_summary
     assert "write_llm_calls" not in build_summary
     space_summary = build_summary["spaces"][spaces[0].source_id]

@@ -71,6 +71,8 @@ async def build_run(
     checkpoint = _load_checkpoint(run_paths.checkpoint)
     completed = set(checkpoint["completed_space_ids"])
     last_episode_by_space = dict(checkpoint["last_episode_by_space"])
+    prior_elapsed = float(checkpoint["elapsed_seconds"])
+    started = time.monotonic()
     engine = await FluxFold.open(
         db_path=str(run_paths.database),
         generation_provider=generation,
@@ -82,6 +84,27 @@ async def build_run(
     semaphore = asyncio.Semaphore(config.benchmark_memory_space_build_concurrency)
     summary: dict[str, dict[str, int | float]] = {}
     completed_lock = asyncio.Lock()
+
+    def elapsed_seconds() -> float:
+        return round(prior_elapsed + (time.monotonic() - started), 3)
+
+    def persist_progress() -> None:
+        _write_build_checkpoint(
+            writer,
+            run_paths,
+            completed,
+            last_episode_by_space,
+            elapsed_seconds=elapsed_seconds(),
+        )
+        writer.write_json(
+            run_paths.build_summary,
+            {
+                "dataset": dataset,
+                "spaces": {key: value for key, value in sorted(summary.items())},
+                **writer.build_metrics(),
+                "elapsed_seconds": elapsed_seconds(),
+            },
+        )
 
     async def build_space(space: BenchmarkSpace) -> None:
         if space.source_id in completed:
@@ -173,12 +196,7 @@ async def build_run(
                                         f"{episode.source_sequence})"
                                     ),
                                 )
-                            _write_build_checkpoint(
-                                writer,
-                                run_paths,
-                                completed,
-                                last_episode_by_space,
-                            )
+                            persist_progress()
                 finally:
                     for add_task in add_tasks:
                         if not add_task.done():
@@ -189,12 +207,7 @@ async def build_run(
                 )
                 async with completed_lock:
                     completed.add(space.source_id)
-                    _write_build_checkpoint(
-                        writer,
-                        run_paths,
-                        completed,
-                        last_episode_by_space,
-                    )
+                    persist_progress()
                 writer.event(
                     {
                         "event_type": "memory_space_build_completed",
@@ -212,15 +225,8 @@ async def build_run(
     try:
         await asyncio.gather(*(build_space(space) for space in spaces))
         _write_memory_bank(writer, engine, updated_after="build completed")
-        writer.write_json(
-            run_paths.build_summary,
-            {
-                "dataset": dataset,
-                "spaces": {key: value for key, value in sorted(summary.items())},
-                **writer.build_metrics(),
-            },
-        )
     finally:
+        persist_progress()
         await engine.close()
 
 
@@ -452,7 +458,11 @@ async def _finish_add_item(
 
 def _load_checkpoint(path: Path) -> dict[str, object]:
     if not path.exists():
-        return {"completed_space_ids": [], "last_episode_by_space": {}}
+        return {
+            "completed_space_ids": [],
+            "last_episode_by_space": {},
+            "elapsed_seconds": 0.0,
+        }
     value = json.loads(path.read_text(encoding="utf-8"))
     return {
         "completed_space_ids": [
@@ -462,6 +472,7 @@ def _load_checkpoint(path: Path) -> dict[str, object]:
             str(key): int(sequence)
             for key, sequence in value.get("last_episode_by_space", {}).items()
         },
+        "elapsed_seconds": float(value.get("elapsed_seconds") or 0.0),
     }
 
 
@@ -476,6 +487,8 @@ def _write_build_checkpoint(
     run_paths: RunPaths,
     completed: set[str],
     last_episode_by_space: dict[str, int],
+    *,
+    elapsed_seconds: float,
 ) -> None:
     writer.write_json(
         run_paths.checkpoint,
@@ -484,6 +497,7 @@ def _write_build_checkpoint(
             "last_episode_by_space": {
                 key: value for key, value in sorted(last_episode_by_space.items())
             },
+            "elapsed_seconds": elapsed_seconds,
         },
     )
 
