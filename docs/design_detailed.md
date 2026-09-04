@@ -589,12 +589,13 @@ provider 只有归一化为 `transient_transport`、`rate_limited` 或 `service_
 串行调用底层模型编码。它没有网络 request，因此不应用 request timeout 或 transport retry。
 
 SQLite 固定使用 WAL、`synchronous=NORMAL`。事务冲突最多额外重试 5 次，使用 full
-jitter，不设置退避最大时间。同一 memory space 的 extraction lane 和 stateful lane 各为
-单并发；stateful lane 包含候选召回、linking、正式写入以及本 episode 的全部
-review/split/summary refresh。link、review 和 split 按确定性顺序串行；最终不同 subjects 的
+jitter，不设置退避最大时间。同一 memory space 的 `add_episode` 整段串行：extraction、
+候选召回、linking、正式写入以及本 episode 的全部 review/split/summary refresh 完成后，才
+开始后序 episode。link、review 和 split 按确定性顺序串行；最终不同 subjects 的
 summary refresh 可同时执行，单个 episode 上限为 5，每个成功结果仍使用独立事务提交。
-本 episode 的 pending targets 未全部完成前，不释放 stateful lane。不设置跨 space 的全局
-维护并发、provider 并发限制或单次 `add_episode` 的维护操作数量上限。
+本 episode 的 pending targets 未全部完成前，不开始后序 episode。不设置跨 space 的全局
+维护并发、provider 并发限制或单次 `add_episode` 的维护操作数量上限。不同 memory space
+可以并行。
 
 #### 1.1.13 Public library 与 memory-space 管理边界
 
@@ -643,13 +644,15 @@ source key、UUID 或数据库提交顺序推断。Dataset question、answer、e
 - 每个 evaluation instance 建立独立 memory space。按相同数组位置组合
 `haystack_session_ids`、`haystack_dates` 和 `haystack_sessions`，数组位置形成
 `source_sequence`。
-- Turn 的 `role` 和 `content` 直接映射为 block role 和正文；speaker 信息为空，session
-date 映射为 episode `source_started_at`，逐消息时间为空。
+- Turn 的 `role` 和 `content` 直接映射为 block role 和正文，空字符串 content 原样保留；
+speaker 信息为空，session date 映射为 episode `source_started_at`，逐消息时间为空。
 - 不要求 session 从 user 开始、以 assistant 结束或严格交替，始终保留原数组顺序。
 - `source_key` 由来源位置和 raw `haystack_session_id` 共同确定。相同 raw session ID 在同一
 instance 的不同位置出现时仍是不同 episode；正文相同但时间不同的重复出现也分别保留。
 - `has_answer`、`answer_session_ids`、`question`、`answer`、`question_type` 及其他评测字段
 完全排除，其中 `has_answer` 不得以任何形式泄漏给 Memory Engine。
+- Benchmark gold `answer` 是字符串或 JSON 整数；整数规范为十进制字符串后再用于评分
+（例如 `3` 存为 `"3"`）。
 
 
 
@@ -672,8 +675,8 @@ conversation-history 文本；每个 conversation 建立独立 memory space。
 
 实验版 dataset episode 只接受 `user` 和 `assistant` 协议角色；未知角色不能被丢弃或改写成
 user。多人数据同时保留协议角色与现实 speaker 身份，不能仅根据姓名或位置猜测。空白
-message 不静默跳过，缺失逐消息时间和 session 时间均保持空；存在但无法解释的时间值是
-无效输入，不能当作未知时间。
+message 不静默跳过，空字符串 content 作为正文原样保留。缺失逐消息时间和 session 时间均
+保持空；存在但无法解释的时间值是无效输入，不能当作未知时间。
 
 两套 benchmark 的非空时间均没有来源时区。实验版 profile 固定按 UTC 解释，并把该约定
 写入 benchmark run manifest；这只是可复现编码约定，不声称真实对话发生在 UTC，也不使用
@@ -707,19 +710,16 @@ LLM 与 embedding 在事务外运行。`episode_extractions` 以 episode input h
 配置签名保证一次逻辑完成只提交一次。Extraction 明确返回“没有有价值的 memory”时也必须
 写入 completed 状态；缺失、畸形或校验失败的输出不能产生该状态。
 
-同一 memory space 内的调用必须按 `source_sequence` 顺序提交。公共入口使用两个单并发
-lane：Stage A 校验并持久化 episode、执行 memory extraction 并生成新 memory embedding；
-Stage B 执行批次候选召回与 linking、原子提交和全部后续 maintenance。Stage A 完成
-episode N 后立即释放 extraction lane，因此 N 在 Stage B 运行时，N+1 可以开始 Stage A；
-Stage B 仍按 Stage A 的完成队列顺序进入，后序 episode 不能越过前序 episode。runner 可以
-提交同一 space 的全部待处理 `add_episode`，已完成 extraction、等待 Stage B 的 prepared
-results 不设容量上限。
+同一 memory space 内的调用必须按 `source_sequence` 顺序提交。公共入口对同一 space 串行
+执行整段 `add_episode`：extraction、候选召回、linking、原子提交和全部后续 maintenance
+完成或进入终态后，才开始后序 episode。单个 episode 的 summary targets 可以按上限 5 并发。
+runner 按来源顺序逐个调用 `add_episode`，不预启动后序 episode。
 
-Prepared extraction result 只存在于当前进程内存，不持久化；进程退出后根据 immutable
-episode 和未完成的 `episode_extractions` 重新 extraction。Stage B 在 add transaction 前因
+Prepared extraction result 只存在于当前 `add_episode` 调用的进程内存，不持久化；进程退出后根据 immutable
+episode 和未完成的 `episode_extractions` 重新 extraction。add transaction 前因
 临时依赖或配置错误暂停时重新执行尚未提交的阶段；add 已提交后的 summary maintenance
 failure 不回滚正式状态，恢复时从持久化 refresh targets 重试未完成项。暂停后该 space 不再
-开始新的 extraction，其他 spaces 不受影响。
+开始新的 `add_episode`，其他 spaces 不受影响。
 `context_overflow`、`policy_rejected`、修复耗尽的 `invalid_structured_output` 和
 `incomplete_output` 由 `add_episode` 核心写入 `terminal_failure` 后仍抛出 `StageFailure`；
 相同 episode 重放直接抛出同一失败而不再调用 provider，后序 episode 可以继续。
@@ -1099,16 +1099,13 @@ LoCoMo 的 10 个 conversations 分别建立 10 个 memory spaces，可同时构
 500 个 evaluation instances 分别建立独立 memory space；不同 instance 的 haystack 不能
 合入同一 space。
 
-Benchmark runner 按 session `source_sequence` 创建公共 `add_episode` 调用，不调用
-`_prepare_add`、`_commit_prepared_add` 或其他私有阶段 API。同一 space 的 extraction 单并发；
-前序 session 完成 extraction 并进入 stateful lane 后，后序 session 可以开始 extraction。
-候选召回、linking、正式写入、review、split 和 summary refresh 在同一 stateful lane 中按
-来源顺序完成；单个 episode 的 summary targets 可以按上限 5 并发，后序结果不能越过仍在处理的前序 session。prepared results、等待调用和已
-完成但待 stateful 处理的数量不设上限。前序 session 成为终态单项失败后，由共享
-`add_episode` 核心记录失败并继续推进来源顺序。不同 spaces 的两条 lane 可以并行。
+Benchmark runner 按 session `source_sequence` 逐个创建公共 `add_episode` 调用，不调用
+`_prepare_add`、`_commit_prepared_add` 或其他私有阶段 API。同一 space 的 episode 整段串行；
+单个 episode 的 summary targets 可以按上限 5 并发。前序 session 成为终态单项失败后，由共享
+`add_episode` 核心记录失败并继续推进来源顺序。不同 spaces 可以并行。
 
 不设置整次 benchmark 总 timeout。每完成一个 episode ingestion、space ingestion 或一条
-QA 都原子保存 checkpoint；prepared extraction 不写 checkpoint，崩溃恢复后重新 extraction。
+QA 都原子保存 checkpoint；尚未完成 extraction 的 episode 在崩溃恢复后重新 extraction。
 answer 以 `predictions.jsonl` 中已写入的 question ID 为 checkpoint：每完成一题立即追加
 prediction 与对应 `search_results.jsonl` 记录；再次运行同一 run 的 answer 时跳过这些 ID，
 不删除已有预测。`benchmark_search_sample_timeout_seconds` 从该题拿到
@@ -1230,7 +1227,7 @@ benchmark 对话以及完整 LLM prompt 与输出，必须按包含原始对话�
 关联 IDs、状态或结果，以及适用的对象数量、耗时和简短原因。覆盖范围至少包括：
 
 - memory-space build 的开始、完成、暂停、恢复和失败；
-- episode 开始处理、extraction 完成、Subject linking 完成和原子提交；
+- episode 的 extraction 完成、Subject linking 完成和原子提交；
 - 一次 episode 提取、创建和写入的 memory 数，新建 subject 数及新建 link 数；
 - 本 episode 的 association search 详细结果合计涉及的唯一 candidate memory 数；初始
 name-only candidates 不包含 memory，因此未调用主动检索时该值为 0。若至少一次调用

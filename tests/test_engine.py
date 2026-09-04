@@ -135,30 +135,23 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
     asyncio.run(scenario())
 
 
-def test_add_episode_pipelines_extraction_ahead_of_ordered_linking(tmp_path) -> None:
+def test_add_episode_serializes_episodes_within_a_space(tmp_path) -> None:
     class ObservedPipelineProvider(FakeGenerationProvider):
         def __init__(self) -> None:
             super().__init__(extraction_delay_seconds=0.01)
             self.events: list[tuple[str, str]] = []
-            self.second_extraction_started = asyncio.Event()
 
         async def generate(self, request: GenerationRequest):
             payload = json.loads(request.user_prompt)
             if request.stage == "memory_extraction":
                 content = str(payload["episode"]["messages"][-1]["content"])
                 self.events.append(("extract_started", content))
-                if content == "Alice bought boots.":
-                    self.second_extraction_started.set()
                 response = await super().generate(request)
                 self.events.append(("extract_completed", content))
                 return response
             if request.stage == "subject_linking":
                 content = str(payload["new_memories"][0]["content"])
                 self.events.append(("link_started", content))
-                if content == "Alice likes hiking.":
-                    await asyncio.wait_for(
-                        self.second_extraction_started.wait(), timeout=1
-                    )
                 response = await super().generate(request)
                 self.events.append(("link_completed", content))
                 return response
@@ -189,21 +182,23 @@ def test_add_episode_pipelines_extraction_ahead_of_ordered_linking(tmp_path) -> 
 
         assert [result.memories_created for result in results] == [1, 1]
         assert generation.max_active_extractions == 1
-        assert generation.events.index(
-            ("link_started", "Alice likes hiking.")
-        ) < generation.events.index(("extract_started", "Alice bought boots."))
-        assert generation.events.index(
+        hiking_extract = generation.events.index(
+            ("extract_started", "Alice likes hiking.")
+        )
+        hiking_link = generation.events.index(("link_completed", "Alice likes hiking."))
+        boots_extract = generation.events.index(
             ("extract_started", "Alice bought boots.")
-        ) < generation.events.index(("link_completed", "Alice likes hiking."))
-        assert [
-            content for event, content in generation.events if event == "link_completed"
-        ] == ["Alice likes hiking.", "Alice bought boots."]
+        )
+        boots_link = generation.events.index(("link_completed", "Alice bought boots."))
+        assert hiking_extract < hiking_link
+        assert boots_extract < boots_link
+        assert hiking_link < boots_extract or boots_link < hiking_extract
         await engine.close()
 
     asyncio.run(scenario())
 
 
-def test_add_episode_extraction_lanes_are_independent_between_spaces(tmp_path) -> None:
+def test_add_episode_spaces_remain_independent(tmp_path) -> None:
     async def scenario() -> None:
         generation = FakeGenerationProvider(extraction_delay_seconds=0.02)
         engine = await FluxFold.open(

@@ -33,6 +33,58 @@ def test_longmemeval_adapter_does_not_leak_supervision(tmp_path) -> None:
     assert "hiking" == spaces[0].questions[0].answer
 
 
+def test_longmemeval_adapter_stringifies_integer_answers(tmp_path) -> None:
+    path = tmp_path / "longmemeval.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": "q-count",
+                    "question_type": "multi-session",
+                    "question": "How many items of clothing do I need to pick up?",
+                    "answer": 3,
+                    "question_date": "2025-01-02",
+                    "haystack_session_ids": ["s-1"],
+                    "haystack_dates": ["2025-01-01"],
+                    "haystack_sessions": [
+                        [{"role": "user", "content": "I need to pick up three shirts."}]
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    spaces = load_longmemeval(path)
+    assert spaces[0].questions[0].answer == "3"
+
+
+def test_longmemeval_adapter_keeps_empty_content(tmp_path) -> None:
+    path = tmp_path / "longmemeval.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": "q-empty",
+                    "question_type": "single-session-user",
+                    "question": "What happened?",
+                    "answer": "nothing",
+                    "haystack_session_ids": ["s-1"],
+                    "haystack_dates": ["2025-01-01"],
+                    "haystack_sessions": [
+                        [
+                            {"role": "user", "content": ""},
+                            {"role": "assistant", "content": "Hello."},
+                        ]
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    spaces = load_longmemeval(path)
+    assert [block.content for block in spaces[0].episodes[0].blocks] == ["", "Hello."]
+
+
 def test_locomo_adapter_preserves_speakers_and_caption(tmp_path) -> None:
     conversations = tmp_path / "conversations.json"
     questions = tmp_path / "questions.json"

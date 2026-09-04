@@ -261,8 +261,8 @@ def _load_records(path: str | Path) -> list[dict[str, Any]]:
 
 def _required_string(value: dict[str, Any], field: str) -> str:
     result = value.get(field)
-    if not isinstance(result, str) or not result.strip():
-        raise ValidationError(f"missing or blank string field: {field}")
+    if not isinstance(result, str):
+        raise ValidationError(f"missing string field: {field}")
     return result
 
 
@@ -276,13 +276,17 @@ def _required_list(value: dict[str, Any], field: str) -> list[Any]:
 def _answer_value(value: Any) -> str | tuple[str, ...]:
     if isinstance(value, str):
         return value
+    if type(value) is int:
+        return str(value)
     if (
         isinstance(value, list)
         and value
         and all(isinstance(item, str) for item in value)
     ):
         return tuple(value)
-    raise ValidationError("benchmark answer must be a string or non-empty string list")
+    raise ValidationError(
+        "benchmark answer must be a string, integer, or non-empty string list"
+    )
 
 
 def _role(value: object) -> Role:

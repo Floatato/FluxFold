@@ -155,12 +155,7 @@ class FluxFold:
         self.config = config
         self._event_sink = event_sink
         self._benchmark_seed = benchmark_seed
-        self._space_extraction_locks: defaultdict[str, asyncio.Lock] = defaultdict(
-            asyncio.Lock
-        )
-        self._space_stateful_locks: defaultdict[str, asyncio.Lock] = defaultdict(
-            asyncio.Lock
-        )
+        self._space_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._space_pipeline_failures: dict[str, StageFailure] = {}
         self._llm_io_sample_counts: Counter[str] = Counter()
         self._llm_io_sample_lock = threading.Lock()
@@ -208,9 +203,8 @@ class FluxFold:
         return space
 
     async def delete_space(self, memory_space_id: str) -> None:
-        async with self._space_extraction_locks[memory_space_id]:
-            async with self._space_stateful_locks[memory_space_id]:
-                self._store.delete_space(memory_space_id)
+        async with self._space_locks[memory_space_id]:
+            self._store.delete_space(memory_space_id)
 
     async def clear_spaces(self) -> None:
         self._store.clear_spaces()
@@ -225,13 +219,12 @@ class FluxFold:
         """Extract and add one complete normalized episode to a memory space."""
 
         try:
-            async with self._space_extraction_locks[memory_space_id]:
+            async with self._space_locks[memory_space_id]:
                 self._raise_if_pipeline_failed(memory_space_id)
                 prepared = await self._prepare_add(
                     memory_space_id, episode, actor=actor
                 )
-            self._raise_if_pipeline_failed(memory_space_id)
-            return await self._commit_prepared_add(prepared)
+                return await self._commit_prepared_add(prepared)
         except StageFailure as failure:
             self._handle_episode_failure(memory_space_id, episode, failure)
             raise
@@ -324,127 +317,125 @@ class FluxFold:
     async def _commit_prepared_add(self, prepared: _PreparedAdd) -> AddResult:
         memory_space_id = prepared.memory_space_id
         episode = prepared.episode
-        async with self._space_stateful_locks[memory_space_id]:
-            self._raise_if_pipeline_failed(memory_space_id)
-            current = self._store.persist_episode(memory_space_id, episode)
-            if current.extraction_completed:
-                replay_subject_ids = self._store.operation_active_subject_ids(
-                    memory_space_id, current.completed_operation_id
-                )
-                maintenance = await self._complete_maintenance(
-                    memory_space_id,
-                    cast(str, current.completed_operation_id),
-                    replay_subject_ids,
-                    prepared.signature_id,
-                    prepared.actor,
-                )
-                return AddResult(
-                    current.episode_id,
-                    current.completed_operation_id,
-                    True,
-                    0,
-                    0,
-                    0,
-                    tuple(maintenance),
-                )
-            if prepared.extraction is None:
-                raise ConcurrentUpdateError(
-                    "episode completion disappeared after preparation"
-                )
-            extraction = prepared.extraction
-            contents = prepared.contents
-            memory_refs = prepared.memory_refs
-            memory_ids = prepared.memory_ids
-            memory_vectors = prepared.memory_vectors
-            prepared_memories = prepared.prepared_memories
-            if contents:
-                linking, linking_metrics = await self._link_memories(
-                    memory_space_id,
-                    memory_refs,
-                    contents,
-                    memory_vectors,
-                )
-            else:
-                linking = LinkingOutput(new_subjects=[], links=[])
-                linking_metrics = _LinkingMetrics(0, False, 0)
-            self._event(
-                "subject_linking_completed",
-                memory_space_id=memory_space_id,
-                episode_id=current.episode_id,
-                new_subjects=len(linking.new_subjects),
-                links=len(linking.links),
-                candidate_memory_count=linking_metrics.candidate_memory_count,
-                association_search_called=linking_metrics.association_search_called,
-                association_additional_candidate_memory_count=(
-                    linking_metrics.association_additional_candidate_memory_count
-                ),
-            )
-            (
-                prepared_subjects,
-                prepared_links,
-                subject_touches,
-                affected_subject_ids,
-            ) = await self._prepare_link_commit(
-                memory_space_id,
-                memory_refs,
-                memory_ids,
-                linking,
-            )
-            operation_id = self._store.commit_add(
-                memory_space_id=memory_space_id,
-                episode_id=current.episode_id,
-                input_hash=episode.content_hash,
-                memories=prepared_memories,
-                subjects=prepared_subjects,
-                links=prepared_links,
-                subject_touches=subject_touches,
-                signature_id=prepared.signature_id,
-                actor=prepared.actor,
-                config_signature=self.config.signature,
-            )
-            self._event(
-                "episode_committed",
-                memory_space_id=memory_space_id,
-                episode_id=current.episode_id,
-                operation_id=operation_id,
-                memories_created=len(prepared_memories),
-                subjects_created=len(prepared_subjects),
-                links_created=len(prepared_links),
-            )
-            self._event(
-                "audit_episode_decision",
-                memory_space_id=memory_space_id,
-                episode_id=current.episode_id,
-                operation_id=operation_id,
-                extraction=self._audit_extraction(
-                    memory_space_id, extraction, memory_refs, contents, linking
-                ),
-                new_subjects=[
-                    {
-                        **subject.model_dump(mode="json"),
-                        "subject_id": prepared_subject.subject_id,
-                    }
-                    for subject, prepared_subject in zip(
-                        linking.new_subjects, prepared_subjects, strict=True
-                    )
-                ],
+        current = self._store.persist_episode(memory_space_id, episode)
+        if current.extraction_completed:
+            replay_subject_ids = self._store.operation_active_subject_ids(
+                memory_space_id, current.completed_operation_id
             )
             maintenance = await self._complete_maintenance(
                 memory_space_id,
-                operation_id,
-                sorted(affected_subject_ids),
+                cast(str, current.completed_operation_id),
+                replay_subject_ids,
                 prepared.signature_id,
                 prepared.actor,
             )
             return AddResult(
                 current.episode_id,
-                operation_id,
-                current.replayed,
-                len(prepared_memories),
-                len(prepared_subjects),
-                len(prepared_links),
+                current.completed_operation_id,
+                True,
+                0,
+                0,
+                0,
                 tuple(maintenance),
             )
+        if prepared.extraction is None:
+            raise ConcurrentUpdateError(
+                "episode completion disappeared after preparation"
+            )
+        extraction = prepared.extraction
+        contents = prepared.contents
+        memory_refs = prepared.memory_refs
+        memory_ids = prepared.memory_ids
+        memory_vectors = prepared.memory_vectors
+        prepared_memories = prepared.prepared_memories
+        if contents:
+            linking, linking_metrics = await self._link_memories(
+                memory_space_id,
+                memory_refs,
+                contents,
+                memory_vectors,
+            )
+        else:
+            linking = LinkingOutput(new_subjects=[], links=[])
+            linking_metrics = _LinkingMetrics(0, False, 0)
+        self._event(
+            "subject_linking_completed",
+            memory_space_id=memory_space_id,
+            episode_id=current.episode_id,
+            new_subjects=len(linking.new_subjects),
+            links=len(linking.links),
+            candidate_memory_count=linking_metrics.candidate_memory_count,
+            association_search_called=linking_metrics.association_search_called,
+            association_additional_candidate_memory_count=(
+                linking_metrics.association_additional_candidate_memory_count
+            ),
+        )
+        (
+            prepared_subjects,
+            prepared_links,
+            subject_touches,
+            affected_subject_ids,
+        ) = await self._prepare_link_commit(
+            memory_space_id,
+            memory_refs,
+            memory_ids,
+            linking,
+        )
+        operation_id = self._store.commit_add(
+            memory_space_id=memory_space_id,
+            episode_id=current.episode_id,
+            input_hash=episode.content_hash,
+            memories=prepared_memories,
+            subjects=prepared_subjects,
+            links=prepared_links,
+            subject_touches=subject_touches,
+            signature_id=prepared.signature_id,
+            actor=prepared.actor,
+            config_signature=self.config.signature,
+        )
+        self._event(
+            "episode_committed",
+            memory_space_id=memory_space_id,
+            episode_id=current.episode_id,
+            operation_id=operation_id,
+            memories_created=len(prepared_memories),
+            subjects_created=len(prepared_subjects),
+            links_created=len(prepared_links),
+        )
+        self._event(
+            "audit_episode_decision",
+            memory_space_id=memory_space_id,
+            episode_id=current.episode_id,
+            operation_id=operation_id,
+            extraction=self._audit_extraction(
+                memory_space_id, extraction, memory_refs, contents, linking
+            ),
+            new_subjects=[
+                {
+                    **subject.model_dump(mode="json"),
+                    "subject_id": prepared_subject.subject_id,
+                }
+                for subject, prepared_subject in zip(
+                    linking.new_subjects, prepared_subjects, strict=True
+                )
+            ],
+        )
+        maintenance = await self._complete_maintenance(
+            memory_space_id,
+            operation_id,
+            sorted(affected_subject_ids),
+            prepared.signature_id,
+            prepared.actor,
+        )
+        return AddResult(
+            current.episode_id,
+            operation_id,
+            current.replayed,
+            len(prepared_memories),
+            len(prepared_subjects),
+            len(prepared_links),
+            tuple(maintenance),
+        )
 
     def _handle_episode_failure(
         self,
@@ -496,9 +487,8 @@ class FluxFold:
     ) -> EmbeddingRebuildResult:
         """Rebuild all active retrieval vectors and atomically switch signatures."""
 
-        async with self._space_extraction_locks[memory_space_id]:
-            async with self._space_stateful_locks[memory_space_id]:
-                return await self._rebuild_retrieval_embeddings_locked(memory_space_id)
+        async with self._space_locks[memory_space_id]:
+            return await self._rebuild_retrieval_embeddings_locked(memory_space_id)
 
     async def _rebuild_retrieval_embeddings_locked(
         self, memory_space_id: str
@@ -1589,8 +1579,6 @@ class FluxFold:
             else self.config.message_chars_max
         )
         for block in episode.blocks:
-            if not block.content.strip():
-                raise ValidationError("blank episode messages are invalid")
             if len(block.content) > message_limit:
                 raise ValidationError("episode message exceeds character limit")
             if block.role.value == "user" and block.message_phase is not None:

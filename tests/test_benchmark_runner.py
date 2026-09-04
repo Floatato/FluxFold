@@ -101,10 +101,10 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
             mode="sample",
             config=config,
         )
-        event_count = len(paths.events.read_text(encoding="utf-8").splitlines())
         first_summary = json.loads(paths.build_summary.read_text(encoding="utf-8"))
         first_elapsed = float(first_summary["elapsed_seconds"])
         assert first_elapsed > 0
+        first_audit = paths.audit.read_text(encoding="utf-8")
         previous_checkpoint = json.loads(paths.checkpoint.read_text(encoding="utf-8"))
         paths.checkpoint.write_text(
             json.dumps(
@@ -124,17 +124,17 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
             mode="sample",
             config=config,
         )
-        resumed_events = [
-            json.loads(line)
-            for line in paths.events.read_text(encoding="utf-8").splitlines()[
-                event_count:
-            ]
-        ]
-        assert [
-            event["source_sequence"]
-            for event in resumed_events
-            if event["event_type"] == "episode_processing_started"
-        ] == [2]
+        resumed_audit = paths.audit.read_text(encoding="utf-8")
+        assert (
+            resumed_audit.count("Source sequence: 2")
+            == first_audit.count("Source sequence: 2") + 1
+        )
+        assert resumed_audit.count("Source sequence: 0") == first_audit.count(
+            "Source sequence: 0"
+        )
+        assert resumed_audit.count("Source sequence: 1") == first_audit.count(
+            "Source sequence: 1"
+        )
         later_config = config.with_overrides(subject_split_memory_count_threshold=12)
         assert later_config.signature != config.signature
         await answer_run(

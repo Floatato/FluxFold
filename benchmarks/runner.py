@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import Awaitable
 from dataclasses import asdict
 from pathlib import Path
 from uuid import uuid4
@@ -134,74 +133,42 @@ async def build_run(
                     for episode in space.episodes
                     if episode.source_sequence > last_completed_sequence
                 )
-
-                async def add_episode(episode: NormalizedEpisode) -> AddResult:
-                    writer.event(
-                        {
-                            "event_type": "episode_processing_started",
-                            "severity": "info",
-                            "timestamp_ms": int(time.time() * 1000),
-                            "space_key": space.space_key,
-                            "memory_space_id": memory_space.memory_space_id,
-                            "source_sequence": episode.source_sequence,
-                            "source_key": episode.source_key,
-                        }
+                for episode in pending_episodes:
+                    result, failure = await _finish_add_item(
+                        engine=engine,
+                        memory_space_id=memory_space.memory_space_id,
+                        episode=episode,
+                        writer=writer,
                     )
-                    return await engine.add_episode(
-                        memory_space.memory_space_id, episode
-                    )
-
-                add_tasks = [
-                    asyncio.create_task(add_episode(episode))
-                    for episode in pending_episodes
-                ]
-                try:
-                    for episode, add_task in zip(
-                        pending_episodes, add_tasks, strict=True
-                    ):
-                        result, failure = await _finish_add_item(
-                            engine=engine,
-                            memory_space_id=memory_space.memory_space_id,
-                            episode=episode,
-                            writer=writer,
-                            first_attempt=add_task,
+                    if result is None:
+                        assert failure is not None
+                        writer.audit_episode_failure(
+                            space.space_key,
+                            memory_space.memory_space_id,
+                            episode,
+                            failure.error_class.value,
+                            failure.message,
                         )
-                        if result is None:
-                            assert failure is not None
-                            writer.audit_episode_failure(
-                                space.space_key,
-                                memory_space.memory_space_id,
-                                episode,
-                                failure.error_class.value,
-                                failure.message,
+                    else:
+                        writer.audit_episode(
+                            space.space_key,
+                            memory_space.memory_space_id,
+                            episode,
+                            result,
+                        )
+                    async with completed_lock:
+                        last_episode_by_space[space.source_id] = episode.source_sequence
+                        if result is not None:
+                            _write_memory_bank(
+                                writer,
+                                engine,
+                                updated_after=(
+                                    f"episode `{episode.source_key}` in "
+                                    f"`{space.space_key}` (source sequence "
+                                    f"{episode.source_sequence})"
+                                ),
                             )
-                        else:
-                            writer.audit_episode(
-                                space.space_key,
-                                memory_space.memory_space_id,
-                                episode,
-                                result,
-                            )
-                        async with completed_lock:
-                            last_episode_by_space[space.source_id] = (
-                                episode.source_sequence
-                            )
-                            if result is not None:
-                                _write_memory_bank(
-                                    writer,
-                                    engine,
-                                    updated_after=(
-                                        f"episode `{episode.source_key}` in "
-                                        f"`{space.space_key}` (source sequence "
-                                        f"{episode.source_sequence})"
-                                    ),
-                                )
-                            persist_progress()
-                finally:
-                    for add_task in add_tasks:
-                        if not add_task.done():
-                            add_task.cancel()
-                    await asyncio.gather(*add_tasks, return_exceptions=True)
+                        persist_progress()
                 summary[space.source_id] = engine.space_statistics(
                     memory_space.memory_space_id
                 )
@@ -417,7 +384,6 @@ async def _finish_add_item(
     memory_space_id: str,
     episode: NormalizedEpisode,
     writer: ArtifactWriter,
-    first_attempt: Awaitable[AddResult] | None = None,
 ) -> tuple[AddResult | None, StageFailure | None]:
     transient = {
         ErrorClass.TRANSIENT_TRANSPORT,
@@ -431,8 +397,6 @@ async def _finish_add_item(
         ErrorClass.INCOMPLETE_OUTPUT,
     }
     try:
-        if first_attempt is not None:
-            return await first_attempt, None
         return await engine.add_episode(memory_space_id, episode), None
     except StageFailure as failure:
         if failure.error_class in terminal_item:
