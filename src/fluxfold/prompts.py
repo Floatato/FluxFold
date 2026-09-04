@@ -40,14 +40,28 @@ Examples, given candidates `Mike`, `Mike's Beijing trip`, `Mike's dietary prefer
 - "Mike and John are good friends" has two core anchors. Use `Mike`, direct, for Mike. `John's diet habits` is not a home for John in this memory, so create `John`, direct. The fitting Mike candidate does not resolve John. If `Mike and John's friendship` were a candidate whose scope covers both anchors, one direct link to it could resolve both.
 - Given only `Melanie`, "Melanie's family saw the Perseid meteor shower while camping in 2022" → `Melanie`, direct; do not create `Melanie's family 2022 camping trip`.
 After resolving every core anchor, union and deduplicate their direct targets. Then add contextual links to other existing candidate subjects that are not homes but that the memory concretely completes, constrains, updates, or explains. A missing contextual scope never justifies creating a subject unless it is also an unresolved core anchor.
-Only IDs listed in `candidates` are legal existing targets. Any other subject must be created new.
+When common sense says this memory would change, restrict, or complete something that is probably stored under a different topic, search that topic first; see below.
+Only IDs listed in `candidates` or any `association_search_results` are legal existing targets. Any other subject must be created new.
 `direct` means the subject is a home of the memory for at least one core anchor, subject to the per-anchor rules above. `contextual` means the subject is not a home, but the memory concretely completes, constrains, updates, or explains what is filed there, without treating the affected subject as a home.
 A contextual link is a retrieval bridge: it makes the memory available when a future query retrieves that subject, even when the memory's wording and that subject are too dissimilar for vector recall. Linking only decides membership; it does not rewrite existing memories. Review later compiles members of one subject.
 Each memory needs at least one direct link and at most five links; one to four is normal.
 
+# Association search
+Passive recall only finds subject names that look like the new memories. A new fact can still change records stored under a different topic — those will not appear unless you search that topic. You may search up to five times, one query per response:
+{"result":"association_search","query":"the other topic this memory could change"}
+Check every new memory for effects that common sense says restrict, invalidate, or complete something people usually store elsewhere (food, travel, work, sleep, driving). When one does, return `association_search` as the whole response. Do not skip it just because a direct home is already obvious. Write the query as the affected subject's name, not a paraphrase of the memory. What you find may need a contextual link, or it may be a better direct home that passive recall missed. Results from earlier searches remain available in `association_search_results`; after at most five searches, return final links for the whole batch.
+Examples:
+- New: "Mike had dental implant surgery on 3 May 2024." Oral surgery affects eating and drinking, but the memory never says so. Query "Mike's dietary preferences", "Mike's diet plan". If either appears, `Mike` direct and that subject contextual.
+- New: "Mike's driving licence was suspended for six months from 8 April 2024." He cannot drive. Query "Mike's travel plans", "Mike's commute". Contextual-link any driving-dependent plans that appear.
+- New: "Mike starts night shifts at the hospital on 1 June 2024." His nights are occupied. Query "Mike's evening plans", "Mike's sleep schedule". Contextual-link evening hobbies or sleep routines that appear.
+Do not search for a self-contained fact with no such effect.
+
 # Output
-Return exactly one JSON object with no prose, Markdown, or extra fields:
-{"result":"links","new_subjects":[{"subject_ref":"new_subject_1","name":"John"}],"links":[{"memory_ref":"memory_1","subject":{"kind":"existing","subject_id":"an ID from candidates"},"basis":"direct"},{"memory_ref":"memory_2","subject":{"kind":"new","subject_ref":"new_subject_1"},"basis":"direct"}]}
+Return exactly one JSON object with no prose, Markdown, or extra fields. There are exactly two valid shapes:
+1. While `association_searches_remaining` is greater than zero, request another search when the rule above applies:
+{"result":"association_search","query":"the other subject / topic this memory could change or affect"}
+2. Otherwise, return the final linking result for every supplied memory:
+{"result":"links","new_subjects":[{"subject_ref":"new_subject_1","name":"John"}],"links":[{"memory_ref":"memory_1","subject":{"kind":"existing","subject_id":"an ID from candidates or association_search_results"},"basis":"direct"},{"memory_ref":"memory_2","subject":{"kind":"new","subject_ref":"new_subject_1"},"basis":"direct"}]}
 basis is exactly direct or contextual. Link every `new_memories` entry, keep new_subjects empty when no subject is created, never repeat a memory-subject pair, and give every new subject a unique subject_ref and at least one link. A new subject's name is short and independently understandable, never a catch-all such as Other or Misc; aim for under 10 words."""
 
 

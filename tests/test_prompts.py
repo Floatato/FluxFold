@@ -52,12 +52,13 @@ class RepairingGenerationProvider(FakeGenerationProvider):
 
 
 def test_linking_prompt_contains_the_exact_nested_contract() -> None:
-    assert '"result":"association_search"' not in LINKING_SYSTEM
+    assert "There are exactly two valid shapes" in LINKING_SYSTEM
+    assert '"result":"association_search"' in LINKING_SYSTEM
     assert '"result":"links"' in LINKING_SYSTEM
     assert '"subject":{"kind":"existing","subject_id"' in LINKING_SYSTEM
     assert '"subject":{"kind":"new","subject_ref"' in LINKING_SYSTEM
-    assert "association_search_results" not in LINKING_SYSTEM
-    assert "association_searches_remaining" not in LINKING_SYSTEM
+    assert "up to five times" in LINKING_SYSTEM
+    assert "final linking result for every supplied memory" in LINKING_SYSTEM
     assert "provisional" not in LINKING_SYSTEM
     assert "basis is exactly direct or contextual" in LINKING_SYSTEM
 
@@ -76,15 +77,15 @@ def test_linking_prompt_distinguishes_direct_granularity_from_contextual_links()
     assert "too dissimilar for vector recall" in LINKING_SYSTEM
     assert "without treating the affected subject as a home" in LINKING_SYSTEM
     assert "Linking only decides membership" in LINKING_SYSTEM
-    assert "Mike had dental implant surgery on 3 May 2024" not in LINKING_SYSTEM
+    assert "Mike had dental implant surgery on 3 May 2024" in LINKING_SYSTEM
     assert "cannot drink alcohol for a month" not in LINKING_SYSTEM
-    assert '"Mike\'s dietary preferences", "Mike\'s diet plan"' not in LINKING_SYSTEM
-    assert '"Mike\'s travel plans", "Mike\'s commute"' not in LINKING_SYSTEM
-    assert '"Mike\'s evening plans", "Mike\'s sleep schedule"' not in LINKING_SYSTEM
-    assert "driving licence was suspended" not in LINKING_SYSTEM
-    assert "night shifts at the hospital" not in LINKING_SYSTEM
-    assert "the other topic this memory could change" not in LINKING_SYSTEM
-    assert "better direct home that passive recall missed" not in LINKING_SYSTEM
+    assert '"Mike\'s dietary preferences", "Mike\'s diet plan"' in LINKING_SYSTEM
+    assert '"Mike\'s travel plans", "Mike\'s commute"' in LINKING_SYSTEM
+    assert '"Mike\'s evening plans", "Mike\'s sleep schedule"' in LINKING_SYSTEM
+    assert "driving licence was suspended" in LINKING_SYSTEM
+    assert "night shifts at the hospital" in LINKING_SYSTEM
+    assert "the other topic this memory could change" in LINKING_SYSTEM
+    assert "better direct home that passive recall missed" in LINKING_SYSTEM
 
 
 def test_linking_prompt_resolves_each_core_anchor_before_creating_subjects() -> None:
