@@ -77,6 +77,7 @@ def test_extract_link_and_summary_are_sampled_twice(tmp_path) -> None:
                 "Alice likes hiking.",
                 "Alice bought boots.",
                 "Alice hikes on weekends.",
+                "Alice plans a mountain hike.",
             )
         ):
             await engine.add_episode(

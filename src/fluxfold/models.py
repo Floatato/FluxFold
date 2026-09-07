@@ -18,13 +18,6 @@ def utc_milliseconds() -> int:
     return int(datetime.now(tz=UTC).timestamp() * 1000)
 
 
-def _search_memory_date(latest_source_at: int | None) -> str | None:
-    if latest_source_at is None:
-        return None
-    moment = datetime.fromtimestamp(latest_source_at / 1000, tz=UTC)
-    return f"{moment.day} {moment.strftime('%B %Y')}"
-
-
 def canonical_json(value: object) -> str:
     """Serialize a JSON-compatible value deterministically."""
 
@@ -213,9 +206,7 @@ class SearchResult:
                 if memory_id not in seen:
                     seen.add(memory_id)
                     memory = memories[memory_id]
-                    dated = _search_memory_date(memory.latest_source_at)
-                    prefix = f"  Memory [{dated}]: " if dated else "  Memory: "
-                    lines.append(f"{prefix}{memory.content}")
+                    lines.append(f"  Memory: {memory.content}")
         return "\n".join(lines)
 
 
@@ -343,7 +334,6 @@ class SplitLinkOutput(StrictModel):
 
 
 class SplitSubjectOutput(StrictModel):
-    subject_ref: str
     name: str
     links: list[SplitLinkOutput]
 

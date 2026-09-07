@@ -57,7 +57,6 @@ from fluxfold.prompts import (
     SUMMARY_REFRESH_SYSTEM,
     extraction_input,
     linking_input,
-    prompt_timestamp,
     repair_input,
     review_input,
     split_input,
@@ -711,7 +710,6 @@ class FluxFold:
                 memory_value: dict[str, object] = {
                     "memory_id": memory.memory_id,
                     "content": memory.content,
-                    "last_mentioned_at": prompt_timestamp(memory.latest_source_at),
                     "similarity": memory.similarity,
                     "source": "memory_channel",
                 }
@@ -964,24 +962,33 @@ class FluxFold:
             subject_id=subject_id,
             memory_count=len(snapshot.memories),
         )
-        output, summary_turn = await self._structured_output(
-            stage="subject_summary_refresh",
-            system_prompt=SUMMARY_REFRESH_SYSTEM,
-            user_prompt=summary_refresh_input(snapshot),
-            adapter=TypeAdapter(SummaryRefreshOutput),
-            temperature=self.config.review_temperature,
-            validator=lambda value: self._validate_summary(value.summary),
-        )
-        output = cast(SummaryRefreshOutput, output)
-        self._offer_llm_sample("summary", summary_turn)
-        vector = (
-            await self._embed_documents([_name_summary(snapshot.name, output.summary)])
-        )[0]
+        if (
+            len(snapshot.memories)
+            <= self.config.subject_summary_refresh_llm_link_threshold
+        ):
+            summary = " "
+            decision = {"result": "summary_refresh", "summary": summary}
+        else:
+            output, summary_turn = await self._structured_output(
+                stage="subject_summary_refresh",
+                system_prompt=SUMMARY_REFRESH_SYSTEM,
+                user_prompt=summary_refresh_input(snapshot),
+                adapter=TypeAdapter(SummaryRefreshOutput),
+                temperature=self.config.review_temperature,
+                validator=lambda value: self._validate_summary(value.summary),
+            )
+            output = cast(SummaryRefreshOutput, output)
+            self._offer_llm_sample("summary", summary_turn)
+            summary = output.summary
+            decision = output.model_dump(mode="json")
+        vector = (await self._embed_documents([_name_summary(snapshot.name, summary)]))[
+            0
+        ]
         operation_id = self._store.commit_summary_refresh(
             add_operation_id=add_operation_id,
             memory_space_id=memory_space_id,
             snapshot=snapshot,
-            summary=output.summary,
+            summary=summary,
             summary_embedding=vector,
             signature_id=signature_id,
             actor=actor,
@@ -1002,7 +1009,7 @@ class FluxFold:
                 "name": snapshot.name,
                 "memories": [asdict(memory) for memory in snapshot.memories],
             },
-            decision=output.model_dump(mode="json"),
+            decision=decision,
         )
         return MaintenanceResult(subject_id, "summary_refresh", operation_id)
 
@@ -1202,7 +1209,10 @@ class FluxFold:
                 replacement_content = cast(
                     ReplaceContent, update.content_change
                 ).content
-                self._validate_memory_content(replacement_content)
+                self._validate_memory_content(
+                    replacement_content,
+                    max_chars=self.config.review_memory_content_max_chars,
+                )
                 if replacement_content == old.content and not provenance_changed:
                     raise ValidationError("replacement content is unchanged")
             if provenance_changed:
@@ -1330,9 +1340,6 @@ class FluxFold:
                 raise ValidationError("full split result subject count is invalid")
         elif not 1 <= len(subjects) <= self.config.subject_split_result_subject_max - 1:
             raise ValidationError("partial split new subject count is invalid")
-        refs = [subject.subject_ref for subject in subjects]
-        if len(refs) != len(set(refs)):
-            raise ValidationError("split subject_ref values must be unique")
         input_ids = {memory.memory_id for memory in snapshot.memories}
         membership: Counter[str] = Counter()
         for subject in subjects:
@@ -1592,10 +1599,13 @@ class FluxFold:
         for memory in extraction.memories:
             self._validate_memory_content(memory.content)
 
-    def _validate_memory_content(self, content: str) -> None:
+    def _validate_memory_content(
+        self, content: str, *, max_chars: int | None = None
+    ) -> None:
         if not content.strip():
             raise ValidationError("memory content must not be blank")
-        if len(content) > self.config.memory_content_max_chars:
+        limit = self.config.memory_content_max_chars if max_chars is None else max_chars
+        if len(content) > limit:
             raise ValidationError("memory content exceeds character limit")
         if _SECRET_RE.search(content):
             raise ValidationError(

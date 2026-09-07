@@ -180,7 +180,8 @@ tool arguments 和 tool result 均不进入 Memory Engine，也不进入 episode
 `latest_source_at` 是当前 latest memory version 的全部 provenance 时间锚点中的最大值。
 没有可用来源时间时保持 `NULL`，不得使用 `created_at` 补造。provenance 被完整替换时必须
 重新计算该字段，因此移除最新来源可以使它变早。该时间戳是持久化检索属性，不保存随
-查询时间变化的 recency score。
+查询时间变化的 recency score。它可供结构化 search 调用方或未来的新近性机制使用，
+但不默认展示给写入阶段 LLM，也不渲染到面向 Agent 的检索文本中。
 
 `retired` 是全局逻辑删除状态。退役 memory 保留正文、provenance、原 subject links 和
 operation history，但不再参与任何候选召回、审核、分裂、summary 生成或公开 search。
@@ -282,10 +283,11 @@ Subject 审计的容量使用当前 active links 关联的 active memory 数量�
 
 `unlinked_at IS NULL` 表示 active link。同一 subject–memory 对在解除后重新建立时插入
 新行，不复用旧行。`direct` 表示该 subject 是这条 memory 的组织归属：memory 是该
-subject 要收的那种事实、事件、状态、决定或目标。`contextual` 表示 memory 会具体补全、
-约束、更新或解释该 subject 下已归档的信息：该 subject 不是归属，但未来对该 subject
-的回答需要看见这条记忆，即便两边文本不相似。每条新 memory 至少建立一个
-`direct` link，且可以有多个 `direct` link；全部 active subject links 合计不得超过 5。
+subject 要收的那种事实、事件、状态、决定或目标。`contextual` 表示该 subject 不是归属，
+但 memory 与其下已归档的信息存在具体的约束、影响、更新或解释关系；关系可以由任一方
+施加，未来对该 subject 的回答需要看见这条记忆，即使两边文本不相似。每条 new memory
+至少建立一个 `direct` link，且可以有多个 `direct` link；全部 active subject links 合计不得
+超过 5。
 `contextual` link 按需建立，不表示较低优先级。
 SQLite 使用 `CHECK (link_basis IN ('direct', 'contextual'))` 约束取值。
 
@@ -296,7 +298,8 @@ SQLite 使用 `CHECK (link_basis IN ('direct', 'contextual'))` 约束取值。
 
 任何流程新建 direct link 时，如果 LLM 判断候选 subjects 中一个是另一个的语义具体化，
 只建立指向该 memory 真正归属且更具体 subject 的 direct link。该规则不禁止一条 memory
-同时关联两个没有包含关系的领域，也不排除指向其他受影响 subject 的 contextual link。
+同时关联两个没有包含关系的领域，也不排除指向存在上述具体关系的其他 subject 的
+contextual link。
 包含关系只由 LLM 根据当前输入判断；程序不保存 subject 层级、不主动维护包含关系，也
 不对一般性的语义包含关系作校验。Partial split 中原 subject 与本次新 subjects 之间的关系由操作类型直接确定，按下述 split 规则关闭旧 links。
 
@@ -421,9 +424,11 @@ effect type。link row 同时通过 open/close operation ID 保留关系变化�
    和 name embeddings，只关闭移出 memories 指向原 subject 的 links，建立新 links，并保留
    原 subject 的旧 summary。两种成功结果都将涉及的 active subjects 的新增计数置零，将新建
    subjects 加入 refresh targets，并记录 operation effects。
-4. **Refresh subject summary**：对一个 pending target，以其全部当前 active memories 生成
-   完整 summary；在成员集合、内容、link basis 和 revision 未变化时整体替换 summary、更新
-   `name_summary` embedding，并把该 target 标为完成，不重置 `new_memory_count`。
+4. **Refresh subject summary**：对一个 pending target，当前 active links 不超过 2 时
+   不调用 LLM，直接使用单个空格 `" "`；否则以全部当前 active memories 生成
+   完整 summary。在成员集合、内容、link basis 和 revision 未变化时整体替换
+   summary、更新 `name_summary` embedding，并把该 target 标为完成，不重置
+   `new_memory_count`。
 5. **Switch embedding model**：新 signature 的全部必要 embeddings 准备完成后，切换对应
   用途的 active signature。
 
@@ -470,10 +475,12 @@ generation provider 的 context window 和 API 参数是外部约束，不转换
 | ----------------------------- | -------------------------------------- |
 | subject name prompt 指导        | 建议不超过 10 words                         |
 | subject name 字符硬上限            | 120 字符                                 |
-| subject summary prompt 指导     | 建议不超过 200 words                        |
+| LLM 新生成 subject summary prompt 指导 | 建议不超过 200 words                   |
 | LLM 新生成 subject summary 字符硬上限 | 2,000 字符                               |
 | memory content prompt 指导      | 建议不超过 50 words                         |
 | memory content 字符硬上限          | 1,000 字符                               |
+| review 改写 memory prompt 指导    | 建议不超过 100 words                        |
+| review 改写 memory 字符硬上限       | 800 字符                                 |
 | search query                  | 不设应用层长度上限                              |
 | episode message 数量硬上限         | 256                                    |
 | episode 正文总字符硬上限              | 96,000 字符                              |
@@ -567,6 +574,7 @@ Subject split 无法形成合法语义分组时使用明确的
 | `embedding_request_timeout_seconds`         | 60 秒        | 单次远程 embedding provider 请求的 timeout             |
 | `embedding_transport_max_retries`           | 5           | embedding 初次传输失败后的额外重试次数                        |
 | `embedding_batch_concurrency_per_operation` | 4           | 单个 embedding 逻辑操作内部同时执行的 batch 请求上限            |
+| `subject_summary_refresh_llm_link_threshold` | 2      | active links 不超过此值时不调用 LLM 生成 summary        |
 | `subject_summary_refresh_concurrency_per_episode` | 5     | 一个 episode 内同时执行的 subject summary refresh 上限          |
 | `exact_scan_batch_rows`                     | 8,192       | NumPy 精确扫描时每批从 SQLite 读取并计算的 embedding 行数       |
 | `sqlite_busy_timeout_ms`                    | 5,000 毫秒    | SQLite 遇到锁竞争时等待锁释放的最长时间                         |
@@ -703,7 +711,7 @@ episode
 → 原子写入 memory、provenance、embedding、subject、links 和 operation
 → 先执行已触发的 Subject split / Subject review
 → 构造并持久化本 episode 的 summary refresh targets
-→ 最多并发 5 个 target，分别整体重写 summary
+→ 最多并发 5 个 target，分别更新 summary
 ```
 
 LLM 与 embedding 在事务外运行。`episode_extractions` 以 episode input hash 和 extractor
@@ -731,33 +739,40 @@ failure 不回滚正式状态，恢复时从持久化 refresh targets 重试未�
 状态变化或重要决定的信息应当提取；寒暄、可重新生成的通用知识、未被接受的建议、机械
 操作过程和没有未来用途的重复内容通常不提取。
 
-一条 memory 表达一个可以独立检索、更新或失效的完整对象：明确主体，加一个状态、事件、
-决定或目标，以及理解它所必需的时间、条件、原因或直接结果。不同主体、不同生命周期、
-不同时间范围或可以分别完成的事项应拆开；同一不可分割事实的条件和直接结果应保留在一起。
+一条 memory 表达一个可以独立检索、更新或失效的完整对象：明确所指的实体或事项，加一个
+状态、事件、决定或目标，以及理解它所必需的时间、条件、原因或直接结果。不同实体或主题、
+不同生命周期、不同时间范围或可以分别完成的事项应拆开；同一不可分割事实的条件和直接结果
+应保留在一起。
 
-memory 必须脱离 episode 后仍可理解，消除含糊代词并明确关系双方。多参与者数据存在
-`speaker_name` 时用真实姓名而非协议角色指称主体。content 必须保留来源给出的具体名称、
-地点、数量和限定语，不得用更宽泛的表述替换。extractor 只能重组
-episode 明确支持的信息，不能推测动机或因果；Assistant 建议只有被 User 明确接受后才能
-写成已确认方案。外部事实的来源归属、不确定性、计划/进行中/完成/失败/取消等状态必须保留。
+memory 必须脱离 episode 后仍可理解。能够从来源确定所指对象时，应尽量减少代词以及
+`homeland` 等依赖上下文的指代表达，并明确关系双方。content 应优先使用来源支持的准确姓名、
+地点、数量等细节，而不是更宽泛的改述；每条 memory 使用其来源原文的语言。extractor 只能
+重组 episode 明确支持的信息，不能推测动机或因果；Assistant 建议只有被 User 明确接受后
+才能写成已确认方案。外部事实的来源归属、不确定性、计划/进行中/完成/失败/取消等状态必须保留。
 同一 episode 内的明确纠正以最终状态为准；跨 episode 的重复、冲突、状态变化，以及同一
 subject 内的指代补全、约束写回和实例对齐，交给 Subject review 处理。
 
-episode 存在来源时间时，message 中的相对时间表述换算为明确的日历日期、月份或年份写入
-content，换算只以该 episode 自身的来源时间为基准；只能近似到月或年时同时保留说话人的
-原始表述。来源时间缺失或无法支持时不写时间，也不得编造。LLM 输入中的全部时间统一渲染为
-带星期的可读 UTC 字符串，不向模型暴露 Unix 毫秒值。
+message 有 `observed_at` 时，其相对时间只以该时间为基准；否则使用 episode 的
+`source_started_at` / `source_ended_at` 范围。换算为来源所能支持的最精确日历日期、
+月份或年份。需要反映相对边界或近似程度时使用
+`before`、`after`、`around` 等修饰，能够推断星期时一并写入。content 只保留换算结果，不保留
+原始相对时间表述或换算依据，也不得暗示超出来源支持的精度。来源时间缺失或无法支持时不写
+时间，也不得编造。时间向 LLM 渲染为带星期的可读 UTC 字符串，同时保留
+`source_timezone`；不向模型暴露 Unix 毫秒值。
 
 所有阶段都从持久化事实构造任务专用的最小输入，不直接序列化领域对象。Extraction 的
-episode 只包含 `source_started_at`，每条 message 只包含 `speaker_id` 和 `content`；来源未提供
+episode 包含 messages 和有值的 `source_started_at`、`source_ended_at`、
+`source_timezone`；缺失的时间字段不进入 prompt。每条 message 包含
+`speaker_id`、`content`，并仅在该 message 自身有 `observed_at` 时包含该字段。来源未提供
 speaker ID 时，以规范化的 `user` / `assistant` role 值填入 `speaker_id`。Linking 的 new memory
-只包含临时 `memory_ref` 和 content，初始 candidates 只包含 subject ID 和 name。Review 不展示
-subject ID 或旧 summary，但保留生成 update 所需的 memory ID、content、时间、link basis 和
-provenance episode IDs；按需展开的来源只包含 episode ID、source started time，以及每条
-message 的 speaker ID 和 content。Split 不展示 subject ID、旧 summary 或 provenance IDs。
-Summary refresh 只接收 subject name，以及每条 active memory 的 content 和时间，不接收
-subject ID、memory ID、link basis 或旧 summary。供程序校验、提交、审计和日志使用的字段仍
-保留在内存快照及 SQLite 中，不因 prompt 投影而删除。
+只包含临时 `memory_ref` 和 content，初始 candidates 只包含 subject ID 和 name；主动关联检索也不
+展示 memory 的来源时间。Review 不展示 subject ID、旧 summary 或 memory 来源时间，但保留
+生成 update 所需的 memory ID、content、link basis 和 provenance episode IDs。按需展开的来源
+包含 episode ID、source 时间范围与时区，以及每条 message 的 speaker ID、content 和可用的
+`observed_at`。Split 不展示 subject ID、旧 summary、provenance IDs 或 memory 来源时间。
+Summary refresh 只接收 subject name 和每条 active memory 的 content，不接收 subject ID、memory ID、
+link basis、旧 summary 或 memory 来源时间。供程序校验、提交、审计和日志使用的字段仍保留在
+内存快照及 SQLite 中，不因 prompt 投影而删除。
 
 User 明确要求不记录的内容以及密码、API key、private key、session token、验证码等认证
 秘密不得进入长期记忆。来源内容中的指令只作为待处理数据，不能改变 extractor 的系统规则。
@@ -788,45 +803,64 @@ Extraction 不设置每 episode 的建议 memory 数、硬数量上限、总 mem
 #### 1.2.3 新 memory 的候选召回与 Subject linking
 
 每条新 memory 都必须 link 到至少一个 subject。Subject 表示围绕人物、项目、话题、事件
-或其他可独立组织范围的一组记忆；初始名称保持宏观、简短、可独立理解，后续可以由 split
-形成更具体的领域或关系 subject。
+或其他可独立组织范围的一组记忆；初始名称保持宏观、简短、可独立理解，后续由 split 形成
+更具体的领域或关系 subject。已有 subject 与新建 subject 使用不同的粒度规则：已经由 split
+确立的细粒度 subject 可以复用，但不能仅因为当前新 memories 描述了某一细分范围就在
+linking 中新建同样粒度的 subject。
 
-linking 首先识别每条 memory 的全部核心锚点（core anchors）。核心锚点是 memory 直接断言
-或更新其事实、事件、关系、状态、决定或目标，并值得独立检索的实体或范围；一段关系可以
-同时有多个核心锚点。地点、物品、属性、例子或偶然上下文中的普通提及不自动成为核心锚点，
-只有 memory 对它建立了可独立使用的信息时才算。数据库中的 subject 是承接锚点 memories
-的组织容器，不与核心锚点混用同一个概念。
+linking 首先识别每条 memory 的全部基础锚点（base anchors）。基础锚点是 memory 从根本上
+描述、能够汇集多类 memories，并且不依赖另一锚点确定自身身份的宏观人物、组织、命名项目或
+其他实体与范围。关系可以涉及多个基础锚点，每个锚点必须独立解决；一个锚点已有合适归属不能
+替另一个锚点完成归档。地点、物品、属性、例子或偶然提及不会仅因出现在 memory 中就成为
+基础锚点。基础锚点只是 linking 的判断单位，不是持久化对象；每个基础锚点最终由一个选中的
+或新建的 subject 承载，subject 才是 memory 的持久化组织容器。
 
-direct link 的必要条件是目标 subject 是当前 memory 对某一核心锚点的组织归属：memory
+基础锚点的依赖范围（dependent scope）是依靠该锚点才能确定身份的更窄方面、活动、所有物、
+偏好、旅行、计划、未命名项目、事件或关系，例如 `James's game project`。来源将一个明确命名
+的项目或事件作为具有稳定自身身份的持续对象时，它可以成为基础锚点；描述性的所有格范围仍是
+依赖范围。
+
+direct link 的必要条件是目标 subject 是当前 memory 对某一基础锚点的组织归属：memory
 属于该 subject 要收的那种事实、事件、状态、决定或目标，依据 subject 收的是哪类东西判断，
-而不是记忆是否碰巧提到它。每个核心锚点独立执行以下顺序，一个锚点已有合适 subject 不能
-替另一个锚点完成归档：
+而不是记忆是否碰巧提到它。每个基础锚点独立执行以下顺序：
 
-1. 只考察范围可能承接当前锚点的 candidates；属于其他锚点的合适候选不参与本锚点决策。
-2. 存在合适 candidates 时，只选择 memory 真正归属的最细粒度候选；不得选择并不适合的
-   更细 subject，不得为该锚点新建 subject，也不得为了重复同一归属而同时 direct 或
-   contextual link 到其更粗父级。
-3. 从细到粗没有任何 candidate 合适时，才以最粗可用粒度新建 subject，通常就是该实体或
-   范围本身的名称，使后续 memories 汇集到同一处。
+1. 只考察范围可能承接当前锚点的已有 subject candidates；属于其他锚点的合适 subject
+   candidate 不参与本锚点决策。
+2. 存在合适 subject candidates 时，只选择 memory 真正归属的最细粒度候选。已有依赖范围
+   subject 可以被选择，因为 split 已经确立了该边界；不得选择并不适合的更细 subject，且不
+   得为了重复同一归属而同时 direct 或 contextual link 到其更粗父级。
+3. 没有任何已有 subject candidate 合适时，使用宏观基础锚点：复用本 batch 已为它提出的新
+   subject，否则新建一个。依赖范围没有资格由 linking 新建 subject。
 
-新 subject 是累积容器，不是当前 memory 的摘要；名称不得加入仅属于单次经历的日期、年份、
-一次 trip、show、meeting 或 incident 等细节。只有 event 或 project 本身就是需要独立跟踪的
-核心锚点时，才直接使用其名称。细粒度 subject 由多条 memories 提供稳定边界的证据后通过
-split 形成，而不从单条 memory 的具体程度推导。同一批次的多条 memories 可以共同引用本次
-输出中的同一个新 `subject_ref`。
+正式创建前必须在整个 batch 内比较所有拟新建 subjects。如果一个拟建范围依赖另一个拟建
+基础锚点，只保留基础锚点，并把依赖范围的 memories link 到它。不得同时新建 `James` 和
+`James's game project`；即使本 batch 有多条 memory 描述该游戏项目也不例外。细粒度 subject
+只在积累的 memories 为稳定边界提供足够证据后由 split 创建。
 
-例如已有 `Mike`、`Mike's Beijing trip`、`Mike's dietary preferences` 和
-`John's diet habits` 时，`Mike and John are good friends` 同时以 Mike 和 John 为核心锚点：
-Mike 侧 direct link 到 `Mike`；`John's diet habits` 不承接这段友情，因此 John 侧新建最粗
-粒度的 `John`，不能因为 Mike 已有合适候选而遗漏 John。若已有范围同时覆盖双方的
-`Mike and John's friendship`，一个 direct link 可以解决两个锚点。只有 `Melanie` 候选时，
-`Melanie's family saw the Perseid meteor shower while camping in 2022` direct link 到
-`Melanie`，不得新建 `Melanie's family 2022 camping trip`。
+新 subject 是累积容器，不是当前 memory 的摘要；名称使用简短、宏观的基础锚点，不得加入
+仅属于单次经历的日期、年份、trip、show、meeting 或 incident 等细节。同一批次的多条
+memories 可以共同引用本次输出中的同一个新 `subject_ref`。
 
-全部核心锚点决定 direct targets 后，先合并去重，再判断 contextual links。contextual link
-挂到 memory 会具体补全、约束、更新或解释的既有候选 subject，包括记忆正文从未点名、只凭
-常识才成立的跨域关系，例如种牙手术对饮食偏好、驾照停权对接送出行。缺失的 contextual
-范围本身不触发新建，除非它同时是尚未解决的核心锚点。
+例如没有 subject candidates 时，`James is developing a game project` 只新建 `James`，本 batch
+中其他游戏项目 memories 复用同一个新 subject；已有 `James` 时 direct link 到 `James`，
+不得新建 `James's game project`。如果 `James's game project` 已经存在，更新该项目的 memory
+可以直接 link 到它；即使同时存在 `James`，也不为了重复归属而再 link 到 `James`。没有
+subject candidates 时，`Project Aurora released its first playable build` 可以新建 `Project Aurora`，
+因为来源把这个命名项目作为具有稳定自身身份的持续对象。
+
+`Mike and John are good friends` 涉及 Mike 和 John 两个基础锚点：Mike 侧使用合适的已有
+subject；`John's diet habits` 不承接这段友情，因此没有合适 John subject 时新建宏观的
+`John`；Mike 侧同理，没有合适的 direct link 目标时也必须新建 `Mike`。不能因为一方已有合适
+subject candidate 而遗漏另一方。若 `Mike and John's friendship` 已经存在并覆盖双方，一个
+direct link 可以解决两个锚点。只有 `Melanie` subject candidate 时，`Melanie's family saw
+the Perseid meteor shower while camping in 2022` direct link 到 `Melanie`，不得新建
+`Melanie's family 2022 camping trip`。
+
+全部基础锚点决定 direct targets 后，先合并去重，再判断 contextual links。contextual link
+连接的既有 subject 不是 memory 的组织归属，但 memory 与该 subject 中的信息存在具体的约束、
+影响、更新或解释关系，未来检索时需要共同可见；约束或影响可以来自任一方向。它包括正文未
+点名、只凭常识才能发现的跨域关系，例如种牙手术与饮食偏好、驾驶计划与驾照限制。缺失的
+contextual 范围绝不触发新建 subject。
 
 被动候选召回分别以每条新 memory content 为 query，只扫描 active subject name embedding。
 每条 memory 取相似度不低于阈值的前 5 个 subject，以余弦相似度作为分数放入批次对比池，
@@ -839,15 +873,16 @@ summary、关联 memory 或按 memory 分组的候选视图。
 最终 `links`，也可以返回一个 `association_search(query)` 工具请求；单次 loop 最多执行 5 次
 主动检索，第 6 个模型回合必须在已经累积的结果上给出最终 links。每次主动检索的候选展示
 保持详细的 Subject + Memory 双通道结构：Subject 通道包含 subject name、相似度和最相关的
-一条关联 memory，Memory 通道包含 memory content、相似度、时间和最相关的关联 subject；
+一条关联 memory，Memory 通道包含 memory content、相似度和最相关的关联 subject；
 结果按 query 分轮累积，之前轮次不会被后续结果覆盖。
 
-主动 query 应写成某条新记忆可能改变、约束或补全的另一主题名称，而非复述 new memory。
-判断依据是新记忆本身加上常识：口腔手术影响进食饮酒、驾照停权影响需要开车的行程、夜班
-占用晚间。搜到的可以是被动召回漏掉的 direct home，也可以是 contextual 目标。prompt 要求
-模型在输出 links 前逐条检查这种跨主题效应；不能仅因已经能选择 direct subject、正文从未
-点名另一领域、或被动候选看似合理而跳过。Linking 只决定成员关系，不改写已有 memory 正文；
-同一 subject 内的指代补全、约束写回、实例对齐和类别上提由 Subject review 完成。
+主动检索用于寻找可能影响或约束当前 memory、可能被当前 memory 影响或约束，或者与它存在
+其他超出文本语义相似度的逻辑关系的一个或多个 subjects。query 写成这些可能 subjects 的
+名称，而不是复述 new memory。搜到的可以是被动召回漏掉的 direct link 目标，也可以是
+contextual 目标。prompt 要求模型在输出 links 前逐条检查这种跨主题关系；不能仅因已经能选择
+direct subject、正文没有点名另一领域、或被动候选看似合理而跳过。Linking 只决定成员关系，不改写
+已有 memory 正文；同一 subject 内的指代补全、约束写回、实例对齐和类别上提由 Subject review
+完成。
 
 
 | 配置项                                        | 值    | 含义                                             |
@@ -889,33 +924,31 @@ memory 去重或共享召回上限。主动结果不展示 subject summary。所
 
 LLM 判断应链接哪些已有 subject、是否新建 subject，以及每条 link 的 `direct` 或
 `contextual` basis。`direct` 表示该 subject 是这条 memory 的组织归属。`contextual`
-是跨语义范围的检索桥：memory 的归属在别处，但它补全、约束、更新或解释该 subject 下已
-归档的内容，未来 query 命中该 subject 时需要一并可见，即便两边文本不相似。
+是跨语义范围的检索桥：memory 的归属在别处，但它与该 subject 下的信息存在具体的约束、
+影响、更新或解释关系；无论关系由哪一方施加，未来 query 命中该 subject 时都需要一并可见，
+即使两边文本不相似。
 
-以下例子定义 direct 与 contextual 的边界。给定候选 `Mike`、`Mike's Beijing trip`、
-`Mike's dietary preferences`、`John's diet habits`：
+以下例子补充说明 direct 与 contextual 的边界：
 
 
 | 新 memory | 应建立的 links |
 | --- | --- |
-| Mike likes eating apples | `Mike's dietary preferences` direct |
-| Mike bought a camera for the Beijing trip | `Mike's Beijing trip` direct |
+| Mike likes eating apples | 已有 `Mike's dietary preferences` 时 link 到它；否则使用或新建 `Mike` direct |
+| Mike bought a camera for the Beijing trip | 已有 `Mike's Beijing trip` 时 link 到它；否则使用或新建 `Mike` direct |
 | Mike is learning Spanish | `Mike` direct |
-| Mike and John are good friends | `Mike` direct，并新建 `John` direct |
-| Mike had dental implant surgery on 3 May 2024 | `Mike` direct；`Mike's dietary preferences` contextual |
+| Mike had dental implant surgery on 3 May 2024 | `Mike` direct；已有 `Mike's dietary preferences` 时 contextual |
 
 
 种牙是医疗事件，归属是 `Mike`；记忆正文完全不提饮食，但凭口腔手术会限制咀嚼、进食和
-饮酒的常识，应对 `Mike's dietary preferences` 建 `contextual`。表中把饮食 subject 列为
-给定候选，只为标明正确的 basis；仅凭种牙正文做被动召回，它与饮食偏好文本不相似，通常
-根本不会出现。友谊的归属是 Mike 和 John；没有 John 的 subject 时必须新建，
-不能挂到 `John's diet habits`。
+饮酒的常识，实际检索到 `Mike's dietary preferences` 时应对其建 `contextual`。仅凭种牙正文
+做被动召回，它与饮食偏好文本不相似，通常不会出现。
 
-主动关联检索用于找出被动召回因文本不相似而漏掉、但常识表明新记忆会改变或约束的另一主题。
-query 写成那个主题的名称，而不是复述新记忆：种牙检索 `Mike's dietary preferences`、
-`Mike's diet plan`；驾照停权检索 `Mike's travel plans`、`Mike's commute`；医院夜班检索
-`Mike's evening plans`、`Mike's sleep schedule`。搜到出行、饮食或睡眠 subject 时对其建
-`contextual`。每条新 memory 至多执行一次这种搜索。
+例如 new memory 是 `Mike recently had dental implant surgery` 时，query 可以写
+`Mike's dietary preferences, Mike's diet plan`，因为手术可能约束这些 subjects 描述的内容；
+new memory 是 `Mike plans to drive to Boston next weekend` 时，query 可以写
+`Mike's driving licence, Mike's driving restrictions`，因为这些 subjects 中的信息可能反过来
+约束新计划是否可行。每次 query 可以包含一个或多个可能的 subject 名称，整个 batch agent
+loop 仍最多调用 5 次主动检索。
 
 Linking 把这些记忆收进同一 subject 之后，并不改写旧正文。公开 search 按 memory content
 和 subject name 排序，每个 subject 只附带 1 条 memory，且仅 Subject 通道命中的 subject
@@ -924,8 +957,8 @@ Subject review（可改 memory 正文并重 embed）和最终 summary refresh（
 
 Prompt 建议每条 memory 通常建立 1--4 个 links，硬校验要求每条 memory 至少一个
 direct link，全部 active links 不超过 5。已有 subject 与其语义具体化 subject 同时
-成为候选时，direct 归属只选择该 memory 真正归属且更具体的一个；该规则不排除指向其他
-受影响 subject 的 contextual link。程序不校验或持久化 subject 的包含关系。
+成为候选时，direct 归属只选择该 memory 真正归属且更具体的一个；该规则不排除指向存在
+上述具体关系的其他 subject 的 contextual link。程序不校验或持久化 subject 的包含关系。
 
 每当新 memory 建立指向已有 subject 的 active link，原子 add 递增其 `new_memory_count`；新建
 subject 的初始计数为零。add 不 append memory content，也不更新 summary embedding；所有 link
@@ -943,6 +976,7 @@ subject 的初始计数为零。add 不 append memory content，也不更新 sum
 | `subject_review_new_memory_threshold` | 8   | 自上次成功 review/split 后新增到该 subject 的 memory 数量触发阈值    |
 | `review_provenance_memory_max`        | 8   | 一次 Subject review provenance request 最多指定的 memory 数 |
 | `memory_provenance_episode_max`       | 6   | 一个 memory version 最多关联的来源 episode 数                 |
+| `review_memory_content_max_chars`     | 800 | review 改写后的 memory content 字符硬上限                    |
 
 
 direct/contextual 使用同一计数；同一 memory-subject 对只计一次。review 读取该 subject
@@ -950,8 +984,9 @@ direct/contextual 使用同一计数；同一 memory-subject 对只计一次。r
 长度触发 review；本 episode 的统一 summary refresh 见本节末尾。
 
 审核输入包含 subject name，以及每条 active memory 的 ID、content、相对当前 subject 的
-link basis 和时间等必要元数据。审核允许保留、修改和全局退役 memory，不允许新建、拆分
-memory、调整 links 或读写 summary。修改创建新 memory version 并重算 content embedding；退役关闭该
+link basis 和 provenance episode IDs。审核允许保留、修改和全局退役 memory，不允许新建、拆分
+memory、调整 links 或读写 summary。修改创建新 memory version 并重算 content embedding；改写后的
+content 建议不超过 100 words，程序按 800 字符硬上限校验。退役关闭该
 memory 的全部 active links，使其退出候选、review、split、summary 和公开 search，但保留
 历史正文、provenance、links 与 operation。
 
@@ -960,20 +995,24 @@ subject 只附带 1 条 memory，且仅 Subject 通道命中时展示 summary。
 本 subject 内已有成员，使每条被保留的 memory 对将检索到它的 query 自洽，而不是把跨记忆
 关系只写在 summary 里。适用时：
 
-- 用兄妹记忆补全缺失的专名、地点或日期：一条写 “home country”、另一条点名 Sweden 时，
-把不完整的那条改写成含 Sweden，二者仍可独立更新则不得合并。
-- 把兄妹施加的约束写进被影响的那条，并带上时限：种牙限制饮酒时，改写饮酒偏好而不是把
-手术改成饮食事实。
+- 用兄妹记忆补全缺失的专名、地点或日期：已有 `Nora plans to return to her home country in
+  2027` 和 `Nora's home country is Sweden` 时，把前者改写为 `Nora plans to return to Sweden
+  in 2027`；两条 memory 可以独立变化，因此仍然分开。
+- 把兄妹施加的约束及其时限写入被影响的 memory：已有 `Mike enjoys drinking wine` 和
+  `Mike must avoid alcohol until 31 May 2024 while recovering from dental implant surgery`
+  时，把前者改写为 `Mike enjoys drinking wine but must avoid alcohol until 31 May 2024 while
+  recovering from dental implant surgery`。
 - 把将被计数或比较的平行实例改成可并列检索的句式，但不合并仍可分别完成的事项。
 - 在正文中上提类别词且不发明记忆不支持的实例：Bach 与 Mozart 写成古典音乐偏好，仍保留
 这两人。
 
-相对时间需要对齐、或仅凭 content 无法判断冲突是否真实时，先请求 provenance。
+仅凭 content 无法判断冲突、纠正、状态变化或信息归属时，才请求 provenance。返回的原始
+来源保留时间范围、时区和可用的逐消息时间，以解释其中的原始相对时间或明确的先后与纠正关系。
 
 审核进行一至两次结构化输出。`provenance_request` 与最终 `review` 是两个显式合法的
 结构化分支。首次请求的 `requested_provenance` 为 null；仅在 content 和元数据不足以解决
-重复、冲突、纠正、状态变化、信息归属或若干
-memory 必须共享的日期，且来源会改变判断时，首轮可以返回完整的 `provenance_request`
+重复、冲突、纠正、状态变化或信息归属，且来源会改变判断时，首轮可以返回完整的
+`provenance_request`
 结果。一次最多请求 8 个不同
 memory IDs，系统返回这些 memories 当前 provenance 涉及的全部 episodes，不设置
 `review_provenance_episode_max`。第二次请求的 `requested_provenance` 为 non-null，此时只能
@@ -995,10 +1034,14 @@ provenance 时，它表示包含 1--6 个不同有效 episode IDs 的完整替�
 其他 linked subjects。targets 归属于本 episode 的 add operation，并在结构性事务中持久化；
 同一 subject 只保留一个 target。
 
-每个 target 单独调用一次 LLM，输入只包含 subject name 和全部当前 active memories 的
-content 与时间，明确不提供 subject ID、memory ID、link basis 或旧 summary；输出是基于这些 memories 的完整新
-summary。提交时重新校验成员集合、memory content、link basis 和 `summary_revision`，随后
-整体替换 summary、更新 `name_summary` embedding，并原子标记 target 完成。refresh 不清零
+当 target 的 active links 数量小于等于 2 时，不调用 LLM，summary 直接设为单个
+空格 `" "`。其他 target 单独调用一次 LLM，输入只包含 subject name 和全部当前
+active memories 的 content，不提供 subject ID、memory ID、link basis、旧 summary 或 memory
+来源时间。新 summary 不得丢失 memories 支持的关键细节，并保留 content 中已有的绝对时间表述
+及其精度，不得重写为相对时间。新 summary 建议不超过 200 words，程序按 2,000 字符硬上限校验。
+
+提交时重新校验成员集合、memory content、link basis 和 `summary_revision`，随后整体
+替换 summary、更新 `name_summary` embedding，并原子标记 target 完成。refresh 不清零
 `new_memory_count`，因此不会延后后续 review。
 
 同一 episode 的不同 targets 最多并发 5 个；某个 refresh 失败时，其他已经开始的 refresh
@@ -1029,6 +1072,10 @@ active memory 数达到 24，或 latest contents 总字符数达到 8,000，即�
 最终关联的 memory 数量或总字符数，不设置硬容量、动态阈值、冷却期或封存状态。每次又有
 memory link 到已达到任一阈值的 subject 时，都重新尝试 split。
 
+split 输入只包含当前 subject 的 name，以及每条 active linked memory 的 `memory_id`、content
+和相对当前 subject 的 `link_basis`；不包含其他 subjects 或它们的 links。
+LLM 不输出不可见 links；程序在提交时自动保留它们，并据此校验最终 link 不变量。
+
 split 的结构化结果只能是 `full_split`、`partial_split` 或 `defer_split`，按以下排他顺序选择；
 仅在结构上能凑出分组不代表该分组具有组织意义：
 
@@ -1037,12 +1084,13 @@ split 的结构化结果只能是 `full_split`、`partial_split` 或 `defer_spli
 active memory 至少进入一个、最多进入两个新 subjects；原 subject 被完整替换并退役。不得为
 覆盖完整而把离群 memory 强塞进某组或创建 catch-all。
 - 无法 full split 时，**partial split** 仅用于 1--4 个有意义、可独立增长的群组已经突出，
-但其余 memories 没有共同的更细范围、仍需原粗粒度 subject 承接。它创建新 subjects，同时
-保留原 subject 的 ID、name 和 active 状态。LLM 只列出新 subjects 的 name，以及应移入
-它们的 memory IDs 和 link basis。程序取
-所有被列出 memory IDs 的并集，关闭它们指向原 subject 的 links；未被列出的 memories
-继续留在原 subject。移出集合必须非空且不是原集合，原 subject 至少保留一条 memory；
-不得为扩大新群组而把残余 memories 强行移出。
+  但其余 memories 没有共同的更细范围、仍需原粗粒度 subject 承接。它创建新 subjects，同时
+  保留原 subject 的 ID、name 和 active 状态。LLM 只列出新 subjects 的 name，以及应移入
+  它们的 memory IDs 和 link basis。程序取
+  所有被列出 memory IDs 的并集，关闭它们指向原 subject 的 links；未被列出的 memories
+  继续留在原 subject。移出集合必须非空且不是原集合，原 subject 至少保留一条 memory；
+  不得为扩大新群组而把残余 memories 强行移出，也不能仅为给某个新 subject 增加
+  contextual link 而列出本应留在原 subject 的残余 memory。
 - 以上两者都不适用时使用 **defer split**，包括没有连 3 条 memories 都能组成的连贯群组、
 有意义的分组会违反任一结果约束，或表面群组不是值得独立检索、更新和增长的稳定范围。它是合法
 业务结果，不修改 subjects、memories、links 或计数，并记录 warning；下次又有 memory
@@ -1059,16 +1107,21 @@ memory 到原 subject 的 link 由程序关闭，但它指向 split 范围之外
 
 分组依据是未来是否需要独立检索、更新和增长，而不是平均分配数量。日后同一问题需要同路
 检索的记忆应留在一起，例如搬家与点名来源国的事实、将被计数的平行实例；若必须拆开，保
-留仍成立的 contextual link。结果 name 应保留原
-主体锚点并表达具体领域、项目模块、事件阶段或人物关系；不得使用没有语义边界的 Other、
-Misc 等名称。结果 subjects 存在语义包含关系时，LLM 只把 memory 分配给它真正归属且更
-具体的一个；程序不校验或维护这种包含关系。所有新 links 的 `link_basis` 重新判断，不能
-继承原值；contextual memory 只进入仍有具体联系的新 subject。
+留仍成立的 contextual link。直接归属的 memories 决定新 subject 的范围与名称；contextual
+memories 只能在该范围成立后补充，不能单独成为新建 subject 的理由。结果 name 应保留原主体
+锚点并表达具体领域、项目模块、事件阶段或人物关系；不得使用没有语义边界的 Other、Misc 等
+名称，也不得仅按日期、一次性聚类或当前 memories 的摘要命名。结果 subjects 存在语义包含
+关系时，LLM 只把 memory 分配给它真正归属且更具体的一个；程序不校验或维护这种包含关系。
+所有新 links 的 `link_basis` 都相对新 subject 重新判断，不能继承输入中相对原 subject 的值；
+contextual memory 只进入仍有具体联系的新 subject。
 
-例如，原 subject `Mike` 中只有一组 memories 足以形成 `Mike's dietary preferences` 时，
-partial split 把这组 memories 移入新 subject，其余无共同具体领域的 memories 继续留在
-`Mike`。被移走的 memory 不再同时 link 到 `Mike`，但可以继续 link 到与本次 split 无关的
-其他 subjects。
+例如，原 subject `Mike` 中有三条饮食 memories 和三条旅行 memories，且它们覆盖全部内容
+时，可以 full split 为 `Mike's dietary preferences` 与 `Mike's travel plans`。如果另有一条
+无法与其他 memories 形成 health subject 的种牙记忆，则使用 partial split：饮食和旅行
+memories 移入新 subjects，种牙记忆不出现在输出中并继续留在 `Mike`。不能一边让它留在
+`Mike`，一边在本次 split 输出中把它 contextual link 到饮食 subject，因为任何被列出的
+memory 都会移出原 subject。如果至少三条 health memories 已形成稳定范围，种牙记忆可以
+direct link 到新的 health subject，并在确有饮食约束时 contextual link 到饮食 subject。
 
 full split 和 partial split 都在一个事务中提交新 subjects、name embeddings、refresh targets
 和 link 变化，memory content 与 provenance 不变；不读取或生成 summary。成功后所有结果
@@ -1150,7 +1203,10 @@ build、answer 和 score 分别从 `.env` 读取一组 generation provider 配�
 dimension、revision、API key、base URL 和 query/document encoding mode 配置。
 LongMemEval 输出 `question_id`/`hypothesis`，使用官方 `evaluate_qa.py` 的 yes/no LLM judge prompt。
 LoCoMo_refined 输出 `qa_id`/`predicted_answer`，使用官方 `refined` LLM judge prompt、token F1 和 BLEU-1；多个合法 reference 取最佳
-匹配。answer 阶段按数据集选择 prompt：LoCoMo_refined 要求短短语、尽量使用记忆原文、保持时间粒度并把相对时间锚定到记忆日期；LongMemEval 要求覆盖全部所需事实，并在有 `question_date` 时写入 `Current Date`。检索结果渲染为 subject 分组，每条 memory 带上 `latest_source_at` 对应的日期（`D Month YYYY`）。
+匹配。answer 阶段按数据集选择 prompt：LoCoMo_refined 要求短短语、尽量使用记忆原文、保持时间粒度，
+并在 memory 展示日期存在时以它解析相对时间；
+LongMemEval 要求覆盖全部所需事实，并在有 `question_date` 时写入 `Current Date`。检索结果
+渲染为 subject 分组，不把 memory 的 `latest_source_at` 渲染为事件日期。
 
 上述临时错误在所属操作内重试耗尽后暂停当前 memory space 的 benchmark 记忆构建流水线；
 `rate_limited` 或
@@ -1355,7 +1411,8 @@ subject groups：先保持 Subject 通道排名，再按 Memory 通道首次引�
 
 不设置最终 subject 数、memory 数、每 subject memory 数、返回文本总字符数、单条 summary
 字符数、单条 memory 返回字符数或超限最小保留数量。Public library 返回结构化结果；面向
-主 Agent 的文本仅是同一 subject-group 结构的确定性呈现。
+主 Agent 的文本仅是同一 subject-group 结构的确定性呈现。结构化 `SearchMemory` 保留
+`latest_source_at` 供调用方显式使用，默认文本不渲染该字段。
 
 #### 1.3.2 NumPy 精确扫描
 
@@ -1436,13 +1493,13 @@ Extraction 使用判别结果明确区分提取成功与“没有有价值的记
 形状，随后仍需返回覆盖整批 memories 的最终 linking 结果：
 
 ```json
-{"result": "association_search", "query": "the other topic this memory could change"}
+{"result": "association_search", "query": "likely Subject names"}
 ```
 
 程序校验所有临时引用、已有 IDs、每条 memory 的 direct link 和 link 数量约束，并在应用前
-验证 existing IDs 属于初始 `candidates` 或任一累积的 `association_search_results`。初始
-candidates 只包含 subject ID 和 name；主动结果保留详细的 Subject/Memory 双通道候选，但
-仍不包含 subject summary。
+验证 existing ID 属于初始 `candidates`，或属于该 memory 在累积
+`association_search_results` 中的候选。初始 candidates 只包含 subject ID 和 name；主动结果
+保留详细的 Subject/Memory 双通道候选，但仍不包含 subject summary。
 
 #### 1.4.3 Subject review
 
@@ -1496,7 +1553,6 @@ Full split 输出全部新 subjects 及其完整成员关系：
   "result": "full_split",
   "subjects": [
     {
-      "subject_ref": "new_subject_1",
       "name": "Mike's dietary preferences",
       "links": [
         {"memory_id": "memory-uuid-1", "basis": "direct"},
@@ -1505,7 +1561,6 @@ Full split 输出全部新 subjects 及其完整成员关系：
       ]
     },
     {
-      "subject_ref": "new_subject_2",
       "name": "Mike's travel plans",
       "links": [
         {"memory_id": "memory-uuid-4", "basis": "contextual"},
@@ -1525,7 +1580,6 @@ Partial split 只列出新 subjects 和要移走的 memories；原 subject 的�
   "result": "partial_split",
   "new_subjects": [
     {
-      "subject_ref": "new_subject_1",
       "name": "Mike's dietary preferences",
       "links": [
         {"memory_id": "memory-uuid-1", "basis": "direct"},
@@ -1551,9 +1605,13 @@ subject 缺少 direct，或移出后某条 memory 不再有任何 active direct�
 
 #### 1.4.5 Subject summary refresh
 
-输入仅包含 subject name，以及全部当前 active memories 的 content 和时间；不包含 subject
-ID、memory ID、link basis 或旧 summary。输出整体替换 summary。该阶段是唯一生成 subject
-summary 的阶段：
+当 subject 的 active links 数量小于等于 2 时，不调用 LLM，将 summary 设为单个
+空格 `" "`。其他 subject 的输入仅包含 subject name，以及全部当前 active memories
+的 content；不包含 subject ID、memory ID、link basis、旧 summary 或 memory 来源时间。输出整体替换
+summary：
+
+summary 必须与 memories 一致；若 memories 能确定事件的绝对时间，读者也必须能从 summary
+推断该时间，但允许在不产生歧义时使用相对时间，且不得丢失或虚构时间精度。
 
 ```json
 {
@@ -1562,11 +1620,11 @@ summary 的阶段：
 }
 ```
 
-同一 episode 的每个 target 使用独立输出和独立提交，最多并发 5 个。成功提交同时持久化
-target 完成状态；恢复时只为尚未完成且仍 active 的 targets 再次请求该输出。
+同一 episode 的每个 target 使用独立提交，最多并发 5 个。成功提交同时持久化 target
+完成状态；恢复时只处理尚未完成且仍 active 的 targets。
 
-空白、超出字符硬上限或包含额外字段的结果按结构化输出规则修复；合法提交必须重新校验输入
-快照仍与当前 subject 成员和 memory 内容一致。
+LLM 返回的空白、超出字符硬上限或包含额外字段的结果按结构化输出规则修复；合法提交必须重新
+校验输入快照仍与当前 subject 成员和 memory 内容一致。
 
 ## 2. 第一版正式版补充设计
 

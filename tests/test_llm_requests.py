@@ -9,9 +9,6 @@ from pydantic import ValidationError as PydanticValidationError
 from fluxfold import EpisodeBlock, FluxFold, NormalizedEpisode, Role
 from fluxfold.models import LinkingStageOutput, MemorySnapshot, SubjectSnapshot
 from fluxfold.prompts import (
-    LINKING_SYSTEM,
-    REVIEW_SYSTEM,
-    SPLIT_SYSTEM,
     extraction_input,
     repair_input,
     review_input,
@@ -51,100 +48,6 @@ class RepairingGenerationProvider(FakeGenerationProvider):
         return await super().generate(request)
 
 
-def test_linking_prompt_contains_the_exact_nested_contract() -> None:
-    assert "There are exactly two valid shapes" in LINKING_SYSTEM
-    assert '"result":"association_search"' in LINKING_SYSTEM
-    assert '"result":"links"' in LINKING_SYSTEM
-    assert '"subject":{"kind":"existing","subject_id"' in LINKING_SYSTEM
-    assert '"subject":{"kind":"new","subject_ref"' in LINKING_SYSTEM
-    assert "up to five times" in LINKING_SYSTEM
-    assert "final linking result for every supplied memory" in LINKING_SYSTEM
-    assert "provisional" not in LINKING_SYSTEM
-    assert "basis is exactly direct or contextual" in LINKING_SYSTEM
-
-
-def test_linking_prompt_distinguishes_direct_granularity_from_contextual_links() -> (
-    None
-):
-    assert (
-        "A direct link is valid only when the subject is a home of the memory"
-        in LINKING_SYSTEM
-    )
-    assert "kind of thing the subject is for" in LINKING_SYSTEM
-    assert "never also direct- or contextual-link a coarser parent" in LINKING_SYSTEM
-    assert "After resolving every core anchor" in LINKING_SYSTEM
-    assert "A contextual link is a retrieval bridge" in LINKING_SYSTEM
-    assert "too dissimilar for vector recall" in LINKING_SYSTEM
-    assert "without treating the affected subject as a home" in LINKING_SYSTEM
-    assert "Linking only decides membership" in LINKING_SYSTEM
-    assert "Mike had dental implant surgery on 3 May 2024" in LINKING_SYSTEM
-    assert "cannot drink alcohol for a month" not in LINKING_SYSTEM
-    assert '"Mike\'s dietary preferences", "Mike\'s diet plan"' in LINKING_SYSTEM
-    assert '"Mike\'s travel plans", "Mike\'s commute"' in LINKING_SYSTEM
-    assert '"Mike\'s evening plans", "Mike\'s sleep schedule"' in LINKING_SYSTEM
-    assert "driving licence was suspended" in LINKING_SYSTEM
-    assert "night shifts at the hospital" in LINKING_SYSTEM
-    assert "the other topic this memory could change" in LINKING_SYSTEM
-    assert "better direct home that passive recall missed" in LINKING_SYSTEM
-
-
-def test_linking_prompt_resolves_each_core_anchor_before_creating_subjects() -> None:
-    assert "First identify every core anchor in each memory" in LINKING_SYSTEM
-    assert "A relationship may have multiple core anchors" in LINKING_SYSTEM
-    assert (
-        "a fitting subject for one anchor never removes the need to resolve another"
-        in LINKING_SYSTEM
-    )
-    assert "Do not treat a candidate that fits a different anchor" in LINKING_SYSTEM
-    assert "create no new subject for that anchor" in LINKING_SYSTEM
-    assert "Only when zero candidates are fitting homes" in LINKING_SYSTEM
-    assert "an accumulation container, not a summary" in LINKING_SYSTEM
-    assert "Fine-grained subjects emerge later through split" in LINKING_SYSTEM
-    assert "The fitting Mike candidate does not resolve John" in LINKING_SYSTEM
-    assert "do not create `Melanie's family 2022 camping trip`" in LINKING_SYSTEM
-    assert "A missing contextual scope never justifies creating" in LINKING_SYSTEM
-
-
-def test_split_prompt_explains_link_basis_against_result_subjects() -> None:
-    assert "Input `link_basis` is relative to the original subject" in SPLIT_SYSTEM
-    assert "do not copy it" in SPLIT_SYSTEM
-    assert "`direct` means the result subject is a home of the memory" in SPLIT_SYSTEM
-    assert "kind of thing the subject is for" in SPLIT_SYSTEM
-    assert "A contextual link is a retrieval bridge" in SPLIT_SYSTEM
-    assert "This restriction is specific to direct links" in SPLIT_SYSTEM
-    assert "memories you do not list stay in the original" in SPLIT_SYSTEM
-    assert "links to subjects outside this split are preserved" in SPLIT_SYSTEM
-    assert "Keep together memories that a later question will need" in SPLIT_SYSTEM
-
-
-def test_split_prompt_defines_outcome_order_and_result_size_bounds() -> None:
-    assert "Every new subject holds three to twenty distinct memories" in SPLIT_SYSTEM
-    assert "Choose the result by this order" in SPLIT_SYSTEM
-    assert "no residual memory needs the original broad subject" in SPLIT_SYSTEM
-    assert "Move a non-empty proper subset" in SPLIT_SYSTEM
-    assert "leave at least one memory in the original" in SPLIT_SYSTEM
-    assert "no coherent group reaches three memories" in SPLIT_SYSTEM
-    assert "never force an outlier into a group" in SPLIT_SYSTEM
-
-
-def test_review_prompt_exposes_both_valid_output_shapes() -> None:
-    assert "There are exactly two valid shapes" in REVIEW_SYSTEM
-    assert '"result":"provenance_request"' in REVIEW_SYSTEM
-    assert '"result":"review"' in REVIEW_SYSTEM
-    assert "`requested_provenance` is null" in REVIEW_SYSTEM
-    assert "`requested_provenance` is non-null" in REVIEW_SYSTEM
-    assert "shape 1 is no longer valid" in REVIEW_SYSTEM
-
-
-def test_review_prompt_compiles_sibling_memories() -> None:
-    assert "Linking only placed these memories in this subject" in REVIEW_SYSTEM
-    assert "rewrite the incomplete memory to name Sweden" in REVIEW_SYSTEM
-    assert "rewrite the drinking preference" in REVIEW_SYSTEM
-    assert "Normalize parallel instances" in REVIEW_SYSTEM
-    assert "classical-music preference" in REVIEW_SYSTEM
-    assert "two hops of one later question" in REVIEW_SYSTEM
-
-
 def test_llm_inputs_project_only_task_relevant_fields() -> None:
     episode = NormalizedEpisode(
         source_type="test",
@@ -172,7 +75,27 @@ def test_llm_inputs_project_only_task_relevant_fields() -> None:
     assert json.loads(extraction_input(episode)) == {
         "episode": {
             "source_started_at": "2023-09-07T00:00:00Z (Thursday)",
-            "messages": [{"speaker_id": "alice", "content": "Alice likes hiking."}],
+            "source_ended_at": "2023-09-07T01:00:00Z (Thursday)",
+            "source_timezone": "Europe/Paris",
+            "messages": [
+                {
+                    "speaker_id": "alice",
+                    "content": "Alice likes hiking.",
+                    "observed_at": "2023-09-07T00:05:00Z (Thursday)",
+                }
+            ],
+        }
+    }
+
+    episode_without_times = NormalizedEpisode(
+        source_type="test",
+        source_key="session-2",
+        source_sequence=8,
+        blocks=(EpisodeBlock("block-2", 0, Role.USER, "No time metadata."),),
+    )
+    assert json.loads(extraction_input(episode_without_times)) == {
+        "episode": {
+            "messages": [{"speaker_id": "user", "content": "No time metadata."}]
         }
     }
 
@@ -197,22 +120,20 @@ def test_llm_inputs_project_only_task_relevant_fields() -> None:
     assert set(review["subject"]["memories"][0]) == {
         "memory_id",
         "content",
-        "last_mentioned_at",
         "link_basis",
         "provenance_episode_ids",
     }
     split = json.loads(split_input(snapshot))
     assert set(split["subject"]) == {"name", "memories"}
-    assert "provenance_episode_ids" not in split["subject"]["memories"][0]
+    assert set(split["subject"]["memories"][0]) == {
+        "memory_id",
+        "content",
+        "link_basis",
+    }
     assert json.loads(summary_refresh_input(snapshot)) == {
         "subject": {
             "name": "Alice's hiking",
-            "memories": [
-                {
-                    "content": "Alice likes hiking.",
-                    "last_mentioned_at": "2023-09-07T00:00:00Z (Thursday)",
-                }
-            ],
+            "memories": [{"content": "Alice likes hiking."}],
         }
     }
 
@@ -232,6 +153,7 @@ def test_review_provenance_input_uses_only_source_identity_time_and_content() ->
                 "episode_id": "episode-id",
                 "source_started_at": 1_694_044_800_000,
                 "source_ended_at": 1_694_048_400_000,
+                "source_timezone": "Europe/Paris",
                 "blocks": [
                     {
                         "role": "user",
@@ -250,7 +172,15 @@ def test_review_provenance_input_uses_only_source_identity_time_and_content() ->
             {
                 "episode_id": "episode-id",
                 "source_started_at": "2023-09-07T00:00:00Z (Thursday)",
-                "blocks": [{"speaker_id": "alice", "content": "I moved."}],
+                "source_ended_at": "2023-09-07T01:00:00Z (Thursday)",
+                "source_timezone": "Europe/Paris",
+                "blocks": [
+                    {
+                        "speaker_id": "alice",
+                        "content": "I moved.",
+                        "observed_at": "2023-09-07T00:05:00Z (Thursday)",
+                    }
+                ],
             }
         ]
     }

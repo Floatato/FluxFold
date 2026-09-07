@@ -13,7 +13,15 @@ from fluxfold.errors import (
     StageFailure,
     ValidationError,
 )
-from fluxfold.models import CandidateSubject
+from fluxfold.models import (
+    CandidateSubject,
+    KeepProvenance,
+    MemorySnapshot,
+    MemoryUpdateOutput,
+    ReplaceContent,
+    ReviewOutput,
+    SubjectSnapshot,
+)
 from fluxfold.providers import GenerationRequest, GenerationResponse
 from tests.fakes import FakeEmbeddingProvider, FakeGenerationProvider
 
@@ -36,6 +44,60 @@ def test_split_result_memory_minimum_cannot_exceed_maximum() -> None:
             subject_split_result_min_memories=4,
             subject_split_result_target_memory_max=3,
         )
+
+
+def test_review_replacement_content_character_limit(tmp_path) -> None:
+    async def scenario() -> None:
+        engine = await FluxFold.open(
+            db_path=str(tmp_path / "review-limit.sqlite3"),
+            generation_provider=FakeGenerationProvider(),
+            embedding_provider=FakeEmbeddingProvider(),
+        )
+        assert engine.config.review_memory_content_max_chars == 800
+        snapshot = SubjectSnapshot(
+            "subject-id",
+            "Alice",
+            None,
+            0,
+            0,
+            (
+                MemorySnapshot(
+                    "memory-id",
+                    "Alice likes hiking.",
+                    None,
+                    ("episode-id",),
+                    "direct",
+                ),
+            ),
+        )
+
+        def replacement(content: str) -> ReviewOutput:
+            return ReviewOutput(
+                result="review",
+                updates=[
+                    MemoryUpdateOutput(
+                        memory_id="memory-id",
+                        content_change=ReplaceContent(
+                            action="replace", content=content
+                        ),
+                        provenance_change=KeepProvenance(action="keep"),
+                    )
+                ],
+                retirements=[],
+            )
+
+        engine._validate_review(
+            replacement("A" * engine.config.review_memory_content_max_chars),
+            snapshot,
+        )
+        with pytest.raises(ValidationError, match="exceeds character limit"):
+            engine._validate_review(
+                replacement("A" * (engine.config.review_memory_content_max_chars + 1)),
+                snapshot,
+            )
+        await engine.close()
+
+    asyncio.run(scenario())
 
 
 def test_add_search_replay_and_source_conflict(tmp_path) -> None:
@@ -65,7 +127,7 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
         assert len(bank) == 1
         assert bank[0].space_key == "test:alice"
         assert [(subject.name, subject.summary) for subject in bank[0].subjects] == [
-            ("Alice's hiking", "Alice likes hiking.")
+            ("Alice's hiking", " ")
         ]
         assert bank[0].subjects[0].memory_contents == ("Alice likes hiking.",)
         statistics = engine.space_statistics(space.memory_space_id)
@@ -396,7 +458,7 @@ def test_link_agent_allows_five_association_search_calls(tmp_path) -> None:
 def test_episode_summary_refresh_concurrency_is_capped_at_five(tmp_path) -> None:
     class ConcurrentSummaries(FakeGenerationProvider):
         def __init__(self) -> None:
-            super().__init__(always_new_subject=True)
+            super().__init__()
             self.active_summaries = 0
             self.max_active_summaries = 0
 
@@ -409,14 +471,47 @@ def test_episode_summary_refresh_concurrency_is_capped_at_five(tmp_path) -> None
                             "result": "memories",
                             "memories": [
                                 {"content": f"Alice fact {index}."}
-                                for index in range(7)
+                                for index in range(21)
                             ],
                         }
                     ),
                     input_tokens=6,
                     output_tokens=4,
                     total_tokens=10,
-                    request_id="seven-memory-request",
+                    request_id="twenty-one-memory-request",
+                )
+            if request.stage == "subject_linking":
+                self.requests.append(request)
+                memories = json.loads(request.user_prompt)["new_memories"]
+                new_subjects = [
+                    {
+                        "subject_ref": f"alice_group_{index}",
+                        "name": f"Alice group {index}",
+                    }
+                    for index in range(7)
+                ]
+                return GenerationResponse(
+                    text=json.dumps(
+                        {
+                            "result": "links",
+                            "new_subjects": new_subjects,
+                            "links": [
+                                {
+                                    "memory_ref": memory["memory_ref"],
+                                    "subject": {
+                                        "kind": "new",
+                                        "subject_ref": f"alice_group_{index // 3}",
+                                    },
+                                    "basis": "direct",
+                                }
+                                for index, memory in enumerate(memories)
+                            ],
+                        }
+                    ),
+                    input_tokens=6,
+                    output_tokens=4,
+                    total_tokens=10,
+                    request_id="seven-subject-request",
                 )
             if request.stage == "subject_summary_refresh":
                 self.active_summaries += 1
@@ -556,7 +651,7 @@ def test_existing_subject_link_triggers_review(tmp_path) -> None:
     asyncio.run(scenario())
 
 
-def test_linked_existing_subject_summary_is_rewritten_without_old_summary(
+def test_small_subject_skips_summary_llm_until_it_has_three_links(
     tmp_path,
 ) -> None:
     async def scenario() -> None:
@@ -579,6 +674,21 @@ def test_linked_existing_subject_summary_is_rewritten_without_old_summary(
         )
 
         assert [item.operation for item in second.maintenance] == ["summary_refresh"]
+        assert not any(
+            item.stage == "subject_summary_refresh" for item in generation.requests
+        )
+        snapshot = engine._store.subject_snapshot(
+            space.memory_space_id,
+            engine._store.active_subject_ids(space.memory_space_id)[0],
+        )
+        assert snapshot.summary == " "
+        assert snapshot.new_memory_count == 1
+
+        third = await engine.add_episode(
+            space.memory_space_id, _episode("three", "Alice hikes on weekends.", 2)
+        )
+
+        assert [item.operation for item in third.maintenance] == ["summary_refresh"]
         request = [
             item
             for item in generation.requests
@@ -589,6 +699,7 @@ def test_linked_existing_subject_summary_is_rewritten_without_old_summary(
         assert {item["content"] for item in payload["subject"]["memories"]} == {
             "Alice likes hiking.",
             "Alice bought boots.",
+            "Alice hikes on weekends.",
         }
         snapshot = engine._store.subject_snapshot(
             space.memory_space_id,
@@ -596,7 +707,8 @@ def test_linked_existing_subject_summary_is_rewritten_without_old_summary(
         )
         assert "Alice likes hiking." in snapshot.summary
         assert "Alice bought boots." in snapshot.summary
-        assert snapshot.new_memory_count == 1
+        assert "Alice hikes on weekends." in snapshot.summary
+        assert snapshot.new_memory_count == 2
         await engine.close()
 
     asyncio.run(scenario())
@@ -676,7 +788,13 @@ def test_failed_summary_refresh_is_recovered_by_episode_replay(tmp_path) -> None
             event_sink=events.append,
         )
         space = await engine.create_or_open_space("test:resume-refresh")
-        episode = _episode("one", "Alice likes hiking.", 0)
+        await engine.add_episode(
+            space.memory_space_id, _episode("one", "Alice likes hiking.", 0)
+        )
+        await engine.add_episode(
+            space.memory_space_id, _episode("two", "Alice bought boots.", 1)
+        )
+        episode = _episode("three", "Alice hikes on weekends.", 2)
         with pytest.raises(StageFailure) as raised:
             await engine.add_episode(space.memory_space_id, episode)
         assert raised.value.error_class == ErrorClass.TRANSIENT_TRANSPORT
@@ -695,7 +813,7 @@ def test_failed_summary_refresh_is_recovered_by_episode_replay(tmp_path) -> None
         subject_id = engine._store.active_subject_ids(space.memory_space_id)[0]
         assert (
             engine._store.subject_snapshot(space.memory_space_id, subject_id).summary
-            is None
+            == " "
         )
         await engine.close()
 
@@ -713,15 +831,17 @@ def test_failed_summary_refresh_is_recovered_by_episode_replay(tmp_path) -> None
         }
         refreshed = resumed._store.subject_snapshot(space.memory_space_id, subject_id)
         assert "Alice likes hiking." in refreshed.summary
+        assert "Alice bought boots." in refreshed.summary
+        assert "Alice hikes on weekends." in refreshed.summary
         await resumed.close()
 
     asyncio.run(scenario())
 
 
 def test_replay_only_retries_unfinished_summary_refresh_targets(tmp_path) -> None:
-    class ThreeMemoriesWithOneRefreshFailure(FakeGenerationProvider):
+    class ThreeSubjectsWithOneRefreshFailure(FakeGenerationProvider):
         def __init__(self) -> None:
-            super().__init__(always_new_subject=True)
+            super().__init__()
 
         async def generate(self, request: GenerationRequest):
             if request.stage == "memory_extraction":
@@ -732,19 +852,54 @@ def test_replay_only_retries_unfinished_summary_refresh_targets(tmp_path) -> Non
                             "result": "memories",
                             "memories": [
                                 {"content": f"Alice fact {index}."}
-                                for index in range(3)
+                                for index in range(9)
                             ],
                         }
                     ),
                     input_tokens=6,
                     output_tokens=4,
                     total_tokens=10,
-                    request_id="three-memory-request",
+                    request_id="nine-memory-request",
+                )
+            if request.stage == "subject_linking":
+                self.requests.append(request)
+                memories = json.loads(request.user_prompt)["new_memories"]
+                new_subjects = [
+                    {
+                        "subject_ref": f"alice_group_{index}",
+                        "name": f"Alice group {index}",
+                    }
+                    for index in range(3)
+                ]
+                return GenerationResponse(
+                    text=json.dumps(
+                        {
+                            "result": "links",
+                            "new_subjects": new_subjects,
+                            "links": [
+                                {
+                                    "memory_ref": memory["memory_ref"],
+                                    "subject": {
+                                        "kind": "new",
+                                        "subject_ref": f"alice_group_{index // 3}",
+                                    },
+                                    "basis": "direct",
+                                }
+                                for index, memory in enumerate(memories)
+                            ],
+                        }
+                    ),
+                    input_tokens=6,
+                    output_tokens=4,
+                    total_tokens=10,
+                    request_id="three-subject-request",
                 )
             if request.stage == "subject_summary_refresh":
                 payload = json.loads(request.user_prompt)
-                content = payload["subject"]["memories"][0]["content"]
-                if content == "Alice fact 1.":
+                contents = {
+                    memory["content"] for memory in payload["subject"]["memories"]
+                }
+                if "Alice fact 3." in contents:
                     self.requests.append(request)
                     raise ProviderError(
                         ErrorClass.TRANSIENT_TRANSPORT,
@@ -754,7 +909,7 @@ def test_replay_only_retries_unfinished_summary_refresh_targets(tmp_path) -> Non
 
     async def scenario() -> None:
         database = tmp_path / "partial-refresh-replay.sqlite3"
-        generation = ThreeMemoriesWithOneRefreshFailure()
+        generation = ThreeSubjectsWithOneRefreshFailure()
         engine = await FluxFold.open(
             db_path=str(database),
             generation_provider=generation,
@@ -984,6 +1139,10 @@ def test_association_search_results_keep_the_detailed_candidate_view(tmp_path) -
             if request.stage == "subject_linking"
         ]
         assert len(linking_calls) == 3
+        final_payload = json.loads(linking_calls[-1].user_prompt)
+        assert "last_mentioned_at" not in json.dumps(
+            final_payload["association_search_results"]
+        )
         linking_events = [
             event
             for event in events

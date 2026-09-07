@@ -204,12 +204,10 @@ class FakeGenerationProvider:
                         "result": "full_split",
                         "subjects": [
                             {
-                                "subject_ref": "trails",
                                 "name": "Alice's hiking trails",
                                 "links": links,
                             },
                             {
-                                "subject_ref": "equipment",
                                 "name": "Alice's hiking equipment",
                                 "links": links,
                             },
@@ -227,12 +225,10 @@ class FakeGenerationProvider:
                         "result": "full_split",
                         "subjects": [
                             {
-                                "subject_ref": "trails",
                                 "name": "Alice's hiking trails",
                                 "links": links,
                             },
                             {
-                                "subject_ref": "equipment",
                                 "name": "Alice's hiking equipment",
                                 "links": links,
                             },
@@ -247,7 +243,6 @@ class FakeGenerationProvider:
                         "result": "full_split",
                         "subjects": [
                             {
-                                "subject_ref": "trails",
                                 "name": "Alice's hiking trails",
                                 "links": [
                                     {"memory_id": memory_id, "basis": "direct"}
@@ -255,7 +250,6 @@ class FakeGenerationProvider:
                                 ],
                             },
                             {
-                                "subject_ref": "equipment",
                                 "name": "Alice's hiking equipment",
                                 "links": [
                                     {"memory_id": memory_id, "basis": "direct"}
@@ -271,7 +265,6 @@ class FakeGenerationProvider:
                         "result": "partial_split",
                         "new_subjects": [
                             {
-                                "subject_ref": "equipment",
                                 "name": "Alice's hiking equipment",
                                 "links": [
                                     {"memory_id": memory_id, "basis": "direct"}

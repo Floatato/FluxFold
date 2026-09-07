@@ -1228,10 +1228,12 @@ class Store:
                             "episode_id": episode["episode_id"],
                             "source_started_at": episode["source_started_at"],
                             "source_ended_at": episode["source_ended_at"],
+                            "source_timezone": episode["source_timezone"],
                             "blocks": [
                                 {
                                     "speaker_id": block["speaker_id"] or block["role"],
                                     "content": block["content"],
+                                    "observed_at": block["observed_at"],
                                 }
                                 for block in blocks
                             ],

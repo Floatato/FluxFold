@@ -19,6 +19,7 @@ class FluxFoldConfig:
     subject_name_max_chars: int = 120
     generated_subject_summary_max_chars: int = 2_000
     memory_content_max_chars: int = 1_000
+    review_memory_content_max_chars: int = 800
     episode_message_max: int = 256
     episode_chars_max: int = 96_000
     message_chars_max: int = 32_000
@@ -65,6 +66,7 @@ class FluxFoldConfig:
     embedding_batch_size: int = 100
     embedding_request_timeout_seconds: float = 60
     embedding_batch_concurrency_per_operation: int = 4
+    subject_summary_refresh_llm_link_threshold: int = 2
     subject_summary_refresh_concurrency_per_episode: int = 5
     exact_scan_batch_rows: int = 8_192
     sqlite_busy_timeout_ms: int = 5_000
