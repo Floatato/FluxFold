@@ -144,6 +144,7 @@ class SearchSubject:
     subject_id: str
     name: str
     summary: str | None
+    similarity: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +152,7 @@ class SearchMemory:
     memory_id: str
     content: str
     latest_source_at: int | None
+    similarity: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +177,12 @@ class RankedMemoryRef:
 
 
 @dataclass(frozen=True, slots=True)
+class SearchSubjectGroup:
+    subject: SearchSubject
+    memories: tuple[SearchMemory, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class SearchResult:
     query: str
     subjects: tuple[SearchSubject, ...]
@@ -183,30 +191,85 @@ class SearchResult:
     subject_channel: tuple[RankedSubjectRef, ...]
     memory_channel: tuple[RankedMemoryRef, ...]
 
-    def render(self) -> str:
-        """Render one deduplicated group per subject in retrieval order."""
+    def displayed_groups(self) -> tuple[SearchSubjectGroup, ...]:
+        """Merge both retrieval channels into globally deduplicated groups."""
 
+        subjects = {item.subject_id: item for item in self.subjects}
         memories = {item.memory_id: item for item in self.memories}
-        grouped_memory_ids: dict[str, list[str]] = {
-            subject.subject_id: [] for subject in self.subjects
-        }
+        direct_subject_ids = {item.subject_id for item in self.subject_channel}
+        candidate_subject_ids: dict[str, set[str]] = {}
+
         for hit in self.subject_channel:
-            grouped_memory_ids[hit.subject_id].extend(hit.attached_memory_ids)
+            for memory_id in hit.attached_memory_ids:
+                candidate_subject_ids.setdefault(memory_id, set()).add(hit.subject_id)
         for memory_hit in self.memory_channel:
             for subject_id in memory_hit.attached_subject_ids:
-                grouped_memory_ids[subject_id].append(memory_hit.memory_id)
+                candidate_subject_ids.setdefault(memory_hit.memory_id, set()).add(
+                    subject_id
+                )
+
+        grouped_memory_ids: dict[str, list[str]] = {
+            subject_id: [] for subject_id in direct_subject_ids
+        }
+        for memory_id, candidates in candidate_subject_ids.items():
+            if memory_id not in memories:
+                continue
+            eligible = [
+                subject_id for subject_id in candidates if subject_id in subjects
+            ]
+            if not eligible:
+                continue
+            winner = min(
+                eligible,
+                key=lambda subject_id: (
+                    -subjects[subject_id].similarity,
+                    subject_id,
+                ),
+            )
+            grouped_memory_ids.setdefault(winner, []).append(memory_id)
+
+        ordered_subject_ids = sorted(
+            grouped_memory_ids,
+            key=lambda subject_id: (-subjects[subject_id].similarity, subject_id),
+        )
+        return tuple(
+            SearchSubjectGroup(
+                (
+                    subjects[subject_id]
+                    if subject_id in direct_subject_ids
+                    or subjects[subject_id].summary is None
+                    else SearchSubject(
+                        subject_id,
+                        subjects[subject_id].name,
+                        None,
+                        subjects[subject_id].similarity,
+                    )
+                ),
+                tuple(
+                    memories[memory_id]
+                    for memory_id in sorted(
+                        grouped_memory_ids[subject_id],
+                        key=lambda memory_id: (
+                            -memories[memory_id].similarity,
+                            memory_id,
+                        ),
+                    )
+                ),
+            )
+            for subject_id in ordered_subject_ids
+        )
+
+    def render(self) -> str:
+        """Render the globally deduplicated subject groups shown to the LLM."""
 
         lines = ["Subject groups:"]
-        for subject in self.subjects:
+        for group in self.displayed_groups():
+            subject = group.subject
             lines.append(f"- Subject: {subject.name}")
             if subject.summary is not None:
                 lines.append(f"  Summary: {subject.summary}")
-            seen: set[str] = set()
-            for memory_id in grouped_memory_ids[subject.subject_id]:
-                if memory_id not in seen:
-                    seen.add(memory_id)
-                    memory = memories[memory_id]
-                    lines.append(f"  Memory: {memory.content}")
+            for memory in group.memories:
+                lines.append(f"  Memory: {memory.content}")
         return "\n".join(lines)
 
 

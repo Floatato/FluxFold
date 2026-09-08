@@ -77,8 +77,6 @@ class FluxFoldConfig:
     benchmark_memory_space_build_concurrency: int = 10
     benchmark_search_concurrency: int = 5
     benchmark_seed: int = 42
-    benchmark_memory_space_build_timeout_seconds: float = 7_200
-    benchmark_search_sample_timeout_seconds: float = 300
     benchmark_checkpoint_interval_items: int = 1
 
     def __post_init__(self) -> None:

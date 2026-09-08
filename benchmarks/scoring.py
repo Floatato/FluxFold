@@ -71,7 +71,6 @@ async def score_predictions(
     predictions: dict[str, str],
     provider: GenerationProvider,
     concurrency: int,
-    timeout_seconds: float,
     seed: int,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     semaphore = asyncio.Semaphore(concurrency)
@@ -115,7 +114,6 @@ async def score_predictions(
                             stage="benchmark_judge",
                             user_prompt=prompt,
                             temperature=0.0,
-                            timeout_seconds=timeout_seconds,
                             seed=seed,
                         )
                     )

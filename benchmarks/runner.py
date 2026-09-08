@@ -10,7 +10,13 @@ from pathlib import Path
 from uuid import uuid4
 
 from benchmarks.adapters import BenchmarkSpace, load_locomo, load_longmemeval
-from benchmarks.artifacts import ArtifactWriter, RunPaths, append_jsonl
+from benchmarks.artifacts import (
+    ArtifactWriter,
+    RunPaths,
+    append_jsonl,
+    load_jsonl,
+    write_search_artifacts,
+)
 from benchmarks.runtime import (
     dataset_hash,
     embedding_provider,
@@ -61,9 +67,8 @@ async def build_run(
         "benchmark_seed": config.benchmark_seed,
         "source_timezone_convention": "UTC",
     }
-    if run_paths.manifest.exists():
-        if existing_manifest != manifest:
-            raise ValidationError("run manifest differs from the existing build")
+    if existing_manifest is not None:
+        _ensure_resume_matches_manifest(existing_manifest, manifest)
     else:
         writer.write_json(run_paths.manifest, manifest)
     writer.run_id = run_id
@@ -113,80 +118,58 @@ async def build_run(
             )
             return
         async with semaphore:
-
-            async def work() -> None:
-                memory_space = await engine.create_or_open_space(space.space_key)
-                writer.event(
-                    {
-                        "event_type": "memory_space_build_started",
-                        "severity": "info",
-                        "timestamp_ms": int(time.time() * 1000),
-                        "space_key": space.space_key,
-                        "memory_space_id": memory_space.memory_space_id,
-                    }
-                )
-                last_completed_sequence = int(
-                    last_episode_by_space.get(space.source_id, -1)
-                )
-                pending_episodes = tuple(
-                    episode
-                    for episode in space.episodes
-                    if episode.source_sequence > last_completed_sequence
-                )
-                for episode in pending_episodes:
-                    result, failure = await _finish_add_item(
-                        engine=engine,
-                        memory_space_id=memory_space.memory_space_id,
-                        episode=episode,
-                        writer=writer,
-                    )
-                    if result is None:
-                        assert failure is not None
-                        writer.audit_episode_failure(
-                            space.space_key,
-                            memory_space.memory_space_id,
-                            episode,
-                            failure.error_class.value,
-                            failure.message,
-                        )
-                    else:
-                        writer.audit_episode(
-                            space.space_key,
-                            memory_space.memory_space_id,
-                            episode,
-                            result,
-                        )
-                    async with completed_lock:
-                        last_episode_by_space[space.source_id] = episode.source_sequence
-                        if result is not None:
-                            _write_memory_bank(
-                                writer,
-                                engine,
-                                updated_after=(
-                                    f"episode `{episode.source_key}` in "
-                                    f"`{space.space_key}` (source sequence "
-                                    f"{episode.source_sequence})"
-                                ),
-                            )
-                        persist_progress()
-                summary[space.source_id] = engine.space_statistics(
-                    memory_space.memory_space_id
+            memory_space = await engine.create_or_open_space(space.space_key)
+            writer.event(
+                {
+                    "event_type": "memory_space_build_started",
+                    "severity": "info",
+                    "timestamp_ms": int(time.time() * 1000),
+                    "space_key": space.space_key,
+                    "memory_space_id": memory_space.memory_space_id,
+                }
+            )
+            last_completed_sequence = int(
+                last_episode_by_space.get(space.source_id, -1)
+            )
+            pending_episodes = tuple(
+                episode
+                for episode in space.episodes
+                if episode.source_sequence > last_completed_sequence
+            )
+            for episode in pending_episodes:
+                result, _ = await _finish_add_item(
+                    engine=engine,
+                    memory_space_id=memory_space.memory_space_id,
+                    episode=episode,
+                    writer=writer,
                 )
                 async with completed_lock:
-                    completed.add(space.source_id)
+                    last_episode_by_space[space.source_id] = episode.source_sequence
+                    if result is not None:
+                        _write_memory_bank(
+                            writer,
+                            engine,
+                            updated_after=(
+                                f"episode `{episode.source_key}` in "
+                                f"`{space.space_key}` (source sequence "
+                                f"{episode.source_sequence})"
+                            ),
+                        )
                     persist_progress()
-                writer.event(
-                    {
-                        "event_type": "memory_space_build_completed",
-                        "severity": "info",
-                        "timestamp_ms": int(time.time() * 1000),
-                        "space_key": space.space_key,
-                        "memory_space_id": memory_space.memory_space_id,
-                    }
-                )
-
-            await asyncio.wait_for(
-                work(), timeout=config.benchmark_memory_space_build_timeout_seconds
+            summary[space.source_id] = engine.space_statistics(
+                memory_space.memory_space_id
+            )
+            async with completed_lock:
+                completed.add(space.source_id)
+                persist_progress()
+            writer.event(
+                {
+                    "event_type": "memory_space_build_completed",
+                    "severity": "info",
+                    "timestamp_ms": int(time.time() * 1000),
+                    "space_key": space.space_key,
+                    "memory_space_id": memory_space.memory_space_id,
+                }
             )
 
     try:
@@ -205,6 +188,10 @@ async def answer_run(
     config: FluxFoldConfig,
 ) -> None:
     _validate_manifest(run_paths, dataset, spaces)
+    questions = tuple(question for space in spaces for question in space.questions)
+    query_numbers = {
+        question.question_id: index for index, question in enumerate(questions, start=1)
+    }
     completed = _completed_question_ids(run_paths.predictions, dataset)
     pending = [
         (space, question_index)
@@ -213,6 +200,7 @@ async def answer_run(
         if space.questions[question_index].question_id not in completed
     ]
     if not pending:
+        write_search_artifacts(run_paths, load_jsonl(run_paths.search_records))
         return
     generation = generation_provider(config, stage="answer")
     embedding = embedding_provider(config)
@@ -234,24 +222,25 @@ async def answer_run(
         question = space.questions[question_index]
         memory_space = opened_spaces[space.space_key]
 
-        async def work() -> tuple[dict[str, object], dict[str, object]]:
+        async with semaphore:
             started = time.perf_counter()
             result = await engine.search(
                 memory_space.memory_space_id, question.question
             )
             search_latency = time.perf_counter() - started
-            prompt = _answer_user_prompt(
-                dataset, question.question, question.question_date, result.render()
+            search_text = result.render()
+            request = GenerationRequest(
+                stage="benchmark_answer",
+                user_prompt=_answer_user_prompt(
+                    dataset,
+                    question.question,
+                    question.question_date,
+                    search_text,
+                ),
+                temperature=0.0,
+                seed=config.benchmark_seed,
             )
-            response = await generation.generate(
-                GenerationRequest(
-                    stage="benchmark_answer",
-                    user_prompt=prompt,
-                    temperature=0.0,
-                    timeout_seconds=config.benchmark_search_sample_timeout_seconds,
-                    seed=config.benchmark_seed,
-                )
-            )
+            response = await generation.generate(request)
             prediction = (
                 {"question_id": question.question_id, "hypothesis": response.text}
                 if dataset == "longmemeval"
@@ -260,21 +249,50 @@ async def answer_run(
                     "predicted_answer": response.text,
                 }
             )
-            search_record = {
+            direct_subject_ids = {hit.subject_id for hit in result.subject_channel}
+            direct_memory_ids = {hit.memory_id for hit in result.memory_channel}
+            query_number = query_numbers[question.question_id]
+            search_record: dict[str, object] = {
                 "question_id": question.question_id,
-                "space_key": space.space_key,
+                "query_number": query_number,
+                "query": question.question,
                 "search_latency_seconds": search_latency,
-                "search_result": asdict(result),
+                "answer_llm_input_tokens": response.input_tokens,
+                "rendered_context_chars": len(search_text),
+                "groups": [
+                    {
+                        "name": group.subject.name,
+                        "summary": group.subject.summary,
+                        "similarity": group.subject.similarity,
+                        "route": (
+                            "direct subject hit"
+                            if group.subject.subject_id in direct_subject_ids
+                            else "attached through memory"
+                        ),
+                        "memories": [
+                            {
+                                "content": memory.content,
+                                "similarity": memory.similarity,
+                                "route": (
+                                    "direct memory hit"
+                                    if memory.memory_id in direct_memory_ids
+                                    else "attached through subject"
+                                ),
+                            }
+                            for memory in group.memories
+                        ],
+                    }
+                    for group in result.displayed_groups()
+                ],
             }
-            return prediction, search_record
-
-        async with semaphore:
-            prediction, search_record = await asyncio.wait_for(
-                work(), timeout=config.benchmark_search_sample_timeout_seconds
-            )
+            if query_number <= 3:
+                search_record["answer_input_sample"] = {
+                    "system_prompt": request.system_prompt,
+                    "user_prompt": request.user_prompt,
+                }
         async with write_lock:
             append_jsonl(run_paths.predictions, prediction)
-            append_jsonl(run_paths.search_results, search_record)
+            append_jsonl(run_paths.search_records, search_record)
 
     try:
         await asyncio.gather(
@@ -282,6 +300,7 @@ async def answer_run(
         )
     finally:
         await engine.close()
+        write_search_artifacts(run_paths, load_jsonl(run_paths.search_records))
 
 
 async def score_run(
@@ -302,7 +321,6 @@ async def score_run(
             predictions=predictions,
             provider=generation,
             concurrency=config.benchmark_search_concurrency,
-            timeout_seconds=config.benchmark_search_sample_timeout_seconds,
             seed=config.benchmark_seed,
         )
     finally:
@@ -338,6 +356,27 @@ def _load_dataset(dataset: str, paths: tuple[str, ...]) -> tuple[BenchmarkSpace,
     if len(paths) != 2:
         raise ValidationError("LoCoMo requires conversations and questions paths")
     return load_locomo(paths[0], paths[1])
+
+
+_RESUME_IDENTITY_FIELDS = (
+    "manifest_version",
+    "dataset",
+    "mode",
+    "dataset_hash",
+    "selected_space_ids",
+    "build_model",
+    "embedding_model",
+    "benchmark_seed",
+    "source_timezone_convention",
+)
+
+
+def _ensure_resume_matches_manifest(
+    existing: dict[str, object], current: dict[str, object]
+) -> None:
+    for field in _RESUME_IDENTITY_FIELDS:
+        if existing.get(field) != current.get(field):
+            raise ValidationError("run manifest differs from the existing build")
 
 
 def _validate_manifest(

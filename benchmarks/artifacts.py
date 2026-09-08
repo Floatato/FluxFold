@@ -3,28 +3,25 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import threading
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from fluxfold.engine import LLM_IO_SAMPLE_QUOTAS
-from fluxfold.models import AddResult, MemoryBankSpace, NormalizedEpisode
+from fluxfold.models import MemoryBankSpace
 
 _LLM_IO_SAMPLE_HEADING = re.compile(r"^## ([a-z_]+) · sample (\d+)\s*$")
 _LLM_IO_SAMPLE_HEADER = """# LLM I/O samples
 
-Sampled first-attempt structured-output successes: the complete system prompt, user prompt, and model output.
+Each LLM call that returns model output has an independent 10% chance of being sampled. Each sample contains only the user prompt and model output.
 
-Quotas: extract, link (no `association_search`), review (no `provenance_viewed`), split, and summary ×2. A complete `association_search` agent loop (2–6 rounds) and a two-round `provenance_viewed` path are sampled once each if they occur.
+Quotas: extract, link (no `association_search`), review, split, and summary ×10; link with `association_search` ×5. For a link agent loop that uses `association_search`, only the final linking decision is eligible.
 
 """
-_REVIEW_PROVENANCE_TITLES = (
-    "Round 1 — provenance request",
-    "Round 2 — final review decision",
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,10 +39,6 @@ class RunPaths:
     @property
     def events(self) -> Path:
         return self.root / "build_events.jsonl"
-
-    @property
-    def audit(self) -> Path:
-        return self.root / "build_audit.md"
 
     @property
     def llm_io_samples(self) -> Path:
@@ -68,8 +61,20 @@ class RunPaths:
         return self.root / "predictions.jsonl"
 
     @property
-    def search_results(self) -> Path:
-        return self.root / "search_results.jsonl"
+    def search_records(self) -> Path:
+        return self.root / "search_records.jsonl"
+
+    @property
+    def search_summary(self) -> Path:
+        return self.root / "search_summary.json"
+
+    @property
+    def search_audit(self) -> Path:
+        return self.root / "search_audit.md"
+
+    @property
+    def answer_llm_input_samples(self) -> Path:
+        return self.root / "answer_llm_input_samples.md"
 
     @property
     def scores(self) -> Path:
@@ -90,7 +95,6 @@ class ArtifactWriter:
         paths.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self.run_id: str | None = None
-        self._pending_audit: dict[str, list[dict[str, object]]] = {}
         self._successful_llm_calls = 0
         self._failed_llm_calls = 0
         self._llm_input_tokens = 0
@@ -109,10 +113,6 @@ class ArtifactWriter:
             self._accept_llm_io_sample(event)
             return
         with self._lock:
-            if event_type.startswith("audit_"):
-                memory_space_id = str(event["memory_space_id"])
-                self._pending_audit.setdefault(memory_space_id, []).append(event)
-                return
             if self.run_id is not None:
                 event = {"run_id": self.run_id, **event}
             self._count_event(event)
@@ -123,8 +123,6 @@ class ArtifactWriter:
 
     def _accept_llm_io_sample(self, event: dict[str, object]) -> None:
         kind = str(event["kind"])
-        rounds = event["rounds"]
-        assert isinstance(rounds, list)
         with self._lock:
             if self._llm_io_sample_counts[kind] >= LLM_IO_SAMPLE_QUOTAS[kind]:
                 return
@@ -138,59 +136,10 @@ class ArtifactWriter:
                     _render_llm_io_sample(
                         kind,
                         index,
-                        tuple(rounds),
-                        run_id=self.run_id,
-                        timestamp_ms=event.get("timestamp_ms"),
+                        str(event["user_prompt"]),
+                        str(event["output"]),
                     )
                 )
-
-    def audit_episode(
-        self,
-        space_key: str,
-        memory_space_id: str,
-        episode: NormalizedEpisode,
-        result: AddResult,
-    ) -> None:
-        lines = [
-            f"## Episode `{episode.source_key}` in `{space_key}`",
-            "",
-            f"Source sequence: {episode.source_sequence}",
-            "",
-        ]
-        for block in episode.blocks:
-            speaker = f" / {block.speaker_name}" if block.speaker_name else ""
-            lines.extend(
-                [
-                    f"### {block.sequence_no}. {block.role.value}{speaker}",
-                    "",
-                    block.content,
-                    "",
-                ]
-            )
-        lines.extend(
-            [
-                "### Commit result",
-                "",
-                "```json",
-                json.dumps(asdict(result), ensure_ascii=False, indent=2),
-                "```",
-                "",
-            ]
-        )
-        with self._lock:
-            for decision in self._pending_audit.pop(memory_space_id, []):
-                lines.extend(
-                    [
-                        f"### {str(decision['event_type']).replace('_', ' ').title()}",
-                        "",
-                        "```json",
-                        json.dumps(decision, ensure_ascii=False, indent=2),
-                        "```",
-                        "",
-                    ]
-                )
-            with self.paths.audit.open("a", encoding="utf-8") as handle:
-                handle.write("\n".join(lines))
 
     def build_metrics(self) -> dict[str, int]:
         with self._lock:
@@ -219,44 +168,6 @@ class ArtifactWriter:
         }:
             self._terminal_failures += 1
 
-    def audit_episode_failure(
-        self,
-        space_key: str,
-        memory_space_id: str,
-        episode: NormalizedEpisode,
-        error_class: str,
-        reason: str,
-    ) -> None:
-        lines = [
-            f"## Episode `{episode.source_key}` in `{space_key}`",
-            "",
-            f"Source sequence: {episode.source_sequence}",
-            "",
-        ]
-        for block in episode.blocks:
-            speaker = f" / {block.speaker_name}" if block.speaker_name else ""
-            lines.extend(
-                [
-                    f"### {block.sequence_no}. {block.role.value}{speaker}",
-                    "",
-                    block.content,
-                    "",
-                ]
-            )
-        lines.extend(
-            [
-                "### Terminal failure",
-                "",
-                f"- Error class: `{error_class}`",
-                f"- Reason: {reason}",
-                "",
-            ]
-        )
-        with self._lock:
-            self._pending_audit.pop(memory_space_id, None)
-            with self.paths.audit.open("a", encoding="utf-8") as handle:
-                handle.write("\n".join(lines))
-
     def write_memory_bank(
         self,
         spaces: tuple[MemoryBankSpace, ...],
@@ -283,6 +194,203 @@ class ArtifactWriter:
 def append_jsonl(path: Path, value: dict[str, object]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def load_jsonl(path: Path) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def write_search_artifacts(paths: RunPaths, records: list[dict[str, object]]) -> None:
+    ordered = sorted(records, key=lambda record: int(record["query_number"]))
+    ArtifactWriter(paths).write_json(paths.search_summary, _search_summary(ordered))
+    _write_text(paths.search_audit, _render_search_audit(ordered))
+    _write_text(
+        paths.answer_llm_input_samples,
+        _render_answer_llm_input_samples(ordered),
+    )
+
+
+def _search_summary(records: list[dict[str, object]]) -> dict[str, object]:
+    latencies = [float(record["search_latency_seconds"]) for record in records]
+    answer_tokens = [int(record["answer_llm_input_tokens"]) for record in records]
+    summary_chars: list[int] = []
+    memory_chars: list[int] = []
+    context_chars: list[int] = []
+    subject_counts: list[int] = []
+    summary_counts: list[int] = []
+    memory_counts: list[int] = []
+    subject_similarities: list[list[float]] = []
+    memory_similarities: list[list[float]] = []
+
+    for record in records:
+        groups = list(record["groups"])
+        summaries = [
+            str(group["summary"]) for group in groups if group["summary"] is not None
+        ]
+        memories = [memory for group in groups for memory in list(group["memories"])]
+        summary_chars.append(sum(len(summary) for summary in summaries))
+        memory_chars.append(sum(len(str(memory["content"])) for memory in memories))
+        context_chars.append(int(record["rendered_context_chars"]))
+        subject_counts.append(len(groups))
+        summary_counts.append(len(summaries))
+        memory_counts.append(len(memories))
+        subject_similarities.append([float(group["similarity"]) for group in groups])
+        memory_similarities.append([float(memory["similarity"]) for memory in memories])
+
+    return {
+        "search_latency_seconds": {
+            "mean": _mean(latencies),
+            "p50": _percentile(latencies, 0.5),
+            "p90": _percentile(latencies, 0.9),
+            "max": max(latencies, default=None),
+        },
+        "answer_llm_input_tokens_per_query": _mean_min_max(answer_tokens),
+        "summary_chars_per_query": _mean_min_max(summary_chars),
+        "memory_content_chars_per_query": _mean_min_max(memory_chars),
+        "rendered_context_chars_per_query": _mean_min_max(context_chars),
+        "subject_retrieval_similarity": _retrieval_similarity_summary(
+            subject_similarities
+        ),
+        "memory_retrieval_similarity": _retrieval_similarity_summary(
+            memory_similarities
+        ),
+        "returned_per_query": {
+            "subjects_mean": _mean(subject_counts),
+            "summaries_mean": _mean(summary_counts),
+            "memories_mean": _mean(memory_counts),
+        },
+    }
+
+
+def _retrieval_similarity_summary(
+    per_query: list[list[float]],
+) -> dict[str, object]:
+    nonempty = [values for values in per_query if values]
+    return {
+        "per_query_top1": _mean_min_max([max(values) for values in nonempty]),
+        "per_query_mean": _mean_min_max(
+            [sum(values) / len(values) for values in nonempty]
+        ),
+        "per_query_min": _mean_min_max([min(values) for values in nonempty]),
+    }
+
+
+def _mean_min_max(values: list[int] | list[float]) -> dict[str, object]:
+    return {
+        "mean": _mean(values),
+        "max": max(values, default=None),
+        "min": min(values, default=None),
+    }
+
+
+def _mean(values: list[int] | list[float]) -> float | None:
+    return None if not values else sum(values) / len(values)
+
+
+def _percentile(values: list[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def _render_search_audit(records: list[dict[str, object]]) -> str:
+    lines = ["# Search audit", ""]
+    for record in records:
+        groups = list(record["groups"])
+        summary_count = sum(group["summary"] is not None for group in groups)
+        memory_count = sum(len(list(group["memories"])) for group in groups)
+        lines.extend(
+            [
+                f"## Query {record['query_number']}",
+                "",
+                "**Question**",
+                "",
+                *_blockquote(str(record["query"])),
+                "",
+                (
+                    f"- Displayed: {len(groups)} subjects · {summary_count} "
+                    f"summaries · {memory_count} memories"
+                ),
+                "",
+            ]
+        )
+        for index, group in enumerate(groups, start=1):
+            lines.extend(
+                [
+                    f"### {index}. {_heading_text(str(group['name']))}",
+                    "",
+                    f"- Subject name similarity: `{float(group['similarity']):.4f}`",
+                    f"- Retrieval route: `{group['route']}`",
+                ]
+            )
+            if group["summary"] is not None:
+                lines.extend(_field_lines("Summary", str(group["summary"])))
+            lines.extend(["", "#### Memories", ""])
+            for memory_index, memory in enumerate(list(group["memories"]), start=1):
+                lines.extend(
+                    [
+                        (
+                            f"{memory_index}. Similarity "
+                            f"`{float(memory['similarity']):.4f}` · "
+                            f"{memory['route']}"
+                        ),
+                        *_blockquote(str(memory["content"]), indent="   "),
+                        "",
+                    ]
+                )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_answer_llm_input_samples(records: list[dict[str, object]]) -> str:
+    lines = ["# Answer LLM input samples", ""]
+    samples = [
+        record["answer_input_sample"]
+        for record in records
+        if "answer_input_sample" in record
+    ][:3]
+    for index, sample in enumerate(samples, start=1):
+        lines.extend([f"## Sample {index}", "", "### System prompt", ""])
+        system_prompt = sample["system_prompt"]
+        if system_prompt is None:
+            lines.extend(["_(none)_", ""])
+        else:
+            lines.extend([_markdown_fence(str(system_prompt), ""), ""])
+        lines.extend(
+            [
+                "### User prompt",
+                "",
+                _markdown_fence(str(sample["user_prompt"]), ""),
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _field_lines(name: str, value: str) -> list[str]:
+    parts = value.splitlines() or [""]
+    return [f"- {name}: {parts[0]}", *(f"  {part}" for part in parts[1:])]
+
+
+def _blockquote(value: str, *, indent: str = "") -> list[str]:
+    return [f"{indent}> {line}" for line in (value.splitlines() or [""])]
+
+
+def _write_text(path: Path, value: str) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(value, encoding="utf-8")
+    temporary.replace(path)
 
 
 def _render_memory_bank(
@@ -340,63 +448,14 @@ def _llm_io_sample_counts(path: Path) -> Counter[str]:
 def _render_llm_io_sample(
     kind: str,
     index: int,
-    rounds: tuple[object, ...],
-    *,
-    run_id: str | None,
-    timestamp_ms: object,
+    user_prompt: str,
+    output: str,
 ) -> str:
     lines = [f"## {kind} · sample {index}", ""]
-    if run_id is not None:
-        lines.append(f"- run_id: `{run_id}`")
-    if timestamp_ms is not None:
-        lines.append(f"- timestamp_ms: `{timestamp_ms}`")
-    round_count = len(rounds)
-    for position, round_payload in enumerate(rounds):
-        assert isinstance(round_payload, dict)
-        heading = _round_heading(kind, position, round_count)
-        if heading is not None:
-            lines.extend(["", f"### {heading}", ""])
-        request_id = round_payload.get("request_id")
-        stage = round_payload.get("stage")
-        meta: list[str] = []
-        if stage is not None:
-            meta.append(f"- stage: `{stage}`")
-        if request_id is not None:
-            meta.append(f"- request_id: `{request_id}`")
-        if meta:
-            lines.extend([*meta, ""])
-        heading_prefix = "#### " if heading is not None else "### "
-        lines.extend(
-            _prompt_section(
-                f"{heading_prefix}System prompt",
-                str(round_payload["system_prompt"]),
-            )
-        )
-        lines.extend(
-            _prompt_section(
-                f"{heading_prefix}User prompt",
-                str(round_payload["user_prompt"]),
-            )
-        )
-        lines.extend(
-            _prompt_section(
-                f"{heading_prefix}Model output",
-                str(round_payload["output"]),
-            )
-        )
+    lines.extend(_prompt_section("### User prompt", user_prompt))
+    lines.extend(_prompt_section("### Model output", output))
     lines.extend(["---", "", ""])
     return "\n".join(lines)
-
-
-def _round_heading(kind: str, position: int, round_count: int) -> str | None:
-    if kind == "review_provenance":
-        return _REVIEW_PROVENANCE_TITLES[position]
-    if kind == "link_association_search":
-        number = position + 1
-        if position == round_count - 1:
-            return f"Round {number} — final linking decision"
-        return f"Round {number} — association_search request"
-    return None
 
 
 def _prompt_section(heading: str, text: str) -> list[str]:

@@ -1143,8 +1143,6 @@ JSON、schema、字段类型或非法 ID 错误归入 `invalid_structured_output
 | `benchmark_memory_space_build_concurrency`     | 10      | benchmark 同时构建的独立 memory space 数                                  |
 | `benchmark_search_concurrency`                 | 5       | 同时执行的 benchmark search/QA 样例数                                     |
 | `benchmark_seed`                               | 42      | generation provider 支持 seed 时 benchmark 使用的固定 seed                |
-| `benchmark_memory_space_build_timeout_seconds` | 7,200 秒 | 构建一个 memory space 的总 timeout                                      |
-| `benchmark_search_sample_timeout_seconds`      | 300 秒   | 一条 benchmark search/QA 样例拿到并发槽之后，search + 生成的 timeout；不含排队等待 |
 | `benchmark_checkpoint_interval_items`          | 1       | 每完成多少个项目保存一次 checkpoint 和结果                                       |
 
 
@@ -1157,12 +1155,14 @@ Benchmark runner 按 session `source_sequence` 逐个创建公共 `add_episode` 
 单个 episode 的 summary targets 可以按上限 5 并发。前序 session 成为终态单项失败后，由共享
 `add_episode` 核心记录失败并继续推进来源顺序。不同 spaces 可以并行。
 
-不设置整次 benchmark 总 timeout。每完成一个 episode ingestion、space ingestion 或一条
+不设置整次 benchmark 总 timeout，也不为单个 memory space 构建或单条 search/QA 样例再包
+一层 timeout；连接和单次请求 timeout 由 generation / embedding provider 的 transport
+负责。每完成一个 episode ingestion、space ingestion 或一条
 QA 都原子保存 checkpoint；尚未完成 extraction 的 episode 在崩溃恢复后重新 extraction。
 answer 以 `predictions.jsonl` 中已写入的 question ID 为 checkpoint：每完成一题立即追加
-prediction 与对应 `search_results.jsonl` 记录；再次运行同一 run 的 answer 时跳过这些 ID，
-不删除已有预测。`benchmark_search_sample_timeout_seconds` 从该题拿到
-`benchmark_search_concurrency` 槽之后起算，只覆盖这一题的 search 与生成，排队等待不计入。
+prediction 与对应的紧凑 `search_records.jsonl` 机器记录；再次运行同一 run 的 answer 时跳过
+这些 ID，不删除已有预测。机器记录保存生成检索汇总和人类审计日志所需的 query、延迟、回答
+LLM input tokens，以及最终展示的 subject、summary、memory、相似度和检索路径。
 Benchmark runner 不提供完整 item 外层 retry；generation transport、
 embedding transport、structured-output repair 和 SQLite transaction 只执行各自所属操作内
 的有限重试。模型给出的结构和业务均有效但错误的答案不重试。一次 full 或 sample 脚本只
@@ -1175,13 +1175,30 @@ manifest，或 manifest 的 dataset/mode 不匹配的项不参与选择。未指
 提供 `--dataset`。需要指向特定 run，或恢复未完成的 build / answer 时，显式传入 `--run-dir`。
 runner 不内置重复次数，也不跨 run 计算均值或标准差。
 
+answer 根据 `search_records.jsonl` 覆盖生成三份产物：
+
+- `search_summary.json` 汇总检索延迟的 mean、p50、p90、max；每 query 回答 LLM input
+  tokens 的 mean、max、min；每 query 的 summary chars、memory content chars 和最终 rendered
+  context chars 的 mean、max、min；subject 与 memory retrieval similarity 的 per-query top1、
+  mean、min 各自跨 query 的 mean、max、min；以及每 query 实际展示的 subject、summary、
+  memory 数量均值。没有召回对应对象的 query 不参与 similarity 汇总。
+- `search_audit.md` 按数据集 question 顺序逐题展示 query、实际展示的 subject/summary/memory
+  数量，以及按 query-subject name 相似度降序排列的 subject groups。每个 group 展示 subject
+  name、相似度、检索路径和实际送入回答 prompt 的 summary；组内 memories 按 query-memory
+  相似度降序展示 content、相似度和检索路径，不展示内部 ID。
+- `answer_llm_input_samples.md` 保存数据集顺序前 3 个回答请求的完整 system prompt 和 user
+  prompt；数据集不足 3 题时保存全部。没有发送 system message 时明确记为空。
+
 每套数据集提供 `build`、`answer`、`score` 三个独立 stage，并分别提供 full 与 sample
 薄脚本，共六个可直接通过 `python -m benchmarks.scripts.<stage>_<mode>` 运行的模块。
 build 只构建数据库和写入审计产物；answer 从同一 run manifest 和数据库执行 public
 search 并生成官方字段形状的 predictions；score 独立读取 predictions 生成逐题结果和汇总。
 build 把 dataset hash、选择范围、配置签名、embedding model 和 seed 写入不可变
-manifest，供复盘。answer 和 score 只校验 dataset 与 space 选择与 manifest 一致，不要求
-当前 FluxFoldConfig 与 build 时相同。manifest 记录 build 使用的 generation model，供复盘
+manifest，供复盘。续跑未完成的 build 时不改写已有 manifest；只校验 dataset、mode、
+dataset hash、space 选择、build model、embedding model、seed 和时区约定。不要求当前
+`config_signature` 与写入时相同，因此 runner 超时、并发等运行时配置变化后仍可恢复。
+answer 和 score 只校验 dataset 与 space 选择与 manifest 一致，不要求当前 FluxFoldConfig
+与 build 时相同。manifest 记录 build 使用的 generation model，供复盘
 写入侧；answer 和 score 各自读取独立的 generation provider 配置，不要求与 build model
 相同。
 数据集由 `./scripts/setup-dev.sh` clone 到 `data/`：
@@ -1271,11 +1288,15 @@ subjects 时，对应 max/mean 为 0。
 
 #### 1.2.7 实验版记忆构建日志
 
-每次 memory-space build 生成四份日志：一份 JSONL 结构化事件日志，用于机器分析、统计和定位失败；一份 Markdown 高可读性审计日志，用于人工完整复盘 memories 和 subjects 如何形成及演化；一份 Markdown LLM 输入输出采样日志，用于人工阅读完整 prompt 与模型输出；一份覆盖写入的 Markdown 当前记忆库快照，按 memory space 组织展示当前全部 active subjects 的 name 与 summary，以及各自 active linked memories 的 content。结构化事件日志与审计日志共享 build/run ID、memory-space ID、episode ID、source sequence、domain operation ID 及正式对象 ID；LLM 采样日志通过 `run_id` 与 `request_id` 对应到同一次 `llm_call`。记忆库快照不进入结构化事件 JSONL。
+每次 memory-space build 生成三份日志：一份 JSONL 结构化事件日志，用于机器分析、统计和
+定位失败；一份 Markdown LLM 输入输出采样日志，用于人工抽查 user prompt 与模型输出；
+一份覆盖写入的 Markdown 当前记忆库快照，按 memory space 组织展示当前全部 active
+subjects 的 name 与 summary，以及各自 active linked memories 的 content。不生成
+`build_audit.md`。记忆库快照和 LLM 输入输出样本不进入结构化事件 JSONL。
 
-这四份日志是实验产物，不是 SQLite 正式数据或可写事实源，不能反向驱动记忆状态，也不能
-进入后续 LLM 输入。高可读性日志和记忆库快照包含完整 memory 内容；审计日志还包含完整
-benchmark 对话以及完整 LLM prompt 与输出，必须按包含原始对话数据的敏感实验产物保存。
+这三份日志是实验产物，不是 SQLite 正式数据或可写事实源，不能反向驱动记忆状态，也不能
+进入后续 LLM 输入。LLM 输入输出采样日志和记忆库快照都可能包含完整 memory 内容，必须
+按敏感实验产物保存。
 
 ##### 结构化事件日志
 
@@ -1303,67 +1324,25 @@ association search，还记录 `association_search_called = true`，以及主动
 
 结构化日志保留正式 IDs 和计数，便于汇总实验指标；不为了日志给 memory 增加 name 字段。
 
-##### 高可读性审计日志
-
-高可读性日志按 episode 来源顺序和后续维护实际发生顺序展开。它必须展示已经通过校验并
-参与正式状态决策的完整内容，而不只是计数或对象 ID。
-
-每个 episode 在 extraction 和 Subject linking 完成后展示：
-
-- extractor 实际读取的规范化 episode 内容，包括 message 顺序、speaker、role、已知来源
-时间和正文；不包含 dataset question、answer、evidence 等评测监督字段；
-- extraction 得到的全部 memory contents，以及每条 memory 最终 link 到的 subject names；
-如果结果是 `no_valuable_memory`，明确展示该语义结果；
-- 本 episode linking 新建 subjects 的 name；
-- 本批原子提交的最终结果。
-
-memory unit 没有正式 name。日志为同一段落内的 memories 分配 `M1`、`M2` 等仅供阅读的
-短标签，并同时展示完整 content；短标签不能保存为领域字段或跨操作身份，跨段落引用使用
-正式 memory ID。
-
-每次 Subject review 展示：
-
-- review 前的 subject name，以及全部 active memories 和 link basis；
-- provenance request 和系统返回的来源 episodes（如果发生）；
-- 每条被修改 memory 的正式 ID、修改前 content、修改后 content，以及 provenance 的前后
-完整集合；
-- 每条全局退役 memory 的 content，以及因此关闭的全部 active subject links；
-- 未改变的 memories 可以按 ID 和 content 列出一次，无需伪造 change；
-- review 后的最终 active memory 集合。
-
-每次 Subject split 展示：
-
-- split 前原 subject 的 name，以及全部 active memories 和 link basis；
-- `full_split`、`partial_split` 或 `defer_split` 的结果和理由；
-- full split 后全部新 subjects 的 name、memory membership 和 link basis；
-- partial split 新建的 subjects、移出的 memories，以及继续留在原 subject 的 memories；
-- defer split 的 warning 和后续仍会在新增 link 后重试的说明。
-
-每次 Subject summary refresh 展示 subject name、参与重写的全部当前 active memories 和
-link basis，以及生成的完整新 summary；审计输入不展示旧 summary。
-
-高可读性日志还按实际发生位置展示 model provider 错误类别、structured-output 修复重试、
-warning、error、终态单项失败、临时暂停、配置阻塞和恢复，使一次 memory-space build 可以
-仅凭该日志按时间顺序复盘。
-
 ##### LLM 输入输出采样日志
 
-该日志单独写入 `llm_io_samples.md`，不进入结构化事件 JSONL。它记录已经通过结构化校验的
-**首次 attempt** 成功调用：完整 system prompt、完整 user prompt（原始阶段输入，不含
-repair 包装）和完整模型输出。需要 structured-output 修复才成功的调用不采样。
+该日志单独写入 `llm_io_samples.md`。每次返回了模型输出的 LLM 调用各自以 0.1 概率独立
+触发采样；未通过 structured-output 校验的调用也独立参与，后续 repair 调用展示它实际
+收到的 repair prompt。每个样本只展示完整 User prompt 和完整 Model output，不展示 system
+prompt、stage、request ID、run ID、时间戳或 agent loop 的其他轮次。没有返回模型输出的
+provider 失败无法形成样本。
 
-按出现顺序采样，满额即停：
+各类别按采样成功数计数，满额即停止该类别的随机抽样：
 
-- `extract`、`link`、`review`、`split`、`summary` 各 2 次。`link` 只采未调用
-`association_search` 的单轮路径；`review` 只采未请求 provenance 的单轮路径。
-- 若发生 `association_search`，额外采样 1 个完整 agent loop：记录每次 linking prompt、对应
-的 `association_search` 请求，以及累积全部 association 候选后的最终 linking 结果；轮数为
-实际工具调用次数加一，最多 6 轮。
-- 若发生 `provenance_viewed`，额外采样 1 次完整两轮：第 1 轮 review prompt 与
-provenance 请求，第 2 轮带上来源 episodes 后的 review prompt 与最终 review 结果。
+- `extract`、未调用主动检索的 `link`、`review`、`split`、`summary` 各 10 个；
+- 调用过主动 `association_search` 的 `link` 为 5 个。这类 linking agent loop 中，发起
+  `association_search` 的中间 LLM 调用不参与采样，只有返回最终 linking 决策的最后一次
+  LLM 调用以 0.1 概率参与采样。
 
-某类调用在本次 build 中未出现则该项空缺。显式恢复续跑时，已写入文件的样本计入配额，
-不因引擎重启而重复超过上限。JSON 形态的 prompt 与输出按缩进展开，便于阅读。
+`review` 不按是否请求 provenance 拆分配额；两轮 review 中的每次 LLM 调用分别参与
+随机采样并共用 10 个上限。某类调用在本次 build 中未出现则该项空缺。显式恢复续跑时，
+已写入文件的样本计入配额，不因引擎重启而写入超过上限。JSON 形态的 prompt 与输出按缩进
+展开，便于阅读。
 
 ##### 当前记忆库快照
 
@@ -1401,13 +1380,12 @@ Subject 通道使用 subject name embedding，召回最多 5 个相似度不低�
 15 条相似度不低于 0.35 的 active memories；每条 memory 附带 active linked subjects 中
 name embedding 与 query 最相似的 1 个。
 
-通过各通道 top-k 和阈值的所有对象都进入最终结果。合并后按真实 links 组织为去重的
-subject groups：先保持 Subject 通道排名，再按 Memory 通道首次引入顺序追加其他 subjects；
-每个 subject 只展示一次，组内同一 memory 也只展示一次。只有 Subject 通道直接命中的最多
-5 个 subjects 携带 summary；仅由 Memory 通道引入的 subjects 只携带 name。结构化结果同样
-不暴露这些额外 subjects 的 summary，不只是文本 render 隐藏。不计算融合分数、不重新排序、
-不再次淘汰。direct/contextual links 均参与，第一版不调整权重。由通道数量可派生出去重前
-最多 20 个 subjects 和 20 条 memories，不把该结果重复配置为另一个上限。
+两条通道产生的 subject-memory 候选关系合并后，每条 memory 在最终结果中只展示一次。如果
+同一 memory 可归入多个候选 subjects，则归入 query-subject name 相似度最高的 subject；同分
+以稳定 ID 决定。Subject 通道直接命中的 subjects 即使最终没有 memory 也保留，并可以携带
+summary。仅由 Memory 通道引入的 subject 不携带 summary；如果最终没有分到 memory，则不
+展示。最终 subject groups 按 query-subject name 相似度降序排列，每个 group 内的 memories
+按 query-memory 相似度降序排列。direct/contextual links 均参与，第一版不调整权重。
 
 不设置最终 subject 数、memory 数、每 subject memory 数、返回文本总字符数、单条 summary
 字符数、单条 memory 返回字符数或超限最小保留数量。Public library 返回结构化结果；面向

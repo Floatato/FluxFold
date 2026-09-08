@@ -1685,6 +1685,8 @@ class Store:
             signature_id = self._active_signature(connection, memory_space_id)
             subject_refs: list[tuple[str, float, tuple[str, ...]]] = []
             memory_refs: list[tuple[str, float, tuple[str, ...]]] = []
+            subject_similarities = dict(subject_hits)
+            memory_similarities = dict(memory_hits)
             direct_subject_ids = tuple(item[0] for item in subject_hits)
             subject_order = list(direct_subject_ids)
             memory_order = [item[0] for item in memory_hits]
@@ -1699,12 +1701,14 @@ class Store:
                     """,
                     (signature_id, subject_id),
                 ).fetchall()
-                attached = _top_embedded_ids(
+                attached_hits = _top_embedded_items(
                     rows,
                     query_vector,
                     "memory_id",
                     self.config.search_subject_attached_memory_k,
                 )
+                attached = tuple(item[0] for item in attached_hits)
+                memory_similarities.update(attached_hits)
                 for memory_id in attached:
                     if memory_id not in memory_order:
                         memory_order.append(memory_id)
@@ -1720,12 +1724,14 @@ class Store:
                     """,
                     (signature_id, memory_id),
                 ).fetchall()
-                attached = _top_embedded_ids(
+                attached_hits = _top_embedded_items(
                     rows,
                     query_vector,
                     "subject_id",
                     self.config.search_memory_attached_subject_k,
                 )
+                attached = tuple(item[0] for item in attached_hits)
+                subject_similarities.update(attached_hits)
                 for subject_id in attached:
                     if subject_id not in subject_order:
                         subject_order.append(subject_id)
@@ -1733,9 +1739,14 @@ class Store:
             subject_ids = set(subject_order)
             memory_ids = set(memory_order)
             subjects = self._load_search_subjects(
-                connection, subject_order, set(direct_subject_ids)
+                connection,
+                subject_order,
+                set(direct_subject_ids),
+                subject_similarities,
             )
-            memories = self._load_search_memories(connection, memory_order)
+            memories = self._load_search_memories(
+                connection, memory_order, memory_similarities
+            )
             links = self._load_search_links(connection, subject_ids, memory_ids)
         from fluxfold.models import RankedMemoryRef, RankedSubjectRef
 
@@ -2062,6 +2073,7 @@ class Store:
         connection: sqlite3.Connection,
         ids: Sequence[str],
         summary_ids: set[str],
+        similarities: dict[str, float],
     ) -> tuple[SearchSubject, ...]:
         if not ids:
             return ()
@@ -2076,12 +2088,16 @@ class Store:
                 subject_id,
                 by_id[subject_id]["name"],
                 by_id[subject_id]["summary"] if subject_id in summary_ids else None,
+                similarities[subject_id],
             )
             for subject_id in stable_ids
         )
 
     def _load_search_memories(
-        self, connection: sqlite3.Connection, ids: Sequence[str]
+        self,
+        connection: sqlite3.Connection,
+        ids: Sequence[str],
+        similarities: dict[str, float],
     ) -> tuple[SearchMemory, ...]:
         if not ids:
             return ()
@@ -2100,6 +2116,7 @@ class Store:
                 memory_id,
                 by_id[memory_id]["content"],
                 by_id[memory_id]["latest_source_at"],
+                similarities[memory_id],
             )
             for memory_id in stable_ids
         )
@@ -2308,12 +2325,12 @@ def _best_embedded_row(
     )
 
 
-def _top_embedded_ids(
+def _top_embedded_items(
     rows: Sequence[sqlite3.Row],
     query_vector: np.ndarray,
     id_field: str,
     top_k: int,
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, float], ...]:
     query = _normalized_query(query_vector)
     ranked = sorted(
         (
@@ -2322,7 +2339,7 @@ def _top_embedded_ids(
         ),
         key=lambda item: (-item[1], item[0]),
     )
-    return tuple(item[0] for item in ranked[:top_k])
+    return tuple(ranked[:top_k])
 
 
 def _subject_embedding_text(name: str, summary: str) -> str:
