@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 from typing import Literal
 
+import httpx
+
 from fluxfold.config import FluxFoldConfig
 from fluxfold.errors import ValidationError
 from fluxfold.providers import (
@@ -64,9 +66,8 @@ def generation_provider(
         model=_required_env(f"{prefix}_MODEL"),
         api_key=os.environ.get(f"{prefix}_API_KEY", "EMPTY"),
         base_url=os.environ.get(f"{prefix}_BASE_URL") or None,
-        transport_max_retries=config.transport_max_retries,
-        retry_initial_seconds=config.retry_initial_seconds,
-        retry_multiplier=config.retry_multiplier,
+        max_retries=config.provider_max_retries,
+        timeout=_provider_timeout(config),
     )
 
 
@@ -98,9 +99,8 @@ def embedding_provider(config: FluxFoldConfig) -> EmbeddingProvider:
         model_info=info,
         api_key=os.environ.get("FLUXFOLD_EMBEDDING_API_KEY", "EMPTY"),
         base_url=os.environ.get("FLUXFOLD_EMBEDDING_BASE_URL") or None,
-        transport_max_retries=config.embedding_transport_max_retries,
-        retry_initial_seconds=config.retry_initial_seconds,
-        retry_multiplier=config.retry_multiplier,
+        max_retries=config.provider_max_retries,
+        timeout=_provider_timeout(config),
     )
 
 
@@ -138,3 +138,12 @@ def _required_env(name: str) -> str:
     if value is None or not value.strip():
         raise ValidationError(f"required environment variable is missing: {name}")
     return value
+
+
+def _provider_timeout(config: FluxFoldConfig) -> httpx.Timeout:
+    return httpx.Timeout(
+        connect=config.provider_connect_timeout_seconds,
+        read=config.provider_read_timeout_seconds,
+        write=config.provider_write_timeout_seconds,
+        pool=config.provider_pool_timeout_seconds,
+    )

@@ -29,6 +29,22 @@ from fluxfold.errors import ErrorClass, StageFailure, ValidationError
 from fluxfold.models import AddResult, NormalizedEpisode
 from fluxfold.providers import GenerationRequest
 
+_TERMINAL_ITEM_ERROR_CLASSES = frozenset(
+    {
+        ErrorClass.CONTEXT_OVERFLOW,
+        ErrorClass.POLICY_REJECTED,
+        ErrorClass.INVALID_STRUCTURED_OUTPUT,
+        ErrorClass.INCOMPLETE_OUTPUT,
+    }
+)
+_TRANSIENT_ERROR_CLASSES = frozenset(
+    {
+        ErrorClass.TRANSIENT_TRANSPORT,
+        ErrorClass.RATE_LIMITED,
+        ErrorClass.SERVICE_UNAVAILABLE,
+    }
+)
+
 
 async def build_run(
     *,
@@ -73,7 +89,7 @@ async def build_run(
         writer.write_json(run_paths.manifest, manifest)
     writer.run_id = run_id
     checkpoint = _load_checkpoint(run_paths.checkpoint)
-    completed = set(checkpoint["completed_space_ids"])
+    completed = list(checkpoint["completed_space_ids"])
     last_episode_by_space = dict(checkpoint["last_episode_by_space"])
     prior_elapsed = float(checkpoint["elapsed_seconds"])
     started = time.monotonic()
@@ -88,6 +104,7 @@ async def build_run(
     semaphore = asyncio.Semaphore(config.benchmark_memory_space_build_concurrency)
     summary: dict[str, dict[str, int | float]] = {}
     completed_lock = asyncio.Lock()
+    paused_spaces: dict[str, StageFailure] = {}
 
     def elapsed_seconds() -> float:
         return round(prior_elapsed + (time.monotonic() - started), 3)
@@ -137,30 +154,37 @@ async def build_run(
                 if episode.source_sequence > last_completed_sequence
             )
             for episode in pending_episodes:
-                result, _ = await _finish_add_item(
+                _, failure = await _finish_add_item(
                     engine=engine,
                     memory_space_id=memory_space.memory_space_id,
                     episode=episode,
                     writer=writer,
                 )
+                if (
+                    failure is not None
+                    and failure.error_class not in _TERMINAL_ITEM_ERROR_CLASSES
+                ):
+                    async with completed_lock:
+                        paused_spaces[space.source_id] = failure
+                        summary[space.source_id] = engine.space_statistics(
+                            memory_space.memory_space_id
+                        )
+                        persist_progress()
+                    return
                 async with completed_lock:
                     last_episode_by_space[space.source_id] = episode.source_sequence
-                    if result is not None:
-                        _write_memory_bank(
-                            writer,
-                            engine,
-                            updated_after=(
-                                f"episode `{episode.source_key}` in "
-                                f"`{space.space_key}` (source sequence "
-                                f"{episode.source_sequence})"
-                            ),
-                        )
                     persist_progress()
             summary[space.source_id] = engine.space_statistics(
                 memory_space.memory_space_id
             )
             async with completed_lock:
-                completed.add(space.source_id)
+                completed.append(space.source_id)
+                space_keys = {item.source_id: item.space_key for item in spaces}
+                bank = {item.space_key: item for item in engine.memory_bank()}
+                writer.write_memory_bank(
+                    tuple(bank[space_keys[source_id]] for source_id in completed),
+                    updated_after=f"memory space `{space.space_key}` completed",
+                )
                 persist_progress()
             writer.event(
                 {
@@ -174,7 +198,12 @@ async def build_run(
 
     try:
         await asyncio.gather(*(build_space(space) for space in spaces))
-        _write_memory_bank(writer, engine, updated_after="build completed")
+        if paused_spaces:
+            names = ", ".join(sorted(paused_spaces))
+            raise ValidationError(
+                f"build paused {len(paused_spaces)} memory space(s): {names}. "
+                "Re-run the same command with --run-dir to resume."
+            )
     finally:
         persist_progress()
         await engine.close()
@@ -424,25 +453,14 @@ async def _finish_add_item(
     episode: NormalizedEpisode,
     writer: ArtifactWriter,
 ) -> tuple[AddResult | None, StageFailure | None]:
-    transient = {
-        ErrorClass.TRANSIENT_TRANSPORT,
-        ErrorClass.RATE_LIMITED,
-        ErrorClass.SERVICE_UNAVAILABLE,
-    }
-    terminal_item = {
-        ErrorClass.CONTEXT_OVERFLOW,
-        ErrorClass.POLICY_REJECTED,
-        ErrorClass.INVALID_STRUCTURED_OUTPUT,
-        ErrorClass.INCOMPLETE_OUTPUT,
-    }
     try:
         return await engine.add_episode(memory_space_id, episode), None
     except StageFailure as failure:
-        if failure.error_class in terminal_item:
+        if failure.error_class in _TERMINAL_ITEM_ERROR_CLASSES:
             return None, failure
         event_type = (
             "memory_space_build_paused"
-            if failure.error_class in transient
+            if failure.error_class in _TRANSIENT_ERROR_CLASSES
             else "memory_space_build_blocked"
         )
         writer.event(
@@ -456,7 +474,7 @@ async def _finish_add_item(
                 "reason": failure.message,
             }
         )
-        raise
+        return None, failure
 
 
 def _load_checkpoint(path: Path) -> dict[str, object]:
@@ -479,16 +497,10 @@ def _load_checkpoint(path: Path) -> dict[str, object]:
     }
 
 
-def _write_memory_bank(
-    writer: ArtifactWriter, engine: FluxFold, *, updated_after: str
-) -> None:
-    writer.write_memory_bank(engine.memory_bank(), updated_after=updated_after)
-
-
 def _write_build_checkpoint(
     writer: ArtifactWriter,
     run_paths: RunPaths,
-    completed: set[str],
+    completed: list[str],
     last_episode_by_space: dict[str, int],
     *,
     elapsed_seconds: float,
@@ -496,7 +508,7 @@ def _write_build_checkpoint(
     writer.write_json(
         run_paths.checkpoint,
         {
-            "completed_space_ids": sorted(completed),
+            "completed_space_ids": completed,
             "last_episode_by_space": {
                 key: value for key, value in sorted(last_episode_by_space.items())
             },

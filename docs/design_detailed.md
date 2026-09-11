@@ -511,9 +511,12 @@ LLM 阶段参数如下：
 requests-per-minute 或 tokens-per-minute；即默认不设置 `requests_per_minute` 或
 `tokens_per_minute`。Generation provider/deployment profile 可按真实外部配额覆盖。不支持 temperature
 的 generation provider profile 省略该参数。Memory Engine 不设置分阶段 request timeout、
-阶段 deadline，也不在 generation provider 外再包一层 timeout。连接和单次请求 timeout 由
-generation provider 的 transport 负责；timeout 归一化后在 provider 内执行下述 transport
-retry，耗尽后才把错误返回 Memory Engine。
+阶段 deadline，也不在 generation provider 外再包一层 timeout。OpenAI-compatible generation
+与远程 embedding adapter 把连接和单次请求 timeout、以及可恢复传输错误的重试交给 OpenAI
+Python SDK：`max_retries=5`（初次失败后额外 5 次，共最多 6 次 HTTP），`connect=30` 秒，
+`read=600` 秒，`write=600` 秒，`pool=30` 秒。SDK 使用自带指数退避（初值 0.5 秒、倍数 2、
+最大 8 秒、在目标值附近抖动），并在不超过 120 秒时服从 `Retry-After`。FluxFold 不再实现
+第二层 transport retry 循环。SDK 耗尽后，adapter 将错误归一化并返回 Memory Engine。
 
 本文用 model provider 统称外部模型服务；调用 extraction、linking、review、split 和
 summary refresh 的服务称为 generation provider，生成 retrieval 或 boundary vector 的服务称为 embedding provider。
@@ -524,9 +527,9 @@ SQLite 等数据库基础设施不属于 model provider。具体 provider adapte
 
 | `error_class`                     | 典型情况                                               | 重试或修复规则                                                                  | 耗尽后的作用范围与结果                                                    |
 | --------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------- |
-| `transient_transport`             | DNS、连接重置、连接或单次请求 timeout 等临时传输错误                   | 按 transport retry 退避                                                     | 正式版临时暂停相关写入 pipeline；benchmark 按 1.2.6 处理                      |
-| `rate_limited`                    | 临时请求或 token 速率限制                                   | 按 transport retry，优先服从 `Retry-After`                                     | 暂停到 provider 指定的恢复时间；没有有效恢复时间时使用正式版默认暂停时间                      |
-| `service_unavailable`             | provider 5xx、overloaded 或临时容量不足                    | 按 transport retry 退避                                                     | 正式版临时暂停相关写入 pipeline；benchmark 按 1.2.6 处理                      |
+| `transient_transport`             | DNS、连接重置、连接或单次请求 timeout 等临时传输错误                   | OpenAI-compatible SDK transport retry（`max_retries=5`）                     | 正式版临时暂停相关写入 pipeline；benchmark 按 1.2.6 处理                      |
+| `rate_limited`                    | 临时请求或 token 速率限制                                   | OpenAI-compatible SDK transport retry；SDK 优先服从 `Retry-After`（上限 120 秒） | 暂停到 provider 指定的恢复时间；没有有效恢复时间时使用正式版默认暂停时间                      |
+| `service_unavailable`             | provider 5xx、overloaded 或临时容量不足                    | OpenAI-compatible SDK transport retry（`max_retries=5`）                     | 正式版临时暂停相关写入 pipeline；benchmark 按 1.2.6 处理                      |
 | `authentication_or_configuration` | credential 无效、无权限、endpoint、deployment 或 model 配错   | 不重试                                                                      | 相关写入 pipeline 进入配置阻塞，等待配置变化或显式健康检查成功                           |
 | `quota_exhausted`                 | 余额不足、billing 问题或硬配额耗尽                              | 不重试；provider 给出明确恢复时间时可以等待该时间                                            | 无恢复时间时进入配置阻塞；有恢复时间时临时暂停到该时间                                    |
 | `invalid_request`                 | 不受支持的参数、adapter 构造了非法请求或模型能力不兼容                    | 不重试                                                                      | 相关写入 pipeline 进入配置阻塞并给出诊断；内容容量问题必须归入 `context_overflow`，不能混入本类 |
@@ -541,19 +544,13 @@ SQLite 等数据库基础设施不属于 model provider。具体 provider adapte
 可恢复的调用失败和能够被确定性校验的输出错误，不把空响应、provider 错误或校验失败转换为
 合法零结果。
 
-只有 `transient_transport`、`rate_limited` 和 `service_unavailable` 执行 transport retry。
-初次失败后额外重试次数为 5，初始退避为 1 秒，倍数为 2，采用 full jitter，不设置最大
-退避时间。第 `retry_index` 次额外重试等待：
-
-```text
-random(0, 1 second * 2^retry_index)
-```
-
-`retry_index` 从 0 开始，provider 的有效 `Retry-After` 优先。仅由 generation provider
-执行 transport retry，使用 SDK 时关闭 SDK 的重复重试。
+`transient_transport`、`rate_limited` 和 `service_unavailable` 由 OpenAI-compatible SDK
+执行 transport retry，不在 FluxFold 内再套一层相同循环。SDK 默认会重试连接错误、超时、
+HTTP 408/409/429 和 5xx；FluxFold 在 SDK 耗尽后仍按上表把最终错误归一化为 `error_class`。
+`quota_exhausted`、鉴权和非法请求在归一化之后不由 Memory Engine 再发一次逻辑请求。
 
 `invalid_structured_output` 或 `incomplete_output` 在初次生成后最多额外重新生成 5 次，因此
-一次逻辑输出最多生成 6 次。每次重新生成中的传输失败仍独立遵守 transport retry；不设置
+一次逻辑输出最多生成 6 次。每次重新生成中的传输失败仍由该次 SDK 调用独立重试；不设置
 跨 transport 与 structured-output 修复的 provider 调用总上限。每个结构化阶段的 system
 prompt 必须给出与程序校验一致的完整判别联合字段、嵌套结构、枚举值和少量合法示例，不能用
 `[...]` 代替关键契约。JSON 解析、schema、非法引用、字段长度和业务不变量错误不能伪装成
@@ -570,9 +567,12 @@ Subject split 无法形成合法语义分组时使用明确的
 
 | 配置项                                         | 值           | 含义                                              |
 | ------------------------------------------- | ----------- | ----------------------------------------------- |
+| `provider_max_retries`                      | 5           | OpenAI-compatible SDK 初次失败后的额外 HTTP 重试次数        |
+| `provider_connect_timeout_seconds`          | 30 秒        | 建立连接的 timeout                                   |
+| `provider_read_timeout_seconds`             | 600 秒       | 等待完整响应的 timeout                                 |
+| `provider_write_timeout_seconds`            | 600 秒       | 发送请求体的 timeout                                  |
+| `provider_pool_timeout_seconds`             | 30 秒        | 从连接池取得连接的 timeout                               |
 | `embedding_batch_size`                      | 100         | 一次 embedding provider 请求最多编码的文本数                |
-| `embedding_request_timeout_seconds`         | 60 秒        | 单次远程 embedding provider 请求的 timeout             |
-| `embedding_transport_max_retries`           | 5           | embedding 初次传输失败后的额外重试次数                        |
 | `embedding_batch_concurrency_per_operation` | 4           | 单个 embedding 逻辑操作内部同时执行的 batch 请求上限            |
 | `subject_summary_refresh_llm_link_threshold` | 2      | active links 不超过此值时不调用 LLM 生成 summary        |
 | `subject_summary_refresh_concurrency_per_episode` | 5     | 一个 episode 内同时执行的 subject summary refresh 上限          |
@@ -588,10 +588,9 @@ memory 或 subject 创建、相关文本更新时立即计算对应 embedding。
 文本时按 100 个一批合并请求，并只在该次操作内部最多并发 4 个 batch；该 semaphore 不跨
 逻辑操作、memory space 或进程共享，也不是全局 provider 限流器。8 个文本形成 1 次请求，
 250 个文本形成 3 次可并发请求。单个文本的批次就是 1。全部必要 embedding 在事务外生成
-成功后，与正式内容和关系原子提交，不能暴露缺少当前 embedding 的 active 对象。Embedding
-provider 只有归一化为 `transient_transport`、`rate_limited` 或 `service_unavailable` 的错误
-才执行额外 5 次重试，并复用 generation transport retry 的退避参数；配置、权限、硬配额和
-非法请求错误遵守上表的阻塞规则。
+成功后，与正式内容和关系原子提交，不能暴露缺少当前 embedding 的 active 对象。远程 embedding
+provider 与 generation 共用同一套 OpenAI-compatible SDK timeout 与 `max_retries`；配置、
+权限、硬配额和非法请求错误在 SDK 耗尽后遵守上表的阻塞规则。
 
 默认本地 embedding 在工作线程中执行，避免阻塞 asyncio event loop；同一 provider instance
 串行调用底层模型编码。它没有网络 request，因此不应用 request timeout 或 transport retry。
@@ -1140,7 +1139,7 @@ JSON、schema、字段类型或非法 ID 错误归入 `invalid_structured_output
 
 | 配置项                                            | 值       | 含义                                                                |
 | ---------------------------------------------- | ------- | ----------------------------------------------------------------- |
-| `benchmark_memory_space_build_concurrency`     | 10      | benchmark 同时构建的独立 memory space 数                                  |
+| `benchmark_memory_space_build_concurrency`     | 10      | benchmark 同时构建的独立 memory space 数；build 可用 `--memory-space-build-concurrency` 覆盖 |
 | `benchmark_search_concurrency`                 | 5       | 同时执行的 benchmark search/QA 样例数                                     |
 | `benchmark_seed`                               | 42      | generation provider 支持 seed 时 benchmark 使用的固定 seed                |
 | `benchmark_checkpoint_interval_items`          | 1       | 每完成多少个项目保存一次 checkpoint 和结果                                       |
@@ -1153,19 +1152,23 @@ LoCoMo 的 10 个 conversations 分别建立 10 个 memory spaces，可同时构
 Benchmark runner 按 session `source_sequence` 逐个创建公共 `add_episode` 调用，不调用
 `_prepare_add`、`_commit_prepared_add` 或其他私有阶段 API。同一 space 的 episode 整段串行；
 单个 episode 的 summary targets 可以按上限 5 并发。前序 session 成为终态单项失败后，由共享
-`add_episode` 核心记录失败并继续推进来源顺序。不同 spaces 可以并行。
+`add_episode` 核心记录失败并继续推进来源顺序。不同 spaces 可以并行。一个 space 因
+`transient_transport`、`rate_limited`、`service_unavailable` 暂停，或因鉴权、硬配额、非法
+请求进入阻塞时，runner 停止该 space 的后续 episode，已完成的 episode 保留，其他 spaces
+继续构建。未完成的 space 不写入 `completed_space_ids`；同一 `--run-dir` 再跑时从失败
+episode 续跑。全部 space 结束后若仍有暂停或阻塞的 space，build 以失败退出。
 
 不设置整次 benchmark 总 timeout，也不为单个 memory space 构建或单条 search/QA 样例再包
-一层 timeout；连接和单次请求 timeout 由 generation / embedding provider 的 transport
-负责。每完成一个 episode ingestion、space ingestion 或一条
+一层 timeout；连接和单次请求 timeout 由 generation / embedding provider 的 OpenAI-compatible
+SDK transport 负责。每完成一个 episode ingestion、space ingestion 或一条
 QA 都原子保存 checkpoint；尚未完成 extraction 的 episode 在崩溃恢复后重新 extraction。
 answer 以 `predictions.jsonl` 中已写入的 question ID 为 checkpoint：每完成一题立即追加
 prediction 与对应的紧凑 `search_records.jsonl` 机器记录；再次运行同一 run 的 answer 时跳过
 这些 ID，不删除已有预测。机器记录保存生成检索汇总和人类审计日志所需的 query、延迟、回答
 LLM input tokens，以及最终展示的 subject、summary、memory、相似度和检索路径。
-Benchmark runner 不提供完整 item 外层 retry；generation transport、
-embedding transport、structured-output repair 和 SQLite transaction 只执行各自所属操作内
-的有限重试。模型给出的结构和业务均有效但错误的答案不重试。一次 full 或 sample 脚本只
+Benchmark runner 不提供完整 item 外层 retry；generation 与 embedding 的 transport retry
+由 OpenAI-compatible SDK 执行，structured-output repair 和 SQLite transaction 只执行各自
+所属操作内的有限重试。模型给出的结构和业务均有效但错误的答案不重试。一次 full 或 sample 脚本只
 执行一个 run。build 未指定 `--run-dir` 时，在 `runs/` 下创建
 `{dataset}_{月}.{日}_{HH:MM}_{seq}` 目录：时刻为本地墙钟时间，月日不补零、时分补零，
 同一分钟内多次 build 递增 seq，例如 `runs/longmemeval_8.27_21:02_1` 与
@@ -1197,6 +1200,8 @@ build 把 dataset hash、选择范围、配置签名、embedding model 和 seed 
 manifest，供复盘。续跑未完成的 build 时不改写已有 manifest；只校验 dataset、mode、
 dataset hash、space 选择、build model、embedding model、seed 和时区约定。不要求当前
 `config_signature` 与写入时相同，因此 runner 超时、并发等运行时配置变化后仍可恢复。
+build 的 `--memory-space-build-concurrency` 覆盖 `benchmark_memory_space_build_concurrency`，
+优先级高于 `--config` TOML。
 answer 和 score 只校验 dataset 与 space 选择与 manifest 一致，不要求当前 FluxFoldConfig
 与 build 时相同。manifest 记录 build 使用的 generation model，供复盘
 写入侧；answer 和 score 各自读取独立的 generation provider 配置，不要求与 build model
@@ -1346,13 +1351,14 @@ provider 失败无法形成样本。
 
 ##### 当前记忆库快照
 
-每次 episode 的 extraction、linking 与本 episode 维护全部成功完成后，覆盖写入
-`memory_bank.md`。整次 memory-space build 成功结束时再写一次最终快照。该文件只展示当前
-正式状态：按 `space_key` 分组的全部 active subjects，每个 subject 给出 name 和 summary，
-其下列出当前 active linked memories 的 content。不包含 subject ID、memory ID、link basis、
-retired 对象、来源 episode 或过程事件。同一 memory 若同时链到多个 subjects，在每个
-subject 下各出现一次。新建尚未 refresh 的 subject 可以没有 summary 正文。该快照反映写完
-当下的 SQLite 状态，不是按时间追加的过程日志。
+每个 memory space 构建完成后，覆盖写入 `memory_bank.md`，仅展示已完成 spaces 的最终快照，
+按构建完成顺序排列。checkpoint 的 `completed_space_ids` 按此顺序持久化，恢复续跑时保留
+已完成 spaces 的顺序，并将新完成的 spaces 排在其后。尚在构建或暂停的 spaces 不出现在文件中；
+首次有 space 完成前不生成该文件。
+每个 space 展示全部 active subjects，每个 subject 给出 name 和 summary，其下列出当前
+active linked memories 的 content。不包含 subject ID、memory ID、link basis、retired 对象、
+来源 episode 或过程事件。同一 memory 若同时链到多个 subjects，在每个 subject 下各出现一次。
+新建尚未 refresh 的 subject 可以没有 summary 正文。该文件不保留 episode 或 link 变动的中间快照。
 
 ### 1.3 记忆检索
 
@@ -1918,7 +1924,7 @@ retrieval embedding rebuild/switch 和删除该 space。`clear_spaces` 使用覆
 
 
 Generation 和 embedding provider 错误统一按 1.1.12 的 `error_class` 处理。
-`transient_transport`、`rate_limited` 和 `service_unavailable` 在操作内 transport retry 耗尽
+`transient_transport`、`rate_limited` 和 `service_unavailable` 在 SDK transport retry 耗尽
 后使相关 memory space 进入临时暂停；带有明确恢复时间的 `quota_exhausted` 直接进入临时
 暂停。SQLite 可重试
 transaction/连接错误在 transaction retry 耗尽后执行相同策略。`rate_limited` 或

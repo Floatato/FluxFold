@@ -10,7 +10,10 @@ from fluxfold.engine import FluxFold
 from fluxfold.providers import (
     DEFAULT_LOCAL_EMBEDDING_MODEL,
     DEFAULT_LOCAL_EMBEDDING_REVISION,
+    DEFAULT_PROVIDER_MAX_RETRIES,
+    DEFAULT_PROVIDER_TIMEOUT,
     LocalMiniLMEmbeddingProvider,
+    OpenAICompatibleGenerationProvider,
 )
 from tests.fakes import FakeGenerationProvider
 
@@ -117,3 +120,16 @@ def test_local_minilm_rejects_unknown_input_type(input_type: str) -> None:
             await provider.embed(("text",), input_type=input_type, timeout_seconds=60)
 
     asyncio.run(scenario())
+
+
+def test_openai_generation_provider_uses_sdk_retries_and_timeouts() -> None:
+    provider = OpenAICompatibleGenerationProvider(
+        model="test-model", api_key="test-key"
+    )
+    assert provider._client.max_retries == DEFAULT_PROVIDER_MAX_RETRIES
+    timeout = provider._client.timeout
+    assert timeout.connect == DEFAULT_PROVIDER_TIMEOUT.connect
+    assert timeout.read == DEFAULT_PROVIDER_TIMEOUT.read
+    assert timeout.write == DEFAULT_PROVIDER_TIMEOUT.write
+    assert timeout.pool == DEFAULT_PROVIDER_TIMEOUT.pool
+    asyncio.run(provider.close())

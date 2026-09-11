@@ -11,6 +11,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 dependencies = [
     "huggingface-hub>=0.34",
+    "httpx>=0.27",
     "numpy>=2.0",
     "onnxruntime>=1.22",
     "openai>=1.68",

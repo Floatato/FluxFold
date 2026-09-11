@@ -1482,7 +1482,7 @@ class FluxFold:
                 response = await self._embedding.embed(
                     batch,
                     input_type=input_type,
-                    timeout_seconds=self.config.embedding_request_timeout_seconds,
+                    timeout_seconds=self.config.provider_read_timeout_seconds,
                 )
                 if len(response.vectors) != len(batch):
                     raise ProviderError(

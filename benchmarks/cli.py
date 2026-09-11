@@ -34,6 +34,7 @@ from benchmarks.runtime import (
     load_config,
     load_project_env,
 )
+from fluxfold.config import FluxFoldConfig
 from fluxfold.errors import ValidationError
 
 
@@ -41,7 +42,7 @@ def main(stage: str, *, sample: bool, argv: Sequence[str] | None = None) -> None
     load_project_env()
     parser = _parser(stage, sample=sample)
     arguments = parser.parse_args(argv)
-    config = load_config(arguments.config)
+    config = _runtime_config(arguments, stage=stage)
     run_paths = RunPaths(_resolve_run_dir(stage, arguments, sample=sample))
     if stage == "build":
         dataset, spaces, data_paths = _build_selection(arguments, sample=sample)
@@ -109,6 +110,16 @@ def _parser(stage: str, *, sample: bool) -> argparse.ArgumentParser:
     )
     if stage != "build":
         return parser
+    parser.add_argument(
+        "--memory-space-build-concurrency",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help=(
+            "Number of memory spaces to build at once. Overrides "
+            "[fluxfold] benchmark_memory_space_build_concurrency (default: 10)."
+        ),
+    )
     parser.add_argument(
         "--data-path",
         help="LongMemEval-S JSON or JSONL file. Defaults to the cloned dataset under data/.",
@@ -191,3 +202,19 @@ def _resolve_run_dir(
         path = latest_run_dir(dataset, mode=mode)
     print(f"run-dir: {display_run_dir(path)}", flush=True)
     return path.resolve()
+
+
+def _runtime_config(arguments: argparse.Namespace, *, stage: str) -> FluxFoldConfig:
+    config = load_config(arguments.config)
+    if stage != "build" or arguments.memory_space_build_concurrency is None:
+        return config
+    return config.with_overrides(
+        benchmark_memory_space_build_concurrency=arguments.memory_space_build_concurrency
+    )
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from argparse import Namespace
 from pathlib import Path
 
 import pytest
-from benchmarks.cli import _build_selection, _existing_data_file
+from benchmarks.cli import (
+    _build_selection,
+    _existing_data_file,
+    _parser,
+    _runtime_config,
+)
 from benchmarks.runtime import (
     DEFAULT_LOCOMO_CONVERSATIONS_PATH,
     DEFAULT_LOCOMO_QUESTIONS_PATH,
@@ -87,6 +93,14 @@ def test_generation_provider_reads_stage_env(monkeypatch) -> None:
     assert build.model_id == "build-model"
     assert answer.model_id == "answer-model"
     assert score.model_id == "score-model"
+    assert build._client.max_retries == 5
+    assert build._client.timeout.connect == 30.0
+    assert build._client.timeout.read == 600.0
+    assert build._client.timeout.write == 600.0
+    assert build._client.timeout.pool == 30.0
+    asyncio.run(build.close())
+    asyncio.run(answer.close())
+    asyncio.run(score.close())
 
 
 def test_generation_provider_requires_stage_model(monkeypatch) -> None:
@@ -134,4 +148,48 @@ def test_build_selection_rejects_missing_longmemeval(tmp_path: Path) -> None:
                 select=[],
             ),
             sample=True,
+        )
+
+
+def test_build_cli_overrides_memory_space_build_concurrency(tmp_path: Path) -> None:
+    parser = _parser("build", sample=False)
+    arguments = parser.parse_args(
+        [
+            "--dataset",
+            "longmemeval",
+            "--memory-space-build-concurrency",
+            "4",
+        ]
+    )
+    config = _runtime_config(arguments, stage="build")
+    assert config.benchmark_memory_space_build_concurrency == 4
+    toml_path = tmp_path / "fluxfold.toml"
+    toml_path.write_text(
+        "[fluxfold]\nbenchmark_memory_space_build_concurrency = 2\n",
+        encoding="utf-8",
+    )
+    arguments = parser.parse_args(
+        [
+            "--dataset",
+            "longmemeval",
+            "--config",
+            str(toml_path),
+            "--memory-space-build-concurrency",
+            "3",
+        ]
+    )
+    config = _runtime_config(arguments, stage="build")
+    assert config.benchmark_memory_space_build_concurrency == 3
+    arguments = parser.parse_args(
+        ["--dataset", "longmemeval", "--config", str(toml_path)]
+    )
+    config = _runtime_config(arguments, stage="build")
+    assert config.benchmark_memory_space_build_concurrency == 2
+
+
+def test_build_cli_rejects_non_positive_memory_space_build_concurrency() -> None:
+    parser = _parser("build", sample=False)
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["--dataset", "longmemeval", "--memory-space-build-concurrency", "0"]
         )

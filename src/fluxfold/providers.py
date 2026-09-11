@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import os
-import random
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Protocol, cast, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
+import httpx
 import numpy as np
 from openai import (
     NOT_GIVEN,
@@ -96,6 +96,13 @@ class EmbeddingProvider(Protocol):
 
 DEFAULT_LOCAL_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_LOCAL_EMBEDDING_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+DEFAULT_PROVIDER_MAX_RETRIES = 5
+DEFAULT_PROVIDER_TIMEOUT = httpx.Timeout(
+    connect=30.0,
+    read=600.0,
+    write=600.0,
+    pool=30.0,
+)
 
 
 class _LocalEmbeddingModel(Protocol):
@@ -267,96 +274,81 @@ class OpenAICompatibleGenerationProvider:
         model: str,
         api_key: str,
         base_url: str | None = None,
-        transport_max_retries: int = 5,
-        retry_initial_seconds: float = 1.0,
-        retry_multiplier: float = 2.0,
+        max_retries: int = DEFAULT_PROVIDER_MAX_RETRIES,
+        timeout: httpx.Timeout = DEFAULT_PROVIDER_TIMEOUT,
     ) -> None:
         self._model = model
-        self._client = AsyncOpenAI(
+        self._client = _async_openai_client(
             api_key=api_key,
             base_url=base_url,
-            max_retries=0,
+            max_retries=max_retries,
+            timeout=timeout,
         )
-        self._transport_max_retries = transport_max_retries
-        self._retry_initial_seconds = retry_initial_seconds
-        self._retry_multiplier = retry_multiplier
 
     @property
     def model_id(self) -> str:
         return self._model
 
     async def generate(self, request: GenerationRequest) -> GenerationResponse:
-        for retry_index in range(self._transport_max_retries + 1):
-            try:
-                response = await self._client.chat.completions.create(
-                    model=self._model,
-                    messages=(
-                        [
-                            {"role": "system", "content": request.system_prompt},
-                            {"role": "user", "content": request.user_prompt},
-                        ]
-                        if request.system_prompt
-                        else [{"role": "user", "content": request.user_prompt}]
-                    ),
-                    temperature=request.temperature,
-                    seed=request.seed,
-                    timeout=(
-                        request.timeout_seconds
-                        if request.timeout_seconds is not None
-                        else NOT_GIVEN
-                    ),
-                )
-                choice = response.choices[0]
-                if choice.finish_reason == "length":
-                    raise ProviderError(
-                        ErrorClass.INCOMPLETE_OUTPUT,
-                        "provider stopped because the output limit was reached",
-                        request_id=response.id,
-                    )
-                if choice.finish_reason == "content_filter":
-                    raise ProviderError(
-                        ErrorClass.POLICY_REJECTED,
-                        "provider content policy rejected the completion",
-                        request_id=response.id,
-                    )
-                content = choice.message.content
-                if not content:
-                    raise ProviderError(
-                        ErrorClass.INCOMPLETE_OUTPUT,
-                        "provider returned an empty completion",
-                        request_id=response.id,
-                    )
-                usage = response.usage
-                if usage is None:
-                    input_tokens = 0
-                    output_tokens = 0
-                    total_tokens = 0
-                else:
-                    input_tokens = usage.prompt_tokens
-                    output_tokens = usage.completion_tokens or 0
-                    total_tokens = usage.total_tokens
-                return GenerationResponse(
-                    text=content,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    total_tokens=total_tokens,
+        try:
+            response = await self._client.chat.completions.create(
+                model=self._model,
+                messages=(
+                    [
+                        {"role": "system", "content": request.system_prompt},
+                        {"role": "user", "content": request.user_prompt},
+                    ]
+                    if request.system_prompt
+                    else [{"role": "user", "content": request.user_prompt}]
+                ),
+                temperature=request.temperature,
+                seed=request.seed,
+                timeout=(
+                    request.timeout_seconds
+                    if request.timeout_seconds is not None
+                    else NOT_GIVEN
+                ),
+            )
+            choice = response.choices[0]
+            if choice.finish_reason == "length":
+                raise ProviderError(
+                    ErrorClass.INCOMPLETE_OUTPUT,
+                    "provider stopped because the output limit was reached",
                     request_id=response.id,
                 )
-            except ProviderError:
-                raise
-            except Exception as error:
-                normalized = _normalize_openai_error(error)
-                if normalized.error_class not in _TRANSIENT_ERRORS:
-                    raise normalized from error
-                if retry_index >= self._transport_max_retries:
-                    raise normalized from error
-                await _wait_before_retry(
-                    normalized,
-                    retry_index,
-                    self._retry_initial_seconds,
-                    self._retry_multiplier,
+            if choice.finish_reason == "content_filter":
+                raise ProviderError(
+                    ErrorClass.POLICY_REJECTED,
+                    "provider content policy rejected the completion",
+                    request_id=response.id,
                 )
-        raise AssertionError("unreachable provider retry state")
+            content = choice.message.content
+            if not content:
+                raise ProviderError(
+                    ErrorClass.INCOMPLETE_OUTPUT,
+                    "provider returned an empty completion",
+                    request_id=response.id,
+                )
+            usage = response.usage
+            if usage is None:
+                input_tokens = 0
+                output_tokens = 0
+                total_tokens = 0
+            else:
+                input_tokens = usage.prompt_tokens
+                output_tokens = usage.completion_tokens or 0
+                total_tokens = usage.total_tokens
+            return GenerationResponse(
+                text=content,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                request_id=response.id,
+            )
+        except ProviderError:
+            raise
+        except Exception as error:
+            raise _normalize_openai_error(error) from error
 
     async def close(self) -> None:
         await self._client.close()
@@ -371,19 +363,16 @@ class OpenAICompatibleEmbeddingProvider:
         model_info: EmbeddingModelInfo,
         api_key: str,
         base_url: str | None = None,
-        transport_max_retries: int = 5,
-        retry_initial_seconds: float = 1.0,
-        retry_multiplier: float = 2.0,
+        max_retries: int = DEFAULT_PROVIDER_MAX_RETRIES,
+        timeout: httpx.Timeout = DEFAULT_PROVIDER_TIMEOUT,
     ) -> None:
         self._model_info = model_info
-        self._client = AsyncOpenAI(
+        self._client = _async_openai_client(
             api_key=api_key,
             base_url=base_url,
-            max_retries=0,
+            max_retries=max_retries,
+            timeout=timeout,
         )
-        self._transport_max_retries = transport_max_retries
-        self._retry_initial_seconds = retry_initial_seconds
-        self._retry_multiplier = retry_multiplier
 
     @property
     def model_info(self) -> EmbeddingModelInfo:
@@ -398,43 +387,31 @@ class OpenAICompatibleEmbeddingProvider:
     ) -> EmbeddingResponse:
         if input_type not in {"query", "document"}:
             raise ValueError(f"unknown embedding input_type: {input_type}")
+        del timeout_seconds
         if not texts:
             return EmbeddingResponse(vectors=())
         encoded = [_encode_text(text, input_type, self._model_info) for text in texts]
-        for retry_index in range(self._transport_max_retries + 1):
-            try:
-                response = await self._client.embeddings.create(
-                    model=self._model_info.model,
-                    input=encoded,
-                    encoding_format="float",
-                    timeout=timeout_seconds,
+        try:
+            response = await self._client.embeddings.create(
+                model=self._model_info.model,
+                input=encoded,
+                encoding_format="float",
+            )
+            ordered = sorted(response.data, key=lambda item: item.index)
+            vectors = tuple(
+                _normalize_vector(item.embedding, self._model_info.dimension)
+                for item in ordered
+            )
+            if len(vectors) != len(texts):
+                raise ProviderError(
+                    ErrorClass.INCOMPLETE_OUTPUT,
+                    "embedding response count does not match request count",
                 )
-                ordered = sorted(response.data, key=lambda item: item.index)
-                vectors = tuple(
-                    _normalize_vector(item.embedding, self._model_info.dimension)
-                    for item in ordered
-                )
-                if len(vectors) != len(texts):
-                    raise ProviderError(
-                        ErrorClass.INCOMPLETE_OUTPUT,
-                        "embedding response count does not match request count",
-                    )
-                return EmbeddingResponse(vectors=vectors)
-            except ProviderError:
-                raise
-            except Exception as error:
-                normalized = _normalize_openai_error(error)
-                if normalized.error_class not in _TRANSIENT_ERRORS:
-                    raise normalized from error
-                if retry_index >= self._transport_max_retries:
-                    raise normalized from error
-                await _wait_before_retry(
-                    normalized,
-                    retry_index,
-                    self._retry_initial_seconds,
-                    self._retry_multiplier,
-                )
-        raise AssertionError("unreachable provider retry state")
+            return EmbeddingResponse(vectors=vectors)
+        except ProviderError:
+            raise
+        except Exception as error:
+            raise _normalize_openai_error(error) from error
 
     async def close(self) -> None:
         await self._client.close()
@@ -444,11 +421,19 @@ def _load_local_minilm_model() -> _LocalEmbeddingModel:
     return _OnnxMiniLMModel()
 
 
-_TRANSIENT_ERRORS = {
-    ErrorClass.TRANSIENT_TRANSPORT,
-    ErrorClass.RATE_LIMITED,
-    ErrorClass.SERVICE_UNAVAILABLE,
-}
+def _async_openai_client(
+    *,
+    api_key: str,
+    base_url: str | None,
+    max_retries: int,
+    timeout: httpx.Timeout,
+) -> AsyncOpenAI:
+    return AsyncOpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        max_retries=max_retries,
+        timeout=cast(Any, timeout),
+    )
 
 
 def _encode_text(text: str, input_type: str, info: EmbeddingModelInfo) -> str:
@@ -473,19 +458,6 @@ def _normalize_vector(raw: Sequence[float], expected_dimension: int) -> np.ndarr
             ErrorClass.INVALID_REQUEST, "embedding vector has zero norm"
         )
     return np.ascontiguousarray(vector / norm, dtype="<f4")
-
-
-async def _wait_before_retry(
-    error: ProviderError,
-    retry_index: int,
-    initial_seconds: float,
-    multiplier: float,
-) -> None:
-    if error.retry_after_seconds is not None:
-        delay = error.retry_after_seconds
-    else:
-        delay = random.uniform(0, initial_seconds * multiplier**retry_index)
-    await asyncio.sleep(delay)
 
 
 def _normalize_openai_error(error: Exception) -> ProviderError:

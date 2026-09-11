@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
 from benchmarks.adapters import load_longmemeval
 from benchmarks.artifacts import (
     ArtifactWriter,
@@ -13,6 +14,7 @@ from benchmarks.artifacts import (
 from benchmarks.runner import answer_run, build_run, score_run
 
 from fluxfold import FluxFoldConfig
+from fluxfold.errors import ErrorClass, ProviderError, ValidationError
 from tests.fakes import FakeEmbeddingProvider, FakeGenerationProvider
 
 
@@ -193,7 +195,7 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
     assert generation.max_active_extractions == 1
     bank_text = paths.memory_bank.read_text(encoding="utf-8")
     assert bank_text.count("# Memory bank") == 1
-    assert "after build completed" in bank_text
+    assert f"after memory space `{spaces[0].space_key}` completed" in bank_text
     assert f"## `{spaces[0].space_key}`" in bank_text
     assert "### Alice's hiking" in bank_text
     assert "- Alice likes hiking." in bank_text
@@ -264,6 +266,97 @@ def test_build_resume_ignores_config_signature(tmp_path, monkeypatch) -> None:
         assert json.loads(paths.manifest.read_text(encoding="utf-8")) == original
 
     asyncio.run(scenario())
+
+
+def test_build_pauses_one_space_and_continues_others(tmp_path, monkeypatch) -> None:
+    ok_record = _alice_record("q-ok")
+    fail_record = _alice_record("q-fail")
+    fail_record["haystack_sessions"][0] = [
+        {"role": "user", "content": "STOP_THIS_SPACE"}
+    ]
+    dataset_path = tmp_path / "longmemeval.json"
+    dataset_path.write_text(json.dumps([ok_record, fail_record]), encoding="utf-8")
+    spaces = load_longmemeval(dataset_path)
+    paths = RunPaths(tmp_path / "run")
+    config = _search_config()
+
+    class _FailOneSpace(FakeGenerationProvider):
+        async def generate(self, request):
+            if (
+                request.stage == "memory_extraction"
+                and "STOP_THIS_SPACE" in request.user_prompt
+            ):
+                raise ProviderError(ErrorClass.TRANSIENT_TRANSPORT, "Connection error.")
+            return await super().generate(request)
+
+    generation = _FailOneSpace(extraction_delay_seconds=0.01)
+    _patch_providers(monkeypatch, generation)
+
+    snapshots = []
+    write_memory_bank = ArtifactWriter.write_memory_bank
+
+    def capture_memory_bank(self, bank, *, updated_after):
+        snapshots.append(tuple(space.space_key for space in bank))
+        write_memory_bank(self, bank, updated_after=updated_after)
+
+    monkeypatch.setattr(ArtifactWriter, "write_memory_bank", capture_memory_bank)
+
+    async def scenario() -> None:
+        with pytest.raises(ValidationError, match="build paused 1 memory space"):
+            await build_run(
+                dataset="longmemeval",
+                spaces=spaces,
+                run_paths=paths,
+                data_paths=(str(dataset_path),),
+                mode="sample",
+                config=config,
+            )
+
+    asyncio.run(scenario())
+    checkpoint = json.loads(paths.checkpoint.read_text(encoding="utf-8"))
+    assert "q-ok" in checkpoint["completed_space_ids"]
+    assert "q-fail" not in checkpoint["completed_space_ids"]
+    events = [
+        json.loads(line)
+        for line in paths.events.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(
+        item.get("event_type") == "memory_space_build_completed" for item in events
+    )
+    paused = [
+        item for item in events if item.get("event_type") == "memory_space_build_paused"
+    ]
+    assert len(paused) == 1
+    assert paused[0]["error_class"] == "transient_transport"
+    bank_text = paths.memory_bank.read_text(encoding="utf-8")
+    space_keys = {space.source_id: space.space_key for space in spaces}
+    assert f"## `{space_keys['q-ok']}`" in bank_text
+    assert f"## `{space_keys['q-fail']}`" not in bank_text
+
+    assert snapshots == [(space_keys["q-ok"],)]
+
+    _patch_providers(monkeypatch, FakeGenerationProvider())
+    asyncio.run(
+        build_run(
+            dataset="longmemeval",
+            spaces=spaces,
+            run_paths=paths,
+            data_paths=(str(dataset_path),),
+            mode="sample",
+            config=config,
+        )
+    )
+    assert snapshots == [
+        (space_keys["q-ok"],),
+        (space_keys["q-ok"], space_keys["q-fail"]),
+    ]
+    checkpoint = json.loads(paths.checkpoint.read_text(encoding="utf-8"))
+    assert checkpoint["completed_space_ids"] == ["q-ok", "q-fail"]
+    bank_text = paths.memory_bank.read_text(encoding="utf-8")
+    assert bank_text.index(f"## `{space_keys['q-ok']}`") < bank_text.index(
+        f"## `{space_keys['q-fail']}`"
+    )
 
 
 def test_answer_run_skips_existing_predictions(tmp_path, monkeypatch) -> None:

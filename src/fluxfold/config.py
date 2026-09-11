@@ -58,13 +58,13 @@ class FluxFoldConfig:
     linking_temperature: float = 0.0
     review_temperature: float = 0.1
     split_temperature: float = 0.1
-    transport_max_retries: int = 5
-    embedding_transport_max_retries: int = 5
     structured_output_max_retries: int = 5
-    retry_initial_seconds: float = 1.0
-    retry_multiplier: float = 2.0
+    provider_max_retries: int = 5
+    provider_connect_timeout_seconds: float = 30.0
+    provider_read_timeout_seconds: float = 600.0
+    provider_write_timeout_seconds: float = 600.0
+    provider_pool_timeout_seconds: float = 30.0
     embedding_batch_size: int = 100
-    embedding_request_timeout_seconds: float = 60
     embedding_batch_concurrency_per_operation: int = 4
     subject_summary_refresh_llm_link_threshold: int = 2
     subject_summary_refresh_concurrency_per_episode: int = 5
@@ -107,6 +107,7 @@ class FluxFoldConfig:
             {
                 "embedding_batch_concurrency_per_operation",
                 "subject_summary_refresh_concurrency_per_episode",
+                "benchmark_memory_space_build_concurrency",
             }
         )
         for name in positive_names:
