@@ -52,6 +52,28 @@ class FakeGenerationProvider:
 
     async def generate(self, request: GenerationRequest) -> GenerationResponse:
         self.requests.append(request)
+        initial = (
+            _original_json(request.user_prompt)
+            if request.stage not in {"benchmark_answer", "benchmark_judge"}
+            else {}
+        )
+        if "name_resolution" in initial:
+            return GenerationResponse(
+                text=json.dumps(
+                    {
+                        "resolutions": [
+                            {
+                                "proposed_name": item["proposed_name"],
+                                "canonical_name": item["proposed_name"],
+                            }
+                            for item in initial["name_resolution"]["items"]
+                        ]
+                    }
+                ),
+                input_tokens=6,
+                output_tokens=4,
+                total_tokens=10,
+            )
         if request.stage == "memory_extraction":
             self.active_extractions += 1
             self.max_active_extractions = max(
@@ -71,7 +93,17 @@ class FakeGenerationProvider:
                     )
                     if content == "NO_MEMORY"
                     else json.dumps(
-                        {"result": "memories", "memories": [{"content": content}]}
+                        {
+                            "result": "memories",
+                            "memories": [
+                                {
+                                    "content": content,
+                                    "anchors": [
+                                        content if self.always_new_subject else "Alice"
+                                    ],
+                                }
+                            ],
+                        }
                     )
                 )
             finally:
@@ -91,46 +123,30 @@ class FakeGenerationProvider:
                 )
             memories = payload["new_memories"]
             candidates = payload["candidates"]
-            if candidates and not self.always_new_subject:
-                subjects = [
-                    {
-                        "kind": "existing",
-                        "subject_id": candidates[0]["subject_id"],
-                    }
-                ] * len(memories)
-                new_subjects: list[dict[str, str]] = []
-            elif self.always_new_subject:
-                new_subjects = [
-                    {
-                        "subject_ref": f"alice_hiking_{memory['memory_ref']}",
-                        "name": f"Alice's hiking {memory['memory_ref']}",
-                    }
-                    for memory in memories
-                ]
-                subjects = [
-                    {"kind": "new", "subject_ref": subject["subject_ref"]}
-                    for subject in new_subjects
-                ]
-            else:
-                subject_ref = "alice_hiking"
-                new_subjects = [
-                    {
-                        "subject_ref": subject_ref,
-                        "name": "Alice's hiking",
-                    }
-                ]
-                subjects = [{"kind": "new", "subject_ref": subject_ref}] * len(memories)
             text = json.dumps(
                 {
                     "result": "links",
-                    "new_subjects": new_subjects,
-                    "links": [
+                    "memories": [
                         {
-                            "memory_ref": memory["memory_ref"],
-                            "subject": subject,
-                            "basis": "direct",
+                            "memory_id": memory["memory_id"],
+                            "direct_assignments": [
+                                {
+                                    "anchor": anchor,
+                                    "subject": next(
+                                        candidate["name"]
+                                        for candidate in candidates
+                                        if anchor in candidate["anchors"]
+                                        and (
+                                            not self.always_new_subject
+                                            or candidate["name"] == anchor
+                                        )
+                                    ),
+                                }
+                                for anchor in memory["anchors"]
+                            ],
+                            "contextual_subjects": [],
                         }
-                        for memory, subject in zip(memories, subjects, strict=True)
+                        for memory in memories
                     ],
                 }
             )

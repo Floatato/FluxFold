@@ -24,14 +24,16 @@ class FluxFoldConfig:
     episode_chars_max: int = 96_000
     message_chars_max: int = 32_000
     longmemeval_message_chars_max: int = 80_000
-    subject_candidate_top_k: int = 5
-    subject_candidate_direct_top_k: int = 2
-    subject_candidate_pool_top_k: int = 10
-    subject_candidate_min_similarity: float = 0.25
+    anchor_subject_candidate_top_k: int = 3
+    name_resolution_min_similarity: float = 0.8
+    name_resolution_bm25_threshold: float = 2.0
+    extraction_memory_warning_threshold: int = 20
+    linking_candidate_warning_threshold: int = 30
+    subject_candidate_min_similarity: float = 0.0
     association_subject_candidate_top_k: int = 8
     subject_candidate_attached_memory_k: int = 1
     memory_candidate_top_k: int = 8
-    memory_candidate_min_similarity: float = 0.35
+    memory_candidate_min_similarity: float = 0.0
     memory_candidate_attached_subject_k: int = 1
     association_search_enabled: bool = True
     association_search_max_calls: int = 5
@@ -49,10 +51,10 @@ class FluxFoldConfig:
     subject_split_result_target_memory_max: int = 20
     subject_split_memory_membership_max: int = 2
     search_subject_top_k: int = 5
-    search_subject_min_similarity: float = 0.25
+    search_subject_min_similarity: float = 0.0
     search_subject_attached_memory_k: int = 1
     search_memory_top_k: int = 15
-    search_memory_min_similarity: float = 0.35
+    search_memory_min_similarity: float = 0.0
     search_memory_attached_subject_k: int = 1
     extraction_temperature: float = 0.1
     linking_temperature: float = 0.0
@@ -115,6 +117,7 @@ class FluxFoldConfig:
             if isinstance(value, (int, float)) and value <= 0:
                 raise ValidationError(f"configuration value must be positive: {name}")
         for name in (
+            "name_resolution_min_similarity",
             "subject_candidate_min_similarity",
             "memory_candidate_min_similarity",
             "search_subject_min_similarity",
@@ -126,10 +129,6 @@ class FluxFoldConfig:
         if not 0 <= self.association_search_max_calls <= 5:
             raise ValidationError(
                 "association_search_max_calls must be between zero and five"
-            )
-        if self.subject_candidate_direct_top_k > self.subject_candidate_top_k:
-            raise ValidationError(
-                "direct subject candidate count exceeds the per-memory count"
             )
         if self.memory_link_preferred_max > self.memory_active_subject_link_max:
             raise ValidationError("preferred link maximum exceeds the hard maximum")

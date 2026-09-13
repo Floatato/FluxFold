@@ -1,6 +1,6 @@
 # FluxFold
 
-FluxFold is an experimental agent-memory library that spends LLM cost on the write path and keeps the read path as exact vector search. Memories are grouped into bounded `subject`s which can be reviewed and split as they grow.
+FluxFold is an experimental agent-memory library that spends LLM cost on the write path and keeps the read path as exact vector search. Memories carry named base `anchors` and are grouped into bounded `subject`s which can be reviewed and split as they grow. Linking recalls up to three subjects per memory and anchor, plus its same-name container, and assigns each anchor to the finest fitting subject before adding contextual links. Subject names are unique across active and retired objects; selected retired subjects are reactivated. Ambiguous anchor names receive a conditional LLM resolution pass. Public search excludes retired and empty subjects before selecting its top results.
 
 The experimental version is a Python library with adapters and runners for LongMemEval-S and LoCoMo_refined. It is not production-ready and has no product CLI, TUI, connector, daemon, or network service.
 
@@ -21,6 +21,8 @@ Already have the environment:
 ```bash
 uv sync
 ```
+
+Current experimental databases use schema version 6. Builds from earlier schemas need a new database; the library rejects incompatible schemas and does not migrate existing benchmark runs.
 
 ## Library usage
 

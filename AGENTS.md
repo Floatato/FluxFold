@@ -39,7 +39,8 @@ subject split, public `search`, SQLite persistence, embedding management, datase
 
 **Out of scope (do not build):** CLI, TUI, connectors, MCP server, durable inbox, buffers,
 embedding-based situation boundary detection, `flush`, users/streams tables, ablation studies,
-graph DB, vector DB, ANN index, BM25, rerankers, query rewriting.
+graph DB, vector DB, ANN index, read-path BM25, rerankers, query rewriting.
+Write-side name disambiguation may use BM25 alongside vectors.
 
 ## Target Layout
 
@@ -78,10 +79,11 @@ Always run tools through `uv run`. All four checks must pass before a change is 
 ```text
 dataset session
 → normalize + persist immutable episode (content_hash, source_sequence)
-→ memory extraction                 (0..N self-contained memories, or no_valuable_memory)
-→ per-memory subject-name recall    (top 5 above threshold; direct top 2 + batch top 10 pool)
+→ memory extraction + anchor resolution (0..N memories with named anchors, or no_valuable_memory)
+→ prepare same-name anchor subjects and actual memory IDs
+→ per-memory, per-anchor subject-name recall (active/retired top 3 plus same-name subject; batch deduplication)
 → batched Subject linking           (one agent loop per episode; up to 5 association_search calls)
-→ atomic commit                     (memories, versions, provenance, embeddings, subjects, links, completion)
+→ atomic commit                     (anchors, memberships, memories, versions, provenance, embeddings, subjects, reactivation, links, completion)
 → Subject split / Subject review    (split first when both are due)
 → Subject summary refresh           (durable episode targets, up to 5 concurrent rewrites)
 ```

@@ -10,7 +10,7 @@ import threading
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 from uuid import uuid4
 
@@ -39,6 +39,7 @@ from fluxfold.models import (
     MemoriesExtraction,
     MemoryBankSpace,
     MemorySpace,
+    NameResolutionOutput,
     NormalizedEpisode,
     ProvenanceRequestOutput,
     ReplaceContent,
@@ -50,6 +51,7 @@ from fluxfold.models import (
     SubjectSnapshot,
     SummaryRefreshOutput,
 )
+from fluxfold.names import NameEntry, bm25_scores, normalized_name
 from fluxfold.prompts import (
     EXTRACTION_SYSTEM,
     LINKING_SYSTEM,
@@ -119,10 +121,10 @@ class _PreparedAdd:
     persisted: PersistedEpisode
     extraction: ExtractionOutput | None
     contents: tuple[str, ...]
-    memory_refs: tuple[str, ...]
     memory_ids: tuple[str, ...]
     memory_vectors: tuple[Any, ...]
     prepared_memories: tuple[PreparedMemory, ...]
+    anchors: tuple[NameEntry, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,7 +261,6 @@ class FluxFold:
                 (),
                 (),
                 (),
-                (),
             )
         extraction, _ = await self._structured_output(
             stage="memory_extraction",
@@ -271,6 +272,41 @@ class FluxFold:
             sample_kind="extract",
         )
         extraction = cast(ExtractionOutput, extraction)
+        anchors: tuple[NameEntry, ...] = ()
+        if isinstance(extraction, MemoriesExtraction):
+            proposed = list(
+                dict.fromkeys(
+                    name for memory in extraction.memories for name in memory.anchors
+                )
+            )
+            mapping, entries = await self._resolve_names(
+                memory_space_id,
+                proposed,
+                self._store.anchor_names(memory_space_id),
+                "memory_extraction",
+                EXTRACTION_SYSTEM,
+                extraction_input(episode),
+                extraction.model_dump(),
+            )
+            for memory in extraction.memories:
+                memory.anchors = list(
+                    dict.fromkeys(mapping[name] for name in memory.anchors)
+                )
+            anchors = tuple(
+                entries[normalized_name(name)]
+                for name in dict.fromkeys(mapping.values())
+            )
+            if (
+                len(extraction.memories)
+                > self.config.extraction_memory_warning_threshold
+            ):
+                self._event(
+                    "extraction_memory_count_warning",
+                    severity="warning",
+                    memory_space_id=memory_space_id,
+                    episode_id=persisted.episode_id,
+                    memory_count=len(extraction.memories),
+                )
         self._event(
             "extraction_completed",
             memory_space_id=memory_space_id,
@@ -287,7 +323,6 @@ class FluxFold:
             if isinstance(extraction, MemoriesExtraction)
             else ()
         )
-        memory_refs = tuple(f"memory_{index + 1}" for index in range(len(contents)))
         memory_ids = tuple(str(uuid4()) for _ in contents)
         memory_vectors = await self._embed_documents(contents)
         prepared_memories = tuple(
@@ -304,10 +339,10 @@ class FluxFold:
             persisted,
             extraction,
             contents,
-            memory_refs,
             memory_ids,
             memory_vectors,
             prepared_memories,
+            anchors,
         )
 
     async def _commit_prepared_add(self, prepared: _PreparedAdd) -> AddResult:
@@ -339,43 +374,51 @@ class FluxFold:
                 "episode completion disappeared after preparation"
             )
         contents = prepared.contents
-        memory_refs = prepared.memory_refs
         memory_ids = prepared.memory_ids
         memory_vectors = prepared.memory_vectors
         prepared_memories = prepared.prepared_memories
+        prepared_subjects, anchor_subjects = self._prepare_anchor_subjects(
+            memory_space_id, prepared.anchors
+        )
         if contents:
             linking, linking_metrics = await self._link_memories(
                 memory_space_id,
-                memory_refs,
+                memory_ids,
                 contents,
                 memory_vectors,
+                [
+                    memory.anchors
+                    for memory in cast(MemoriesExtraction, prepared.extraction).memories
+                ],
             )
         else:
-            linking = LinkingOutput(new_subjects=[], links=[])
+            linking = LinkingOutput(memories=[])
             linking_metrics = _LinkingMetrics(0, False, 0)
         self._event(
             "subject_linking_completed",
             memory_space_id=memory_space_id,
             episode_id=current.episode_id,
-            new_subjects=len(linking.new_subjects),
-            links=len(linking.links),
+            new_subjects=len(prepared_subjects),
+            links=sum(
+                len(
+                    {item.subject for item in memory.direct_assignments}
+                    | set(memory.contextual_subjects)
+                )
+                for memory in linking.memories
+            ),
             candidate_memory_count=linking_metrics.candidate_memory_count,
             association_search_called=linking_metrics.association_search_called,
             association_additional_candidate_memory_count=(
                 linking_metrics.association_additional_candidate_memory_count
             ),
         )
-        (
-            prepared_subjects,
-            prepared_links,
-            subject_touches,
-            affected_subject_ids,
-        ) = await self._prepare_link_commit(
-            memory_space_id,
-            memory_refs,
-            memory_ids,
-            linking,
+        prepared_links, subject_touches, affected_subject_ids = (
+            self._prepare_link_commit(memory_space_id, linking, prepared_subjects)
         )
+        known_anchor_ids = {
+            entry.object_id for entry in self._store.anchor_names(memory_space_id)
+        }
+        anchor_by_name = {entry.name: entry.object_id for entry in prepared.anchors}
         operation_id = self._store.commit_add(
             memory_space_id=memory_space_id,
             episode_id=current.episode_id,
@@ -384,6 +427,23 @@ class FluxFold:
             subjects=prepared_subjects,
             links=prepared_links,
             subject_touches=subject_touches,
+            anchors=[
+                entry
+                for entry in prepared.anchors
+                if entry.object_id not in known_anchor_ids
+            ],
+            anchor_subjects=anchor_subjects,
+            memory_anchors=[
+                (memory_id, anchor_by_name[name])
+                for memory_id, memory in zip(
+                    memory_ids,
+                    cast(MemoriesExtraction, prepared.extraction).memories,
+                    strict=True,
+                )
+                for name in memory.anchors
+            ]
+            if contents
+            else [],
             signature_id=prepared.signature_id,
             actor=prepared.actor,
             config_signature=self.config.signature,
@@ -477,6 +537,10 @@ class FluxFold:
         memory_sources, subject_sources = self._store.retrieval_embedding_sources(
             memory_space_id
         )
+        anchor_sources = self._store.anchor_names(memory_space_id)
+        anchor_vectors = await self._embed_documents(
+            [entry.name for entry in anchor_sources]
+        )
         vectors = await self._embed_documents(
             [source.content for source in memory_sources]
             + [source.name for source in subject_sources]
@@ -503,6 +567,10 @@ class FluxFold:
             signature_id=signature_id,
             memories=tuple(zip(memory_sources, memory_vectors, strict=True)),
             subjects=prepared_subjects,
+            anchors=[
+                replace(entry, vector=vector)
+                for entry, vector in zip(anchor_sources, anchor_vectors, strict=True)
+            ],
         )
         return EmbeddingRebuildResult(
             memory_space_id,
@@ -521,22 +589,134 @@ class FluxFold:
 
         return self._store.memory_bank()
 
+    async def _resolve_names(
+        self,
+        memory_space_id: str,
+        proposed: Sequence[str],
+        existing: Sequence[NameEntry],
+        stage: str,
+        system_prompt: str,
+        original_input: str,
+        original_output: dict[str, Any],
+    ) -> tuple[dict[str, str], dict[str, NameEntry]]:
+        entries = {normalized_name(entry.name): entry for entry in existing}
+        mapping: dict[str, str] = {}
+        unique_proposals: dict[str, str] = {}
+        for name in proposed:
+            if normalized_name(name) not in entries:
+                unique_proposals.setdefault(normalized_name(name), name)
+        fresh = list(unique_proposals.values())
+        vectors = await self._embed_documents(fresh)
+        pending: dict[str, list[str]] = {}
+        feedback = []
+        for name, vector in zip(fresh, vectors, strict=True):
+            catalog = list(entries.values())
+            lexical = bm25_scores(name, [entry.name for entry in catalog])
+            candidates = [
+                entry
+                for entry, score in zip(catalog, lexical, strict=True)
+                if float(entry.vector @ vector)
+                >= self.config.name_resolution_min_similarity
+                or score >= self.config.name_resolution_bm25_threshold
+            ]
+            if candidates:
+                pending[name] = [entry.name for entry in candidates]
+                feedback.append(
+                    {
+                        "proposed_name": name,
+                        "candidates": [{"name": entry.name} for entry in candidates],
+                    }
+                )
+            entries[normalized_name(name)] = NameEntry(str(uuid4()), name, vector)
+        if feedback:
+
+            def validate(value: NameResolutionOutput) -> None:
+                if len(value.resolutions) != len(pending) or {
+                    item.proposed_name for item in value.resolutions
+                } != set(pending):
+                    raise ValidationError("resolve each proposed name once")
+                for item in value.resolutions:
+                    if item.canonical_name not in [
+                        item.proposed_name,
+                        *pending[item.proposed_name],
+                    ]:
+                        raise ValidationError(
+                            "canonical name must be the proposed name or a supplied candidate"
+                        )
+
+            resolved, _ = await self._structured_output(
+                stage=stage,
+                system_prompt=system_prompt
+                + "\n\nFor name_resolution feedback, judge whether the names describe the same "
+                + "entity."
+                + " Reuse its candidate name when they do; otherwise keep the proposed name. Return "
+                + '{"resolutions":[{"proposed_name":"...","canonical_name":"..."}]}.',
+                user_prompt=json.dumps(
+                    {
+                        "original_input": json.loads(original_input),
+                        "previous_output": original_output,
+                        "name_resolution": {"kind": "anchor", "items": feedback},
+                    },
+                    ensure_ascii=False,
+                ),
+                adapter=TypeAdapter(NameResolutionOutput),
+                temperature=0.0,
+                validator=validate,
+                sample_kind="extract",
+            )
+            decisions = {
+                item.proposed_name: item.canonical_name
+                for item in cast(NameResolutionOutput, resolved).resolutions
+            }
+        else:
+            decisions = {}
+        canonical: dict[str, str] = {}
+        for name in fresh:
+            target = decisions.get(name, name)
+            # Candidates only reference persisted names or earlier proposals, so this is acyclic.
+            canonical[name] = canonical.get(target, target)
+        for name in proposed:
+            entry = entries[normalized_name(name)]
+            target = canonical.get(entry.name, entry.name)
+            mapping[name] = target
+            if normalized_name(name) != normalized_name(target):
+                self._event(
+                    "name_normalized",
+                    severity="warning",
+                    memory_space_id=memory_space_id,
+                    stage=stage,
+                    object_kind="anchor",
+                    proposed_name=name,
+                    canonical_name=target,
+                )
+        return mapping, entries
+
     async def _link_memories(
         self,
         memory_space_id: str,
-        memory_refs: Sequence[str],
+        memory_ids: Sequence[str],
         contents: Sequence[str],
         vectors: Sequence[Any],
+        memory_anchors: Sequence[list[str]],
     ) -> tuple[LinkingOutput, _LinkingMetrics]:
         candidates, legal_subject_ids = self._recall_initial_subject_candidates(
-            memory_space_id, vectors
+            memory_space_id, vectors, memory_anchors
         )
         legal_by_memory = {
-            memory_ref: set(legal_subject_ids) for memory_ref in memory_refs
+            memory_id: set(legal_subject_ids) for memory_id in memory_ids
         }
         new_memories = [
-            {"memory_ref": memory_ref, "content": content}
-            for memory_ref, content in zip(memory_refs, contents, strict=True)
+            {
+                "memory_id": memory_id,
+                "content": content,
+                "anchors": anchors,
+                "link_limit": max(
+                    self.config.memory_active_subject_link_max, len(anchors)
+                ),
+            }
+            for memory_id, content, anchors in zip(
+                memory_ids, contents, memory_anchors, strict=True
+            )
         ]
         association_results: list[dict[str, Any]] = []
         association_memory_ids: set[str] = set()
@@ -561,7 +741,9 @@ class FluxFold:
                             "association_search query must not be blank"
                         )
                     return
-                self._validate_linking(value, memory_refs, legal_by_memory)
+                self._validate_linking(
+                    value, memory_ids, legal_by_memory, memory_anchors, memory_space_id
+                )
 
             try:
                 output, turn = await self._structured_output(
@@ -600,13 +782,13 @@ class FluxFold:
             association_candidates, association_legal = (
                 self._recall_association_candidates(
                     memory_space_id,
-                    memory_refs,
-                    [association_vector] * len(memory_refs),
+                    memory_ids,
+                    [association_vector] * len(memory_ids),
                 )
             )
             association_memory_ids.update(_candidate_memory_ids(association_candidates))
-            for memory_ref, subject_ids in association_legal.items():
-                legal_by_memory[memory_ref].update(subject_ids)
+            for memory_id, subject_ids in association_legal.items():
+                legal_by_memory[memory_id].update(subject_ids)
             association_results.append(
                 {
                     "query": output.query,
@@ -618,49 +800,57 @@ class FluxFold:
         self,
         memory_space_id: str,
         vectors: Sequence[Any],
-    ) -> tuple[list[dict[str, str]], set[str]]:
-        scores: dict[str, float] = {}
-        names: dict[str, str] = {}
-        direct_order: list[str] = []
-        for vector in vectors:
-            subjects = self._store.candidate_subject_names(
-                memory_space_id,
-                vector,
-                top_k=self.config.subject_candidate_top_k,
-                min_similarity=self.config.subject_candidate_min_similarity,
-            )
-            for index, subject in enumerate(subjects):
-                names[subject.subject_id] = subject.name
-                scores[subject.subject_id] = max(
-                    scores.get(subject.subject_id, -1.0), subject.similarity
+        memory_anchors: Sequence[list[str]],
+    ) -> tuple[list[dict[str, Any]], set[str]]:
+        catalog = self._store.subject_names(memory_space_id)
+        memberships = self._store.subject_anchor_names(memory_space_id)
+        pool: dict[str, dict[str, Any]] = {}
+        for vector, anchors in zip(vectors, memory_anchors, strict=True):
+            for anchor in anchors:
+                ranked = sorted(
+                    (
+                        (entry, float(entry.vector @ vector))
+                        for entry in catalog
+                        if anchor in memberships.get(entry.object_id, set())
+                        and normalized_name(entry.name) != normalized_name(anchor)
+                    ),
+                    key=lambda item: (-item[1], normalized_name(item[0].name)),
                 )
-                if (
-                    index < self.config.subject_candidate_direct_top_k
-                    and subject.subject_id not in direct_order
-                ):
-                    direct_order.append(subject.subject_id)
-
-        pooled = sorted(
-            scores, key=lambda subject_id: (-scores[subject_id], subject_id)
-        )[: self.config.subject_candidate_pool_top_k]
-        final_ids = list(dict.fromkeys([*direct_order, *pooled]))
-        return (
-            [
-                {"subject_id": subject_id, "name": names[subject_id]}
-                for subject_id in final_ids
-            ],
-            set(final_ids),
-        )
+                for entry, score in ranked[
+                    : self.config.anchor_subject_candidate_top_k
+                ]:
+                    if score >= self.config.subject_candidate_min_similarity:
+                        pool[entry.name] = {
+                            "name": entry.name,
+                            "anchors": sorted(memberships[entry.object_id]),
+                        }
+        by_name = {normalized_name(entry.name): entry for entry in catalog}
+        for anchor in dict.fromkeys(
+            name for anchors in memory_anchors for name in anchors
+        ):
+            root = by_name.get(normalized_name(anchor))
+            name = root.name if root is not None else anchor
+            linked_anchors = memberships.get(root.object_id, set()) if root else set()
+            pool[name] = {"name": name, "anchors": sorted(linked_anchors | {anchor})}
+        if len(pool) > self.config.linking_candidate_warning_threshold:
+            self._event(
+                "linking_candidate_count_warning",
+                severity="warning",
+                memory_space_id=memory_space_id,
+                candidate_count=len(pool),
+            )
+        return list(pool.values()), set(pool)
 
     def _recall_association_candidates(
         self,
         memory_space_id: str,
-        memory_refs: Sequence[str],
+        memory_ids: Sequence[str],
         vectors: Sequence[Any],
     ) -> tuple[dict[str, dict[str, object]], dict[str, set[str]]]:
+        memberships = self._store.subject_anchor_names(memory_space_id)
         candidates: dict[str, dict[str, object]] = {}
         legal: dict[str, set[str]] = {}
-        for memory_ref, vector in zip(memory_refs, vectors, strict=True):
+        for memory_id, vector in zip(memory_ids, vectors, strict=True):
             subjects = self._store.candidate_subjects(
                 memory_space_id,
                 vector,
@@ -676,7 +866,6 @@ class FluxFold:
             groups: dict[str, dict[str, object]] = {}
             for subject in subjects:
                 group: dict[str, object] = {
-                    "subject_id": subject.subject_id,
                     "name": subject.name,
                     "subject_similarity": subject.similarity,
                     "memory_hits": [],
@@ -704,7 +893,6 @@ class FluxFold:
                     continue
                 if subject_id not in groups:
                     groups[subject_id] = {
-                        "subject_id": subject_id,
                         "name": memory.attached_subject_name,
                         "subject_similarity": None,
                         "memory_hits": [],
@@ -712,118 +900,134 @@ class FluxFold:
                 hits = cast(list[dict[str, object]], groups[subject_id]["memory_hits"])
                 if not any(hit["memory_id"] == memory.memory_id for hit in hits):
                     hits.append(memory_value)
-            legal_ids = set(groups)
-            candidates[memory_ref] = {
+            for subject_id, group in groups.items():
+                group["anchors"] = sorted(memberships[subject_id])
+            legal_ids = {str(group["name"]) for group in groups.values()}
+            candidates[memory_id] = {
                 "subjects": list(groups.values()),
                 "unattached_memories": unattached_memories,
             }
-            legal[memory_ref] = legal_ids
+            legal[memory_id] = legal_ids
         return candidates, legal
 
     def _validate_linking(
         self,
         output: LinkingOutput,
-        memory_refs: Sequence[str],
+        memory_ids: Sequence[str],
         legal_by_memory: dict[str, set[str]],
+        memory_anchors: Sequence[list[str]],
+        memory_space_id: str,
     ) -> None:
-        expected = set(memory_refs)
-        subject_refs = [subject.subject_ref for subject in output.new_subjects]
-        if len(subject_refs) != len(set(subject_refs)):
-            raise ValidationError("new subject_ref values must be unique")
-        new_refs = set(subject_refs)
-        referenced_new: set[str] = set()
-        seen_pairs: set[tuple[str, str, str]] = set()
-        by_memory: defaultdict[str, list[Any]] = defaultdict(list)
-        for link in output.links:
-            if link.memory_ref not in expected:
-                raise ValidationError(f"unknown memory_ref: {link.memory_ref}")
-            if link.subject.kind == "existing":
-                target = link.subject.subject_id
-                if target not in legal_by_memory[link.memory_ref]:
+        expected = dict(zip(memory_ids, memory_anchors, strict=True))
+        if len(output.memories) != len(expected) or {
+            item.memory_id for item in output.memories
+        } != set(expected):
+            raise ValidationError("return each supplied memory_id exactly once")
+        memberships_by_id = self._store.subject_anchor_names(memory_space_id)
+        memberships = {
+            entry.name: memberships_by_id.get(entry.object_id, set())
+            for entry in self._store.subject_names(memory_space_id)
+        }
+        known_names = {normalized_name(name): name for name in memberships}
+        for anchor in {name for anchors in memory_anchors for name in anchors}:
+            name = known_names.get(normalized_name(anchor), anchor)
+            memberships.setdefault(name, set()).add(anchor)
+        for memory in output.memories:
+            anchors = expected[memory.memory_id]
+            assigned = [item.anchor for item in memory.direct_assignments]
+            if len(assigned) != len(anchors) or set(assigned) != set(anchors):
+                raise ValidationError(
+                    f"{memory.memory_id} needs exactly one direct assignment per supplied anchor"
+                )
+            names = {item.subject for item in memory.direct_assignments} | set(
+                memory.contextual_subjects
+            )
+            if not names <= legal_by_memory[memory.memory_id]:
+                raise ValidationError(
+                    f"subject was not a candidate for {memory.memory_id}"
+                )
+            for item in memory.direct_assignments:
+                if item.anchor not in memberships[item.subject]:
                     raise ValidationError(
-                        f"subject {target} was not a candidate for {link.memory_ref}"
+                        f"subject {item.subject} does not belong to anchor {item.anchor}"
                     )
-                target_kind = "existing"
-            else:
-                target = link.subject.subject_ref
-                if target not in new_refs:
-                    raise ValidationError(f"unknown new subject_ref: {target}")
-                referenced_new.add(target)
-                target_kind = "new"
-            pair = (link.memory_ref, target_kind, target)
-            if pair in seen_pairs:
-                raise ValidationError("duplicate memory-subject link")
-            seen_pairs.add(pair)
-            by_memory[link.memory_ref].append(link)
-        if referenced_new != new_refs:
-            raise ValidationError("every new subject must be linked to a batch memory")
-        for memory_ref in expected:
-            memory_links = by_memory[memory_ref]
-            if not memory_links or not any(
-                link.basis == "direct" for link in memory_links
+            if len(names) > max(
+                self.config.memory_active_subject_link_max, len(anchors)
             ):
-                raise ValidationError(f"{memory_ref} needs at least one direct link")
-            if len(memory_links) > self.config.memory_active_subject_link_max:
-                raise ValidationError(f"{memory_ref} exceeds the active link maximum")
-        for subject in output.new_subjects:
-            self._validate_subject_name(subject.name)
+                raise ValidationError(f"{memory.memory_id} exceeds its link_limit")
 
-    async def _prepare_link_commit(
+    def _prepare_anchor_subjects(
         self,
         memory_space_id: str,
-        memory_refs: Sequence[str],
-        memory_ids: Sequence[str],
-        linking: LinkingOutput,
-    ) -> tuple[
-        list[PreparedSubject],
-        list[PreparedLink],
-        list[ExistingSubjectTouch],
-        set[str],
-    ]:
-        ref_to_memory_id = dict(zip(memory_refs, memory_ids, strict=True))
-        new_ref_to_id = {
-            subject.subject_ref: str(uuid4()) for subject in linking.new_subjects
+        anchors: Sequence[NameEntry],
+    ) -> tuple[list[PreparedSubject], list[tuple[str, str]]]:
+        entries = {
+            normalized_name(entry.name): entry
+            for entry in self._store.subject_names(memory_space_id)
         }
-        subject_vectors = iter(
-            await self._embed_documents(
-                [subject.name for subject in linking.new_subjects]
-            )
+        subjects = []
+        relations = []
+        for anchor in anchors:
+            key = normalized_name(anchor.name)
+            if key not in entries:
+                entry = NameEntry(str(uuid4()), anchor.name, anchor.vector)
+                entries[key] = entry
+                subjects.append(
+                    PreparedSubject(
+                        entry.object_id, entry.name, None, entry.vector, None
+                    )
+                )
+            relations.append((anchor.object_id, entries[key].object_id))
+        return subjects, sorted(relations)
+
+    def _prepare_link_commit(
+        self,
+        memory_space_id: str,
+        linking: LinkingOutput,
+        subjects: Sequence[PreparedSubject],
+    ) -> tuple[list[PreparedLink], list[ExistingSubjectTouch], set[str]]:
+        known = {
+            normalized_name(entry.name): entry
+            for entry in self._store.subject_names(memory_space_id)
+        }
+        entries = dict(known)
+        entries.update(
+            {
+                normalized_name(subject.name): NameEntry(
+                    subject.subject_id, subject.name, subject.name_embedding
+                )
+                for subject in subjects
+            }
         )
-        prepared_subjects = [
-            PreparedSubject(
-                new_ref_to_id[subject.subject_ref],
-                subject.name,
-                None,
-                next(subject_vectors),
-                None,
+        links = []
+        for memory in linking.memories:
+            direct = {item.subject for item in memory.direct_assignments}
+            for name in sorted(direct | set(memory.contextual_subjects)):
+                links.append(
+                    PreparedLink(
+                        memory.memory_id,
+                        entries[normalized_name(name)].object_id,
+                        "direct" if name in direct else "contextual",
+                    )
+                )
+        known_ids = {entry.object_id for entry in known.values()}
+        counts = Counter(
+            link.subject_id for link in links if link.subject_id in known_ids
+        )
+        touches = [
+            ExistingSubjectTouch(
+                subject_id,
+                self._store.subject_snapshot(
+                    memory_space_id, subject_id
+                ).summary_revision,
+                count,
             )
-            for subject in linking.new_subjects
+            for subject_id, count in counts.items()
         ]
-        prepared_links: list[PreparedLink] = []
-        existing_link_counts: Counter[str] = Counter()
-        affected: set[str] = set()
-        for link in linking.links:
-            if link.subject.kind == "existing":
-                subject_id = link.subject.subject_id
-                existing_link_counts[subject_id] += 1
-            else:
-                subject_id = new_ref_to_id[link.subject.subject_ref]
-            prepared_links.append(
-                PreparedLink(ref_to_memory_id[link.memory_ref], subject_id, link.basis)
-            )
-            affected.add(subject_id)
-        touches: list[ExistingSubjectTouch] = []
-        for subject_id, increment in sorted(existing_link_counts.items()):
-            snapshot = self._store.subject_snapshot(memory_space_id, subject_id)
-            touches.append(
-                ExistingSubjectTouch(subject_id, snapshot.summary_revision, increment)
-            )
-        return (
-            prepared_subjects,
-            prepared_links,
-            touches,
-            affected,
-        )
+        affected = {link.subject_id for link in links} | {
+            subject.subject_id for subject in subjects
+        }
+        return links, touches, affected
 
     async def _complete_maintenance(
         self,
@@ -1229,24 +1433,45 @@ class FluxFold:
             if isinstance(output, FullSplitOutput)
             else output.new_subjects
         )
-        embedding_texts = [subject.name for subject in subjects]
-        vectors = iter(await self._embed_documents(embedding_texts))
+        catalog = {
+            normalized_name(entry.name): entry
+            for entry in self._store.subject_names(memory_space_id)
+        }
+        fresh_names = [
+            subject.name
+            for subject in subjects
+            if normalized_name(subject.name) not in catalog
+        ]
+        vectors = dict(
+            zip(fresh_names, await self._embed_documents(fresh_names), strict=True)
+        )
         prepared: list[PreparedSplitSubject] = []
         for subject in subjects:
-            subject_id = str(uuid4())
+            existing = catalog.get(normalized_name(subject.name))
+            subject_id = existing.object_id if existing is not None else str(uuid4())
+            revision = (
+                self._store.subject_snapshot(
+                    memory_space_id, subject_id
+                ).summary_revision
+                if existing is not None
+                else None
+            )
             prepared.append(
                 PreparedSplitSubject(
                     PreparedSubject(
                         subject_id,
-                        subject.name,
+                        existing.name if existing is not None else subject.name,
                         None,
-                        next(vectors),
+                        existing.vector
+                        if existing is not None
+                        else vectors[subject.name],
                         None,
                     ),
                     tuple(
                         PreparedLink(link.memory_id, subject_id, link.basis)
                         for link in subject.links
                     ),
+                    revision,
                 )
             )
         result: Literal["full_split", "partial_split"] = (
@@ -1288,6 +1513,11 @@ class FluxFold:
                 raise ValidationError("full split result subject count is invalid")
         elif not 1 <= len(subjects) <= self.config.subject_split_result_subject_max - 1:
             raise ValidationError("partial split new subject count is invalid")
+        normalized = [normalized_name(subject.name) for subject in subjects]
+        if len(normalized) != len(set(normalized)):
+            raise ValidationError("split subject names must be unique within the batch")
+        if normalized_name(snapshot.name) in normalized:
+            raise ValidationError("split targets must differ from the original subject")
         input_ids = {memory.memory_id for memory in snapshot.memories}
         membership: Counter[str] = Counter()
         for subject in subjects:
@@ -1328,26 +1558,35 @@ class FluxFold:
                 raise ValidationError(
                     "partial split must move a non-empty proper subset"
                 )
-        current_counts = self._store.memory_active_link_counts(
-            memory_space_id, tuple(moved)
-        )
-        remaining_direct = self._store.memory_active_direct_link_counts(
-            memory_space_id,
-            tuple(moved),
-            excluding_subject_id=snapshot.subject_id,
-        )
-        new_direct: Counter[str] = Counter()
+        catalog = {
+            normalized_name(entry.name): entry.object_id
+            for entry in self._store.subject_names(memory_space_id)
+        }
+        existing_links = self._store.active_link_bases(memory_space_id)
+        final_links = {
+            pair: basis
+            for pair, basis in existing_links.items()
+            if pair[1] != snapshot.subject_id
+        }
         for subject in subjects:
+            target = catalog.get(
+                normalized_name(subject.name), "new:" + normalized_name(subject.name)
+            )
             for link in subject.links:
-                if link.basis == "direct":
-                    new_direct[link.memory_id] += 1
-        for memory_id, new_count in membership.items():
-            final_count = current_counts[memory_id] - 1 + new_count
-            if final_count > self.config.memory_active_subject_link_max:
+                pair = (link.memory_id, target)
+                if pair not in final_links or link.basis == "direct":
+                    final_links[pair] = link.basis
+        for memory_id in moved:
+            bases = [
+                basis
+                for (linked_memory, _), basis in final_links.items()
+                if linked_memory == memory_id
+            ]
+            if len(bases) > self._store.memory_link_limit(memory_id):
                 raise ValidationError(
                     "split would exceed a memory's active link maximum"
                 )
-            if remaining_direct[memory_id] + new_direct[memory_id] < 1:
+            if "direct" not in bases:
                 raise ValidationError(
                     f"split would leave memory {memory_id} without a direct link"
                 )
@@ -1546,6 +1785,8 @@ class FluxFold:
             return
         for memory in extraction.memories:
             self._validate_memory_content(memory.content)
+            for name in memory.anchors:
+                self._validate_subject_name(name)
 
     def _validate_memory_content(
         self, content: str, *, max_chars: int | None = None

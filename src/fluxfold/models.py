@@ -279,6 +279,7 @@ class StrictModel(BaseModel):
 
 class ExtractedMemory(StrictModel):
     content: str
+    anchors: list[str] = Field(min_length=1)
 
 
 class MemoriesExtraction(StrictModel):
@@ -296,36 +297,29 @@ ExtractionOutput = Annotated[
 ]
 
 
-class NewSubjectOutput(StrictModel):
-    subject_ref: str
-    name: str
+class DirectAssignment(StrictModel):
+    anchor: str
+    subject: str
 
 
-class ExistingSubjectTarget(StrictModel):
-    kind: Literal["existing"]
-    subject_id: str
-
-
-class NewSubjectTarget(StrictModel):
-    kind: Literal["new"]
-    subject_ref: str
-
-
-SubjectTarget = Annotated[
-    ExistingSubjectTarget | NewSubjectTarget, Field(discriminator="kind")
-]
-
-
-class LinkingLinkOutput(StrictModel):
-    memory_ref: str
-    subject: SubjectTarget
-    basis: Literal["direct", "contextual"]
+class MemoryLinkingOutput(StrictModel):
+    memory_id: str
+    direct_assignments: list[DirectAssignment]
+    contextual_subjects: list[str]
 
 
 class LinkingOutput(StrictModel):
     result: Literal["links"] = "links"
-    new_subjects: list[NewSubjectOutput]
-    links: list[LinkingLinkOutput]
+    memories: list[MemoryLinkingOutput]
+
+
+class NameResolution(StrictModel):
+    proposed_name: str
+    canonical_name: str
+
+
+class NameResolutionOutput(StrictModel):
+    resolutions: list[NameResolution]
 
 
 class AssociationSearchOutput(StrictModel):

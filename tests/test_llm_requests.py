@@ -101,7 +101,7 @@ def test_llm_inputs_project_only_task_relevant_fields() -> None:
 
     snapshot = SubjectSnapshot(
         "subject-id",
-        "Alice's hiking",
+        "Alice",
         "stale summary",
         4,
         2,
@@ -132,7 +132,7 @@ def test_llm_inputs_project_only_task_relevant_fields() -> None:
     }
     assert json.loads(summary_refresh_input(snapshot)) == {
         "subject": {
-            "name": "Alice's hiking",
+            "name": "Alice",
             "memories": [{"content": "Alice likes hiking."}],
         }
     }
@@ -189,10 +189,9 @@ def test_review_provenance_input_uses_only_source_identity_time_and_content() ->
 def test_validation_feedback_collapses_repeated_array_errors() -> None:
     malformed = {
         "result": "links",
-        "new_subjects": [],
-        "links": [
+        "memories": [
             {
-                "memory_ref": f"memory_{index}",
+                "memory_id": f"id-{index}",
                 "subject_ref": "subject-id",
                 "type": "direct",
             }
@@ -206,8 +205,8 @@ def test_validation_feedback_collapses_repeated_array_errors() -> None:
     else:
         raise AssertionError("malformed linking output unexpectedly validated")
 
-    assert "links[*]" in feedback
-    assert feedback.count("subject: Field required") == 1
+    assert "memories[*]" in feedback
+    assert feedback.count("direct_assignments: Field required") == 1
     assert "pydantic.dev" not in feedback
     assert len(feedback) <= 2_000
 

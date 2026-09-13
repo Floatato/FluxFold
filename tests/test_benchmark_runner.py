@@ -197,7 +197,7 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
     assert bank_text.count("# Memory bank") == 1
     assert f"after memory space `{spaces[0].space_key}` completed" in bank_text
     assert f"## `{spaces[0].space_key}`" in bank_text
-    assert "### Alice's hiking" in bank_text
+    assert "### Alice" in bank_text
     assert "- Alice likes hiking." in bank_text
     assert "- Alice owns hiking boots." in bank_text
     assert "- Alice hikes on weekends." in bank_text
@@ -229,7 +229,7 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
         {
             "contextual_links": 0,
             "direct_links": 3,
-            "name": "Alice's hiking",
+            "name": "Alice",
         }
     ]
 

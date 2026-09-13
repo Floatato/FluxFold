@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS subjects (
     subject_id TEXT PRIMARY KEY,
     memory_space_id TEXT NOT NULL REFERENCES memory_spaces(memory_space_id) ON DELETE RESTRICT,
     name TEXT NOT NULL,
+    normalized_name TEXT NOT NULL,
     summary TEXT,
     lifecycle_status TEXT NOT NULL CHECK (lifecycle_status IN ('active', 'retired')),
     new_memory_count INTEGER NOT NULL CHECK (new_memory_count >= 0),
@@ -126,6 +127,33 @@ CREATE TABLE IF NOT EXISTS subjects (
     retired_by_operation_id TEXT REFERENCES domain_operations(operation_id) ON DELETE RESTRICT,
     CHECK ((lifecycle_status = 'active' AND retired_at IS NULL AND retired_by_operation_id IS NULL)
         OR (lifecycle_status = 'retired' AND retired_at IS NOT NULL AND retired_by_operation_id IS NOT NULL))
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_subject_name
+ON subjects(memory_space_id, normalized_name);
+
+CREATE TABLE IF NOT EXISTS anchors (
+    anchor_id TEXT PRIMARY KEY,
+    memory_space_id TEXT NOT NULL REFERENCES memory_spaces(memory_space_id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    normalized_name TEXT NOT NULL,
+    model_signature_id TEXT NOT NULL REFERENCES embedding_model_signatures(model_signature_id),
+    vector BLOB NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(memory_space_id, normalized_name)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS anchor_subjects (
+    anchor_id TEXT NOT NULL REFERENCES anchors(anchor_id) ON DELETE RESTRICT,
+    subject_id TEXT NOT NULL REFERENCES subjects(subject_id) ON DELETE RESTRICT,
+    PRIMARY KEY(anchor_id, subject_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS ix_anchor_subject ON anchor_subjects(subject_id, anchor_id);
+
+CREATE TABLE IF NOT EXISTS memory_anchors (
+    memory_id TEXT NOT NULL REFERENCES memory_units(memory_id) ON DELETE RESTRICT,
+    anchor_id TEXT NOT NULL REFERENCES anchors(anchor_id) ON DELETE RESTRICT,
+    PRIMARY KEY(memory_id, anchor_id)
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS subject_memory_links (

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 
+import numpy as np
 import pytest
 
 from fluxfold import EpisodeBlock, FluxFold, FluxFoldConfig, NormalizedEpisode, Role
@@ -14,7 +15,6 @@ from fluxfold.errors import (
     ValidationError,
 )
 from fluxfold.models import (
-    CandidateSubject,
     KeepProvenance,
     MemorySnapshot,
     MemoryUpdateOutput,
@@ -127,7 +127,7 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
         assert len(bank) == 1
         assert bank[0].space_key == "test:alice"
         assert [(subject.name, subject.summary) for subject in bank[0].subjects] == [
-            ("Alice's hiking", " ")
+            ("Alice", " ")
         ]
         assert bank[0].subjects[0].memory_contents == ("Alice likes hiking.",)
         statistics = engine.space_statistics(space.memory_space_id)
@@ -147,7 +147,7 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
         assert statistics["rewritten_memories"] == 0
         assert statistics["subjects"] == [
             {
-                "name": "Alice's hiking",
+                "name": "Alice",
                 "direct_links": 1,
                 "contextual_links": 0,
             }
@@ -170,7 +170,7 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
 
         result = await engine.search(space.memory_space_id, "What does Alice enjoy?")
         assert [memory.content for memory in result.memories] == ["Alice likes hiking."]
-        assert result.subjects[0].name == "Alice's hiking"
+        assert result.subjects[0].name == "Alice"
         assert "Alice likes hiking." in result.render()
 
         with pytest.raises(SourceConflictError):
@@ -189,6 +189,8 @@ def test_add_episode_serializes_episodes_within_a_space(tmp_path) -> None:
             self.events: list[tuple[str, str]] = []
 
         async def generate(self, request: GenerationRequest):
+            if '"name_resolution"' in request.user_prompt:
+                return await super().generate(request)
             payload = json.loads(request.user_prompt)
             if request.stage == "memory_extraction":
                 content = str(payload["episode"]["messages"][-1]["content"])
@@ -274,6 +276,8 @@ def test_add_episode_spaces_remain_independent(tmp_path) -> None:
 def test_episode_links_all_new_memories_in_one_batch(tmp_path) -> None:
     class TwoMemoryExtraction(FakeGenerationProvider):
         async def generate(self, request: GenerationRequest):
+            if '"name_resolution"' in request.user_prompt:
+                return await super().generate(request)
             if request.stage == "memory_extraction":
                 self.requests.append(request)
                 return GenerationResponse(
@@ -281,8 +285,14 @@ def test_episode_links_all_new_memories_in_one_batch(tmp_path) -> None:
                         {
                             "result": "memories",
                             "memories": [
-                                {"content": "Alice likes hiking."},
-                                {"content": "Alice bought hiking boots."},
+                                {
+                                    "content": "Alice likes hiking.",
+                                    "anchors": ["Alice"],
+                                },
+                                {
+                                    "content": "Alice bought hiking boots.",
+                                    "anchors": ["Alice"],
+                                },
                             ],
                         }
                     ),
@@ -313,11 +323,16 @@ def test_episode_links_all_new_memories_in_one_batch(tmp_path) -> None:
         ]
         assert len(linking_requests) == 1
         payload = json.loads(linking_requests[0].user_prompt)
-        assert [item["memory_ref"] for item in payload["new_memories"]] == [
-            "memory_1",
-            "memory_2",
-        ]
-        assert payload["candidates"] == []
+        ids = [item["memory_id"] for item in payload["new_memories"]]
+        assert len(set(ids)) == 2
+        assert set(ids) == {
+            memory.memory_id
+            for memory in engine._store.subject_snapshot(
+                space.memory_space_id,
+                engine._store.active_subject_ids(space.memory_space_id)[0],
+            ).memories
+        }
+        assert payload["candidates"] == [{"name": "Alice", "anchors": ["Alice"]}]
         assert payload["association_search_results"] == []
         assert payload["association_searches_remaining"] == 5
         assert result.memories_created == 2
@@ -328,48 +343,48 @@ def test_episode_links_all_new_memories_in_one_batch(tmp_path) -> None:
     asyncio.run(scenario())
 
 
-def test_initial_subject_candidates_union_per_memory_direct_and_global_pool(
+def test_initial_subject_candidates_rank_within_each_anchor(
     tmp_path, monkeypatch
 ) -> None:
+    from fluxfold.names import NameEntry
+
     async def scenario() -> None:
         engine = await FluxFold.open(
-            db_path=str(tmp_path / "candidate-pool.sqlite3"),
+            db_path=str(tmp_path / "pool.sqlite3"),
             generation_provider=FakeGenerationProvider(),
             embedding_provider=FakeEmbeddingProvider(),
         )
-        space = await engine.create_or_open_space("test:candidate-pool")
-        batches = iter(
-            tuple(
-                CandidateSubject(
-                    f"subject-{batch}-{rank}",
-                    f"Subject {batch}-{rank}",
-                    1.0 - batch * 0.1 - rank * 0.01,
-                )
-                for rank in range(5)
-            )
-            for batch in range(6)
+        space = await engine.create_or_open_space("test:pool")
+        entries = tuple(
+            NameEntry(str(index), f"Subject {index}", np.array([1.0, index / 10]))
+            for index in range(8)
         )
-
-        def candidate_subject_names(*args, **kwargs):
-            del args
-            assert kwargs["top_k"] == 5
-            assert kwargs["min_similarity"] == 0.25
-            return next(batches)
-
+        memberships = {
+            str(index): {"Alice" if index < 4 else "Bob"} for index in range(8)
+        }
+        # Even a highest-scoring root must leave all three ordinary slots available.
+        entries += (NameEntry("alice-root", "Alice", np.array([0.0, 100.0])),)
+        memberships["alice-root"] = {"Alice"}
+        monkeypatch.setattr(engine._store, "subject_names", lambda _: entries)
         monkeypatch.setattr(
-            engine._store, "candidate_subject_names", candidate_subject_names
+            engine._store, "subject_anchor_names", lambda _: memberships
         )
         candidates, legal = engine._recall_initial_subject_candidates(
-            space.memory_space_id, [object() for _ in range(6)]
+            space.memory_space_id,
+            [np.array([0.0, 1.0])] * 3,
+            [["Alice"], ["Bob"], ["Alice"]],
         )
-
-        direct_ids = [
-            f"subject-{batch}-{rank}" for batch in range(6) for rank in range(2)
+        assert [candidate["name"] for candidate in candidates] == [
+            "Subject 3",
+            "Subject 2",
+            "Subject 1",
+            "Subject 7",
+            "Subject 6",
+            "Subject 5",
+            "Alice",
+            "Bob",
         ]
-        assert [candidate["subject_id"] for candidate in candidates[:12]] == direct_ids
-        assert set(direct_ids) <= legal
-        assert len(candidates) == 18
-        assert all(set(candidate) == {"subject_id", "name"} for candidate in candidates)
+        assert legal == {candidate["name"] for candidate in candidates}
         await engine.close()
 
     asyncio.run(scenario())
@@ -378,6 +393,8 @@ def test_initial_subject_candidates_union_per_memory_direct_and_global_pool(
 def test_link_agent_allows_five_association_search_calls(tmp_path) -> None:
     class FiveAssociationSearches(FakeGenerationProvider):
         async def generate(self, request: GenerationRequest):
+            if '"name_resolution"' in request.user_prompt:
+                return await super().generate(request)
             if request.stage == "subject_linking":
                 payload = json.loads(request.user_prompt)
                 if payload["association_searches_remaining"] > 0:
@@ -448,6 +465,8 @@ def test_episode_summary_refresh_concurrency_is_capped_at_five(tmp_path) -> None
             self.max_active_summaries = 0
 
         async def generate(self, request: GenerationRequest):
+            if '"name_resolution"' in request.user_prompt:
+                return await super().generate(request)
             if request.stage == "memory_extraction":
                 self.requests.append(request)
                 return GenerationResponse(
@@ -455,7 +474,10 @@ def test_episode_summary_refresh_concurrency_is_capped_at_five(tmp_path) -> None
                         {
                             "result": "memories",
                             "memories": [
-                                {"content": f"Alice fact {index}."}
+                                {
+                                    "content": f"Alice fact {index}.",
+                                    "anchors": [f"Alice group {index // 3}"],
+                                }
                                 for index in range(21)
                             ],
                         }
@@ -468,26 +490,20 @@ def test_episode_summary_refresh_concurrency_is_capped_at_five(tmp_path) -> None
             if request.stage == "subject_linking":
                 self.requests.append(request)
                 memories = json.loads(request.user_prompt)["new_memories"]
-                new_subjects = [
-                    {
-                        "subject_ref": f"alice_group_{index}",
-                        "name": f"Alice group {index}",
-                    }
-                    for index in range(7)
-                ]
                 return GenerationResponse(
                     text=json.dumps(
                         {
                             "result": "links",
-                            "new_subjects": new_subjects,
-                            "links": [
+                            "memories": [
                                 {
-                                    "memory_ref": memory["memory_ref"],
-                                    "subject": {
-                                        "kind": "new",
-                                        "subject_ref": f"alice_group_{index // 3}",
-                                    },
-                                    "basis": "direct",
+                                    "memory_id": memory["memory_id"],
+                                    "direct_assignments": [
+                                        {
+                                            "anchor": memory["anchors"][0],
+                                            "subject": f"Alice group {index // 3}",
+                                        }
+                                    ],
+                                    "contextual_subjects": [],
                                 }
                                 for index, memory in enumerate(memories)
                             ],
@@ -540,6 +556,8 @@ def test_add_episode_persists_terminal_failure_and_replays_it(tmp_path) -> None:
             self.rejection_count = 0
 
         async def generate(self, request: GenerationRequest):
+            if '"name_resolution"' in request.user_prompt:
+                return await super().generate(request)
             if request.stage == "memory_extraction":
                 payload = json.loads(request.user_prompt)
                 content = str(payload["episode"]["messages"][-1]["content"])
@@ -723,12 +741,16 @@ def test_search_groups_subjects_and_only_exposes_five_summaries(tmp_path) -> Non
                 request.user_prompt
                 for request in generation.requests
                 if request.stage == "subject_linking"
+                and "name_resolution" not in request.user_prompt
             ][-1]
         )
         candidates = linking_payload["candidates"]
-        assert len(candidates) == 5
-        assert len({candidate["subject_id"] for candidate in candidates}) == 5
-        assert all(set(candidate) == {"subject_id", "name"} for candidate in candidates)
+        assert candidates == [
+            {
+                "name": "Unique fact number 8 token 136.",
+                "anchors": ["Unique fact number 8 token 136."],
+            }
+        ]
         await engine.close()
 
     asyncio.run(scenario())
@@ -741,6 +763,8 @@ def test_failed_summary_refresh_is_recovered_by_episode_replay(tmp_path) -> None
             self.failed = False
 
         async def generate(self, request: GenerationRequest):
+            if '"name_resolution"' in request.user_prompt:
+                return await super().generate(request)
             if request.stage == "subject_summary_refresh" and not self.failed:
                 self.failed = True
                 raise ProviderError(
@@ -819,6 +843,8 @@ def test_replay_only_retries_unfinished_summary_refresh_targets(tmp_path) -> Non
             super().__init__()
 
         async def generate(self, request: GenerationRequest):
+            if '"name_resolution"' in request.user_prompt:
+                return await super().generate(request)
             if request.stage == "memory_extraction":
                 self.requests.append(request)
                 return GenerationResponse(
@@ -826,7 +852,10 @@ def test_replay_only_retries_unfinished_summary_refresh_targets(tmp_path) -> Non
                         {
                             "result": "memories",
                             "memories": [
-                                {"content": f"Alice fact {index}."}
+                                {
+                                    "content": f"Alice fact {index}.",
+                                    "anchors": [f"Alice group {index // 3}"],
+                                }
                                 for index in range(9)
                             ],
                         }
@@ -839,26 +868,20 @@ def test_replay_only_retries_unfinished_summary_refresh_targets(tmp_path) -> Non
             if request.stage == "subject_linking":
                 self.requests.append(request)
                 memories = json.loads(request.user_prompt)["new_memories"]
-                new_subjects = [
-                    {
-                        "subject_ref": f"alice_group_{index}",
-                        "name": f"Alice group {index}",
-                    }
-                    for index in range(3)
-                ]
                 return GenerationResponse(
                     text=json.dumps(
                         {
                             "result": "links",
-                            "new_subjects": new_subjects,
-                            "links": [
+                            "memories": [
                                 {
-                                    "memory_ref": memory["memory_ref"],
-                                    "subject": {
-                                        "kind": "new",
-                                        "subject_ref": f"alice_group_{index // 3}",
-                                    },
-                                    "basis": "direct",
+                                    "memory_id": memory["memory_id"],
+                                    "direct_assignments": [
+                                        {
+                                            "anchor": memory["anchors"][0],
+                                            "subject": f"Alice group {index // 3}",
+                                        }
+                                    ],
+                                    "contextual_subjects": [],
                                 }
                                 for index, memory in enumerate(memories)
                             ],

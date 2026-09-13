@@ -37,7 +37,8 @@ dataset adapter、benchmark runner、构建日志、测试。
 
 **范围外（不要实现）：** CLI、TUI、connector、MCP server、durable inbox、buffer、基于 embedding
 的 situation boundary detection、`flush`、users/streams 表、ablation study、图数据库、向量数据库、
-ANN 索引、BM25、reranker、query 改写。
+ANN 索引、读取路径 BM25、reranker、query 改写。
+写入侧名称消歧允许结合 BM25 与向量召回。
 
 ## 目标布局
 
@@ -75,10 +76,11 @@ uv build                         # wheel + sdist
 ```text
 dataset session
 → 规范化并持久化不可变 episode（content_hash、source_sequence）
-→ memory extraction                 （0..N 条自包含 memory，或 no_valuable_memory）
-→ 逐条 memory 的 subject name 召回   （阈值以上前 5；直接前 2 + 批次池前 10）
+→ memory extraction + anchor resolution                 （0..N 条带名称锚点的自包含 memory，或 no_valuable_memory）
+→ 准备 anchor 同名 subject 与正式 memory ID
+→ 逐条 memory、逐个 anchor 的 subject name 召回（active/retired 前 3，额外加入同名 subject；批次去重）
 → 批量 Subject linking              （每 episode 一个 agent loop；最多 5 次 association_search）
-→ 原子提交                          （memory、version、provenance、embedding、subject、link、completion）
+→ 原子提交                          （anchor、归属关系、memory、version、provenance、embedding、subject、恢复状态、link、completion）
 → Subject split / Subject review    （两者同时满足时先 split）
 → Subject summary refresh           （持久化 episode targets，最多并发 5 个完整重写）
 ```

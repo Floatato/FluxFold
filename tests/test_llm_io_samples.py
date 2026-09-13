@@ -320,7 +320,7 @@ def test_artifact_writer_enforces_association_search_quota(tmp_path) -> None:
         "kind": "link_association_search",
         "timestamp_ms": 1,
         "user_prompt": '{"association_search_results":[{"query":"q1"}]}',
-        "output": '{"result":"links","new_subjects":[],"links":[]}',
+        "output": '{"result":"links","memories":[]}',
     }
     for _ in range(6):
         writer.event(event)

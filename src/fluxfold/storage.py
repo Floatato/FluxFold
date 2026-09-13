@@ -39,9 +39,10 @@ from fluxfold.models import (
     text_hash,
     utc_milliseconds,
 )
+from fluxfold.names import NameEntry, normalized_name
 from fluxfold.providers import EmbeddingModelInfo
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "6"
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +99,7 @@ class PreparedMemoryUpdate:
 class PreparedSplitSubject:
     subject: PreparedSubject
     links: tuple[PreparedLink, ...]
+    expected_revision: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +148,17 @@ class Store:
     def _initialize(self) -> None:
         schema = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
         with self._connect(management=True) as connection:
+            has_metadata = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_metadata'"
+            ).fetchone()
+            if has_metadata:
+                version = connection.execute(
+                    "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+                ).fetchone()
+                if version is not None and version["value"] != SCHEMA_VERSION:
+                    raise ValidationError(
+                        f"database schema {version['value']} is incompatible with {SCHEMA_VERSION}"
+                    )
             connection.executescript(schema)
             row = connection.execute(
                 "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
@@ -154,10 +167,6 @@ class Store:
                 connection.execute(
                     "INSERT INTO schema_metadata(key, value) VALUES ('schema_version', ?)",
                     (SCHEMA_VERSION,),
-                )
-            elif row["value"] != SCHEMA_VERSION:
-                raise ValidationError(
-                    f"database schema {row['value']} is incompatible with {SCHEMA_VERSION}"
                 )
 
     @contextmanager
@@ -286,6 +295,17 @@ class Store:
         connection.execute(
             f"DELETE FROM memory_versions WHERE memory_id IN ({memories})",
             (memory_space_id,),
+        )
+        connection.execute(
+            f"DELETE FROM memory_anchors WHERE memory_id IN ({memories})",
+            (memory_space_id,),
+        )
+        connection.execute(
+            f"DELETE FROM anchor_subjects WHERE subject_id IN ({subjects})",
+            (memory_space_id,),
+        )
+        connection.execute(
+            "DELETE FROM anchors WHERE memory_space_id=?", (memory_space_id,)
         )
         connection.execute(
             "DELETE FROM subjects WHERE memory_space_id = ?", (memory_space_id,)
@@ -440,7 +460,7 @@ class Store:
                 for row in connection.execute(
                     """
                     SELECT subject_id, name, summary FROM subjects
-                    WHERE memory_space_id = ? AND lifecycle_status = 'active'
+                    WHERE memory_space_id = ?
                     ORDER BY subject_id
                     """,
                     (memory_space_id,),
@@ -457,6 +477,7 @@ class Store:
         subjects: Sequence[
             tuple[RetrievalSubjectSource, np.ndarray, np.ndarray | None]
         ],
+        anchors: Sequence[NameEntry],
     ) -> None:
         now = utc_milliseconds()
         with self._transaction() as connection:
@@ -475,7 +496,7 @@ class Store:
             current_subjects = {
                 row["subject_id"]: (row["name"], row["summary"])
                 for row in connection.execute(
-                    "SELECT subject_id, name, summary FROM subjects WHERE memory_space_id = ? AND lifecycle_status = 'active'",
+                    "SELECT subject_id, name, summary FROM subjects WHERE memory_space_id = ?",
                     (memory_space_id,),
                 )
             }
@@ -492,6 +513,22 @@ class Store:
             ):
                 raise ConcurrentUpdateError(
                     "retrieval sources changed while embeddings were being rebuilt"
+                )
+            current_anchors = {
+                row["anchor_id"]: row["name"]
+                for row in connection.execute(
+                    "SELECT anchor_id, name FROM anchors WHERE memory_space_id=?",
+                    (memory_space_id,),
+                )
+            }
+            if current_anchors != {anchor.object_id: anchor.name for anchor in anchors}:
+                raise ConcurrentUpdateError(
+                    "anchors changed while embeddings were being rebuilt"
+                )
+            for anchor in anchors:
+                connection.execute(
+                    "UPDATE anchors SET vector=?, model_signature_id=? WHERE anchor_id=?",
+                    (_vector_blob(anchor.vector), signature_id, anchor.object_id),
                 )
             for memory_source, vector in memories:
                 connection.execute(
@@ -570,7 +607,7 @@ class Store:
             CROSS JOIN (SELECT 'name' AS kind UNION ALL SELECT 'name_summary') kinds
             LEFT JOIN subject_embeddings e ON e.subject_id = s.subject_id
                 AND e.embedding_kind = kinds.kind AND e.model_signature_id = ?
-            WHERE s.memory_space_id = ? AND s.lifecycle_status = 'active'
+            WHERE s.memory_space_id = ?
                 AND (kinds.kind = 'name' OR s.summary IS NOT NULL)
                 AND e.subject_id IS NULL
             """,
@@ -724,6 +761,9 @@ class Store:
         subjects: Sequence[PreparedSubject],
         links: Sequence[PreparedLink],
         subject_touches: Sequence[ExistingSubjectTouch],
+        anchors: Sequence[NameEntry],
+        anchor_subjects: Sequence[tuple[str, str]],
+        memory_anchors: Sequence[tuple[str, str]],
         signature_id: str,
         actor: str,
         config_signature: str,
@@ -775,7 +815,31 @@ class Store:
                     signature_id,
                     now,
                 )
+            for anchor in anchors:
+                connection.execute(
+                    "INSERT INTO anchors(anchor_id, memory_space_id, name, normalized_name, model_signature_id, vector, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        anchor.object_id,
+                        memory_space_id,
+                        anchor.name,
+                        normalized_name(anchor.name),
+                        signature_id,
+                        _vector_blob(anchor.vector),
+                        now,
+                    ),
+                )
+            connection.executemany(
+                "INSERT OR IGNORE INTO anchor_subjects(anchor_id, subject_id) VALUES (?, ?)",
+                anchor_subjects,
+            )
+            connection.executemany(
+                "INSERT INTO memory_anchors(memory_id, anchor_id) VALUES (?, ?)",
+                memory_anchors,
+            )
             for touch in subject_touches:
+                self._reactivate_subject(
+                    connection, touch.subject_id, operation_id, now
+                )
                 cursor = connection.execute(
                     """
                     UPDATE subjects SET new_memory_count = new_memory_count + ?,
@@ -796,7 +860,10 @@ class Store:
             for link in links:
                 self._insert_link(connection, link, operation_id, now)
             self._insert_summary_refresh_targets(
-                connection, operation_id, {link.subject_id for link in links}
+                connection,
+                operation_id,
+                {link.subject_id for link in links}
+                | {subject.subject_id for subject in subjects},
             )
             self._validate_active_memory_links(connection, memory_space_id)
             connection.execute(
@@ -858,6 +925,22 @@ class Store:
             "created",
         )
 
+    def _reactivate_subject(
+        self,
+        connection: sqlite3.Connection,
+        subject_id: str,
+        operation_id: str,
+        now: int,
+    ) -> None:
+        cursor = connection.execute(
+            """UPDATE subjects SET lifecycle_status='active', retired_at=NULL,
+            retired_by_operation_id=NULL, updated_at=?
+            WHERE subject_id=? AND lifecycle_status='retired'""",
+            (now, subject_id),
+        )
+        if cursor.rowcount:
+            self._effect(connection, operation_id, "subject", subject_id, "reactivated")
+
     def _insert_subject(
         self,
         connection: sqlite3.Connection,
@@ -870,14 +953,15 @@ class Store:
         connection.execute(
             """
             INSERT INTO subjects(
-                subject_id, memory_space_id, name, summary, lifecycle_status,
+                subject_id, memory_space_id, name, normalized_name, summary, lifecycle_status,
                 new_memory_count, summary_revision, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'active', 0, 0, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, 'active', 0, 0, ?, ?)
             """,
             (
                 subject.subject_id,
                 memory_space_id,
                 subject.name,
+                normalized_name(subject.name),
                 subject.summary,
                 now,
                 now,
@@ -1018,28 +1102,59 @@ class Store:
                 )
         return tuple(output)
 
-    def candidate_subject_names(
-        self,
-        memory_space_id: str,
-        query_vector: np.ndarray,
-        *,
-        top_k: int,
-        min_similarity: float,
-    ) -> tuple[CandidateSubject, ...]:
-        """Return name-only subject hits for the initial linking pool."""
-
-        hits = self._scan_subjects(memory_space_id, query_vector, top_k, min_similarity)
+    def anchor_names(self, memory_space_id: str) -> tuple[NameEntry, ...]:
         with self._connect() as connection:
             return tuple(
-                CandidateSubject(
-                    subject_id,
-                    connection.execute(
-                        "SELECT name FROM subjects WHERE subject_id = ?", (subject_id,)
-                    ).fetchone()["name"],
-                    similarity,
+                NameEntry(
+                    row["anchor_id"],
+                    row["name"],
+                    np.frombuffer(row["vector"], dtype="<f4"),
                 )
-                for subject_id, similarity in hits
+                for row in connection.execute(
+                    "SELECT anchor_id, name, vector FROM anchors WHERE memory_space_id = ? ORDER BY normalized_name",
+                    (memory_space_id,),
+                )
             )
+
+    def subject_names(self, memory_space_id: str) -> tuple[NameEntry, ...]:
+        with self._connect() as connection:
+            return tuple(
+                NameEntry(
+                    row["subject_id"],
+                    row["name"],
+                    np.frombuffer(row["vector"], dtype="<f4"),
+                )
+                for row in connection.execute(
+                    """SELECT s.subject_id, s.name, e.vector FROM subjects s
+                JOIN memory_space_model_signatures a ON a.memory_space_id=s.memory_space_id AND a.purpose='retrieval'
+                JOIN subject_embeddings e ON e.subject_id=s.subject_id AND e.embedding_kind='name' AND e.model_signature_id=a.model_signature_id
+                WHERE s.memory_space_id=? ORDER BY s.normalized_name""",
+                    (memory_space_id,),
+                )
+            )
+
+    def subject_anchor_names(self, memory_space_id: str) -> dict[str, set[str]]:
+        with self._connect() as connection:
+            result: dict[str, set[str]] = {}
+            for row in connection.execute(
+                """SELECT r.subject_id, a.name FROM anchor_subjects r
+                JOIN anchors a USING(anchor_id) JOIN subjects s USING(subject_id)
+                WHERE a.memory_space_id=?""",
+                (memory_space_id,),
+            ):
+                result.setdefault(row["subject_id"], set()).add(row["name"])
+            return result
+
+    def active_link_bases(self, memory_space_id: str) -> dict[tuple[str, str], str]:
+        with self._connect() as connection:
+            return {
+                (row["memory_id"], row["subject_id"]): row["link_basis"]
+                for row in connection.execute(
+                    """SELECT l.memory_id, l.subject_id, l.link_basis FROM subject_memory_links l
+                JOIN subjects s USING(subject_id) WHERE s.memory_space_id=? AND l.unlinked_at IS NULL""",
+                    (memory_space_id,),
+                )
+            }
 
     def candidate_memories(
         self,
@@ -1091,13 +1206,27 @@ class Store:
         query_vector: np.ndarray,
         top_k: int,
         min_similarity: float,
+        *,
+        public: bool = False,
     ) -> list[tuple[str, float]]:
-        sql = """
+        visibility = (
+            """
+            AND s.lifecycle_status = 'active'
+            AND EXISTS (
+                SELECT 1 FROM subject_memory_links l
+                JOIN memory_units u ON u.memory_id=l.memory_id AND u.lifecycle_status='active'
+                WHERE l.subject_id=s.subject_id AND l.unlinked_at IS NULL
+            )
+        """
+            if public
+            else ""
+        )
+        sql = f"""
             SELECT s.subject_id AS object_id, e.vector FROM subjects s
             JOIN memory_space_model_signatures a ON a.memory_space_id = s.memory_space_id AND a.purpose = 'retrieval'
             JOIN subject_embeddings e ON e.subject_id = s.subject_id
                 AND e.embedding_kind = 'name' AND e.model_signature_id = a.model_signature_id
-            WHERE s.memory_space_id = ? AND s.lifecycle_status = 'active'
+            WHERE s.memory_space_id = ? {visibility}
             ORDER BY s.subject_id
         """
         return self._exact_scan(
@@ -1159,12 +1288,12 @@ class Store:
             subject = connection.execute(
                 """
                 SELECT name, summary, new_memory_count, summary_revision FROM subjects
-                WHERE subject_id = ? AND memory_space_id = ? AND lifecycle_status = 'active'
+                WHERE subject_id = ? AND memory_space_id = ?
                 """,
                 (subject_id, memory_space_id),
             ).fetchone()
             if subject is None:
-                raise NotFoundError(f"active subject not found: {subject_id}")
+                raise NotFoundError(f"subject not found: {subject_id}")
             rows = connection.execute(
                 """
                 SELECT u.memory_id, u.latest_source_at, v.content, l.link_basis
@@ -1574,15 +1703,11 @@ class Store:
                 )
                 connection.execute(
                     """
-                    UPDATE subjects SET lifecycle_status = 'retired', retired_at = ?,
+                    UPDATE subjects SET lifecycle_status = 'retired', new_memory_count = 0, retired_at = ?,
                         retired_by_operation_id = ?, updated_at = ?
                     WHERE subject_id = ?
                     """,
                     (now, operation_id, now, original.subject_id),
-                )
-                connection.execute(
-                    "DELETE FROM subject_embeddings WHERE subject_id = ?",
-                    (original.subject_id,),
                 )
                 self._effect(
                     connection, operation_id, "subject", original.subject_id, "retired"
@@ -1613,16 +1738,58 @@ class Store:
                     (now, operation_id, original.subject_id, *close_ids),
                 )
             for prepared in new_subjects:
-                self._insert_subject(
-                    connection,
-                    memory_space_id,
-                    prepared.subject,
-                    operation_id,
-                    signature_id,
-                    now,
+                target_id = prepared.subject.subject_id
+                if prepared.expected_revision is None:
+                    self._insert_subject(
+                        connection,
+                        memory_space_id,
+                        prepared.subject,
+                        operation_id,
+                        signature_id,
+                        now,
+                    )
+                else:
+                    target = connection.execute(
+                        "SELECT summary_revision FROM subjects WHERE subject_id=? AND memory_space_id=?",
+                        (target_id, memory_space_id),
+                    ).fetchone()
+                    if (
+                        target is None
+                        or target["summary_revision"] != prepared.expected_revision
+                    ):
+                        raise ConcurrentUpdateError(f"stale split target: {target_id}")
+                    self._reactivate_subject(connection, target_id, operation_id, now)
+                connection.execute(
+                    """INSERT OR IGNORE INTO anchor_subjects(anchor_id, subject_id)
+                    SELECT anchor_id, ? FROM anchor_subjects WHERE subject_id=?""",
+                    (target_id, original.subject_id),
                 )
+                added = 0
                 for link in prepared.links:
-                    self._insert_link(connection, link, operation_id, now)
+                    existing = connection.execute(
+                        "SELECT link_id, link_basis FROM subject_memory_links WHERE subject_id=? AND memory_id=? AND unlinked_at IS NULL",
+                        (target_id, link.memory_id),
+                    ).fetchone()
+                    if existing is None:
+                        self._insert_link(connection, link, operation_id, now)
+                        added += 1
+                    elif (
+                        existing["link_basis"] == "contextual"
+                        and link.basis == "direct"
+                    ):
+                        connection.execute(
+                            "UPDATE subject_memory_links SET unlinked_at=?, closed_by_operation_id=? WHERE link_id=?",
+                            (now, operation_id, existing["link_id"]),
+                        )
+                        self._insert_link(connection, link, operation_id, now)
+                if prepared.expected_revision is not None:
+                    connection.execute(
+                        "UPDATE subjects SET new_memory_count=new_memory_count+?, updated_at=? WHERE subject_id=?",
+                        (added, now, target_id),
+                    )
+                    self._effect(
+                        connection, operation_id, "subject", target_id, "split_reused"
+                    )
             self._insert_summary_refresh_targets(
                 connection,
                 add_operation_id,
@@ -1674,6 +1841,7 @@ class Store:
             query_vector,
             self.config.search_subject_top_k,
             self.config.search_subject_min_similarity,
+            public=True,
         )
         memory_hits = self._scan_memories(
             memory_space_id,
@@ -1810,53 +1978,6 @@ class Store:
                     (add_operation_id, memory_space_id),
                 )
             )
-
-    def memory_active_link_counts(
-        self, memory_space_id: str, memory_ids: Sequence[str]
-    ) -> dict[str, int]:
-        if not memory_ids:
-            return {}
-        ids = tuple(memory_ids)
-        with self._connect() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT u.memory_id, count(l.link_id) AS n FROM memory_units u
-                LEFT JOIN subject_memory_links l ON l.memory_id = u.memory_id AND l.unlinked_at IS NULL
-                WHERE u.memory_space_id = ? AND u.memory_id IN ({_placeholders(ids)})
-                GROUP BY u.memory_id
-                """,
-                (memory_space_id, *ids),
-            ).fetchall()
-        if len(rows) != len(ids):
-            raise ValidationError("link count requested for an invalid memory")
-        return {row["memory_id"]: row["n"] for row in rows}
-
-    def memory_active_direct_link_counts(
-        self,
-        memory_space_id: str,
-        memory_ids: Sequence[str],
-        *,
-        excluding_subject_id: str,
-    ) -> dict[str, int]:
-        if not memory_ids:
-            return {}
-        ids = tuple(memory_ids)
-        with self._connect() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT u.memory_id,
-                    count(CASE WHEN l.link_basis = 'direct' AND l.subject_id != ? THEN 1 END) AS n
-                FROM memory_units u
-                LEFT JOIN subject_memory_links l
-                    ON l.memory_id = u.memory_id AND l.unlinked_at IS NULL
-                WHERE u.memory_space_id = ? AND u.memory_id IN ({_placeholders(ids)})
-                GROUP BY u.memory_id
-                """,
-                (excluding_subject_id, memory_space_id, *ids),
-            ).fetchall()
-        if len(rows) != len(ids):
-            raise ValidationError("link count requested for an invalid memory")
-        return {row["memory_id"]: row["n"] for row in rows}
 
     def memory_bank(self) -> tuple[MemoryBankSpace, ...]:
         with self._connect() as connection:
@@ -2189,6 +2310,14 @@ class Store:
             )
         }
 
+    def memory_link_limit(self, memory_id: str) -> int:
+        with self._connect() as connection:
+            anchor_count = connection.execute(
+                "SELECT count(*) FROM memory_anchors WHERE memory_id=?",
+                (memory_id,),
+            ).fetchone()[0]
+        return max(self.config.memory_active_subject_link_max, int(anchor_count))
+
     def _validate_active_memory_links(
         self, connection: sqlite3.Connection, memory_space_id: str
     ) -> None:
@@ -2201,7 +2330,8 @@ class Store:
             LEFT JOIN subject_memory_links l ON l.memory_id = u.memory_id
             WHERE u.memory_space_id = ? AND u.lifecycle_status = 'active'
             GROUP BY u.memory_id
-            HAVING active_links < 1 OR direct_links < 1 OR active_links > ?
+            HAVING active_links < 1 OR direct_links < 1 OR active_links > max(?,
+                (SELECT count(*) FROM memory_anchors ma WHERE ma.memory_id=u.memory_id))
             LIMIT 1
             """,
             (memory_space_id, self.config.memory_active_subject_link_max),
