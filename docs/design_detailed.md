@@ -225,10 +225,10 @@ PRIMARY KEY(memory_version_id, episode_id)
 ```
 
 初次提取的 memory 只指向当前 episode。审核修改 provenance 时，LLM 提供的是新版本的
-完整来源集合；系统验证所有 episode 有效且属于同一 memory space。overlap context 不得
-成为本次新记忆的 provenance。一个 memory version 的 provenance 必须包含 1--6 个不同
-episode；prompt 与结构化校验使用相同上限，超过时不得截断。provenance 和 episode 来源
-时间是 `latest_source_at` 的事实来源。
+完整来源集合；结构化校验与提交时均验证所有 episode 有效且属于同一 memory space。
+overlap context 不得成为本次新记忆的 provenance。一个 memory version 的 provenance
+必须包含 1--6 个不同 episode；prompt 与结构化校验使用相同上限，超过时不得截断。
+provenance 和 episode 来源时间是 `latest_source_at` 的事实来源。
 
 #### 1.1.6 Subject 与 subject–memory link
 
@@ -1069,8 +1069,9 @@ memory IDs，系统返回这些 memories 当前 provenance 涉及的全部 episo
 
 最终结果只列出 memory updates 和 memory retirements。未列出的 memory 保持不变。update
 可以替换 content、provenance 或两者，但必须至少改变一项；提供
-provenance 时，它表示包含 1--6 个不同有效 episode IDs 的完整替换集合。超过 6 不能截断；
-无法由至多 6 个来源准确支持的合并不得执行。
+provenance 时，它表示包含 1--6 个不同 episode IDs 的完整替换集合。每个 ID 必须存在且属于
+当前 memory space；缺失、跨 space 或重复的 ID 是 structured-output 校验失败。超过 6
+不能截断；无法由至多 6 个来源准确支持的合并不得执行。
 
 只允许拼接共同描述同一个、不可独立更新事实的 memories。不同但相关、可以分别变化的事实
 继续分开，包括日后同一问题的两跳。审核不能默认新事实覆盖旧事实，也不能仅因时间较早

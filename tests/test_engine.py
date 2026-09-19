@@ -15,10 +15,12 @@ from fluxfold.errors import (
     ValidationError,
 )
 from fluxfold.models import (
+    KeepContent,
     KeepProvenance,
     MemorySnapshot,
     MemoryUpdateOutput,
     ReplaceContent,
+    ReplaceProvenance,
     ReviewOutput,
     SubjectSnapshot,
 )
@@ -87,12 +89,87 @@ def test_review_replacement_content_character_limit(tmp_path) -> None:
             )
 
         engine._validate_review(
+            "unused-space",
             replacement("A" * engine.config.review_memory_content_max_chars),
             snapshot,
         )
         with pytest.raises(ValidationError, match="exceeds character limit"):
             engine._validate_review(
+                "unused-space",
                 replacement("A" * (engine.config.review_memory_content_max_chars + 1)),
+                snapshot,
+            )
+        await engine.close()
+
+    asyncio.run(scenario())
+
+
+def test_review_replacement_provenance_requires_existing_episode(tmp_path) -> None:
+    async def scenario() -> None:
+        engine = await FluxFold.open(
+            db_path=str(tmp_path / "review-provenance.sqlite3"),
+            generation_provider=FakeGenerationProvider(),
+            embedding_provider=FakeEmbeddingProvider(),
+            config=FluxFoldConfig().with_overrides(
+                subject_candidate_min_similarity=-1.0,
+                memory_candidate_min_similarity=-1.0,
+            ),
+        )
+        space = await engine.create_or_open_space("test:alice")
+        await engine.add_episode(
+            space.memory_space_id, _episode("one", "Alice likes hiking.", 0)
+        )
+        await engine.add_episode(
+            space.memory_space_id, _episode("two", "Alice bought boots.", 1)
+        )
+        other = await engine.create_or_open_space("test:bob")
+        await engine.add_episode(
+            other.memory_space_id, _episode("bob", "Bob swims.", 0)
+        )
+        snapshot = engine._store.subject_snapshot(
+            space.memory_space_id,
+            engine._store.active_subject_ids(space.memory_space_id)[0],
+        )
+        other_snapshot = engine._store.subject_snapshot(
+            other.memory_space_id,
+            engine._store.active_subject_ids(other.memory_space_id)[0],
+        )
+        first, second = snapshot.memories
+        other_episode = other_snapshot.memories[0].provenance_episode_ids[0]
+        union = list(
+            dict.fromkeys(
+                (*first.provenance_episode_ids, *second.provenance_episode_ids)
+            )
+        )
+
+        def replace_provenance(episode_ids: list[str]) -> ReviewOutput:
+            return ReviewOutput(
+                result="review",
+                updates=[
+                    MemoryUpdateOutput(
+                        memory_id=first.memory_id,
+                        content_change=KeepContent(action="keep"),
+                        provenance_change=ReplaceProvenance(
+                            action="replace", episode_ids=episode_ids
+                        ),
+                    )
+                ],
+                retirements=[],
+            )
+
+        engine._validate_review(
+            space.memory_space_id, replace_provenance(union), snapshot
+        )
+        with pytest.raises(ValidationError, match="invalid episode"):
+            engine._validate_review(
+                space.memory_space_id,
+                replace_provenance(["missing-episode-id"]),
+                snapshot,
+            )
+        with pytest.raises(ValidationError, match="invalid episode"):
+            engine._validate_review(
+                space.memory_space_id,
+                replace_provenance([other_episode]),
                 snapshot,
             )
         await engine.close()
@@ -1230,6 +1307,40 @@ def test_review_provenance_and_memory_changes(tmp_path, review_mode: str) -> Non
             assert (
                 engine.space_statistics(space.memory_space_id)["active_memories"] == 1
             )
+        await engine.close()
+
+    asyncio.run(scenario())
+
+
+def test_review_retries_when_replacement_provenance_is_invalid(tmp_path) -> None:
+    async def scenario() -> None:
+        generation = FakeGenerationProvider(review_invalid_provenance_first=True)
+        events: list[dict[str, object]] = []
+        engine = await FluxFold.open(
+            db_path=str(tmp_path / "review-invalid-provenance.sqlite3"),
+            generation_provider=generation,
+            embedding_provider=FakeEmbeddingProvider(),
+            config=FluxFoldConfig().with_overrides(
+                subject_candidate_min_similarity=-1.0,
+                memory_candidate_min_similarity=-1.0,
+                subject_review_new_memory_threshold=1,
+            ),
+            event_sink=events.append,
+        )
+        space = await engine.create_or_open_space("test:review-invalid-provenance")
+        await engine.add_episode(
+            space.memory_space_id, _episode("one", "Alice likes hiking.", 0)
+        )
+        result = await engine.add_episode(
+            space.memory_space_id, _episode("two", "Alice bought boots.", 1)
+        )
+        assert result.maintenance[0].operation == "review"
+        review_calls = [
+            event
+            for event in events
+            if event["event_type"] == "llm_call" and event["stage"] == "subject_review"
+        ]
+        assert [event["result"] for event in review_calls] == ["failed", "success"]
         await engine.close()
 
     asyncio.run(scenario())

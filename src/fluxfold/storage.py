@@ -1371,6 +1371,19 @@ class Store:
                 output[memory_id] = tuple(rendered)
         return output
 
+    def existing_episode_ids(
+        self, memory_space_id: str, episode_ids: Sequence[str]
+    ) -> frozenset[str]:
+        unique = tuple(dict.fromkeys(episode_ids))
+        if not unique:
+            return frozenset()
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT episode_id FROM situational_episodes WHERE memory_space_id = ? AND episode_id IN ({_placeholders(unique)})",
+                (memory_space_id, *unique),
+            ).fetchall()
+        return frozenset(row["episode_id"] for row in rows)
+
     def commit_review(
         self,
         *,

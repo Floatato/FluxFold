@@ -1281,7 +1281,7 @@ class FluxFold:
                         "provenance request references invalid memories"
                     )
                 return
-            self._validate_review(value, snapshot)
+            self._validate_review(memory_space_id, value, snapshot)
 
         first, _ = await self._structured_output(
             stage="subject_review",
@@ -1302,7 +1302,7 @@ class FluxFold:
             def validate_final(value: ReviewStageOutput) -> None:
                 if isinstance(value, ProvenanceRequestOutput):
                     raise ValidationError("provenance may only be requested once")
-                self._validate_review(value, snapshot)
+                self._validate_review(memory_space_id, value, snapshot)
 
             final, _ = await self._structured_output(
                 stage="subject_review",
@@ -1354,7 +1354,12 @@ class FluxFold:
         )
         return operation_id, provenance_viewed
 
-    def _validate_review(self, review: ReviewOutput, snapshot: SubjectSnapshot) -> None:
+    def _validate_review(
+        self,
+        memory_space_id: str,
+        review: ReviewOutput,
+        snapshot: SubjectSnapshot,
+    ) -> None:
         current = {memory.memory_id: memory for memory in snapshot.memories}
         update_ids = [update.memory_id for update in review.updates]
         if len(update_ids) != len(set(update_ids)):
@@ -1394,6 +1399,11 @@ class FluxFold:
                     and not content_changed
                 ):
                     raise ValidationError("replacement provenance is unchanged")
+                existing = self._store.existing_episode_ids(memory_space_id, episodes)
+                if not set(episodes) <= existing:
+                    raise ValidationError(
+                        "replacement provenance contains an invalid episode"
+                    )
 
     async def _split_subject(
         self,

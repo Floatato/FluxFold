@@ -24,6 +24,7 @@ class FakeGenerationProvider:
         split_result: str | None = None,
         split_missing_direct_first: bool = False,
         split_oversized_first: bool = False,
+        review_invalid_provenance_first: bool = False,
         association_search_once: bool = False,
         review_mode: str = "keep",
         extraction_delay_seconds: float = 0.0,
@@ -34,6 +35,7 @@ class FakeGenerationProvider:
         self.split_result = split_result
         self.split_missing_direct_first = split_missing_direct_first
         self.split_oversized_first = split_oversized_first
+        self.review_invalid_provenance_first = review_invalid_provenance_first
         self.association_search_once = association_search_once
         self.review_mode = review_mode
         self.extraction_delay_seconds = extraction_delay_seconds
@@ -43,6 +45,7 @@ class FakeGenerationProvider:
         self._association_requested = False
         self._illegal_split_emitted = False
         self._oversized_split_emitted = False
+        self._invalid_review_emitted = False
         self.active_extractions = 0
         self.max_active_extractions = 0
 
@@ -178,6 +181,27 @@ class FakeGenerationProvider:
                             }
                         ],
                         "retirements": [memories[1]["memory_id"]],
+                    }
+                )
+            elif (
+                self.review_invalid_provenance_first
+                and not self._invalid_review_emitted
+            ):
+                self._invalid_review_emitted = True
+                text = json.dumps(
+                    {
+                        "result": "review",
+                        "updates": [
+                            {
+                                "memory_id": memories[0]["memory_id"],
+                                "content_change": {"action": "keep"},
+                                "provenance_change": {
+                                    "action": "replace",
+                                    "episode_ids": ["missing-episode-id"],
+                                },
+                            }
+                        ],
+                        "retirements": [],
                     }
                 )
             else:
