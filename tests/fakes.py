@@ -29,7 +29,7 @@ class FakeGenerationProvider:
         review_mode: str = "keep",
         extraction_delay_seconds: float = 0.0,
         answer_delay_seconds: float = 0.0,
-        always_new_subject: bool = False,
+        always_new_domain: bool = False,
     ) -> None:
         self.benchmark_answer = benchmark_answer
         self.split_result = split_result
@@ -40,7 +40,7 @@ class FakeGenerationProvider:
         self.review_mode = review_mode
         self.extraction_delay_seconds = extraction_delay_seconds
         self.answer_delay_seconds = answer_delay_seconds
-        self.always_new_subject = always_new_subject
+        self.always_new_domain = always_new_domain
         self.requests: list[GenerationRequest] = []
         self._association_requested = False
         self._illegal_split_emitted = False
@@ -101,8 +101,8 @@ class FakeGenerationProvider:
                             "memories": [
                                 {
                                     "content": content,
-                                    "anchors": [
-                                        content if self.always_new_subject else "Alice"
+                                    "entities": [
+                                        content if self.always_new_domain else "Alice"
                                     ],
                                 }
                             ],
@@ -111,7 +111,7 @@ class FakeGenerationProvider:
                 )
             finally:
                 self.active_extractions -= 1
-        elif request.stage == "subject_linking":
+        elif request.stage == "domain_linking":
             payload = _original_json(request.user_prompt)
             if self.association_search_once and not self._association_requested:
                 self._association_requested = True
@@ -134,28 +134,28 @@ class FakeGenerationProvider:
                             "memory_id": memory["memory_id"],
                             "direct_assignments": [
                                 {
-                                    "anchor": anchor,
-                                    "subject": next(
+                                    "entity": entity,
+                                    "domain": next(
                                         candidate["name"]
                                         for candidate in candidates
-                                        if anchor in candidate["anchors"]
+                                        if entity in candidate["entities"]
                                         and (
-                                            not self.always_new_subject
-                                            or candidate["name"] == anchor
+                                            not self.always_new_domain
+                                            or candidate["name"] == entity
                                         )
                                     ),
                                 }
-                                for anchor in memory["anchors"]
+                                for entity in memory["entities"]
                             ],
-                            "contextual_subjects": [],
+                            "contextual_domains": [],
                         }
                         for memory in memories
                     ],
                 }
             )
-        elif request.stage == "subject_review":
+        elif request.stage == "domain_review":
             payload = _original_json(request.user_prompt)
-            memories = payload["subject"]["memories"]
+            memories = payload["domain"]["memories"]
             if (
                 self.review_mode == "provenance_request"
                 and payload["requested_provenance"] is None
@@ -212,19 +212,19 @@ class FakeGenerationProvider:
                         "retirements": [],
                     }
                 )
-        elif request.stage == "subject_summary_refresh":
+        elif request.stage == "domain_summary_refresh":
             payload = _original_json(request.user_prompt)
-            memories = payload["subject"]["memories"]
+            memories = payload["domain"]["memories"]
             text = json.dumps(
                 {
                     "result": "summary_refresh",
                     "summary": " ".join(memory["content"] for memory in memories),
                 }
             )
-        elif request.stage == "subject_split":
+        elif request.stage == "domain_split":
             payload = _original_json(request.user_prompt)
-            subject = payload["subject"]
-            memories = subject["memories"]
+            domain = payload["domain"]
+            memories = domain["memories"]
             memory_ids = [memory["memory_id"] for memory in memories]
             if (
                 self.split_missing_direct_first
@@ -242,7 +242,7 @@ class FakeGenerationProvider:
                 text = json.dumps(
                     {
                         "result": "full_split",
-                        "subjects": [
+                        "domains": [
                             {
                                 "name": "Alice's hiking trails",
                                 "links": links,
@@ -263,7 +263,7 @@ class FakeGenerationProvider:
                 text = json.dumps(
                     {
                         "result": "full_split",
-                        "subjects": [
+                        "domains": [
                             {
                                 "name": "Alice's hiking trails",
                                 "links": links,
@@ -281,7 +281,7 @@ class FakeGenerationProvider:
                 text = json.dumps(
                     {
                         "result": "full_split",
-                        "subjects": [
+                        "domains": [
                             {
                                 "name": "Alice's hiking trails",
                                 "links": [
@@ -303,7 +303,7 @@ class FakeGenerationProvider:
                 text = json.dumps(
                     {
                         "result": "partial_split",
-                        "new_subjects": [
+                        "new_domains": [
                             {
                                 "name": "Alice's hiking equipment",
                                 "links": [

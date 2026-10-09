@@ -49,7 +49,7 @@ class AliasProvider(FakeGenerationProvider):
                     "memories": [
                         {
                             "content": content,
-                            "anchors": ["Alice" if "first" in content else "Alicia"],
+                            "entities": ["Alice" if "first" in content else "Alicia"],
                         }
                     ],
                 }
@@ -57,7 +57,7 @@ class AliasProvider(FakeGenerationProvider):
         return await super().generate(request)
 
 
-def test_anchor_alias_resolution_is_atomic_persistent_and_warns(tmp_path):
+def test_entity_alias_resolution_is_atomic_persistent_and_warns(tmp_path):
     async def scenario():
         events = []
         generation = AliasProvider()
@@ -75,14 +75,14 @@ def test_anchor_alias_resolution_is_atomic_persistent_and_warns(tmp_path):
             space.memory_space_id, _episode("2", "Alicia second fact", 1)
         )
         bank = engine.memory_bank()[0]
-        assert [subject.name for subject in bank.subjects] == ["Alice"]
-        assert len(bank.subjects[0].memory_contents) == 2
+        assert [domain.name for domain in bank.domains] == ["Alice"]
+        assert len(bank.domains[0].memory_contents) == 2
         with engine._store._connect() as db:
-            assert db.execute("SELECT count(*) FROM anchors").fetchone()[0] == 1
-            assert db.execute("SELECT count(*) FROM memory_anchors").fetchone()[0] == 2
+            assert db.execute("SELECT count(*) FROM entities").fetchone()[0] == 1
+            assert db.execute("SELECT count(*) FROM memory_entities").fetchone()[0] == 2
         assert any(
             event["event_type"] == "name_normalized"
-            and event["object_kind"] == "anchor"
+            and event["object_kind"] == "entity"
             for event in events
         )
         feedback = [
@@ -98,7 +98,7 @@ def test_anchor_alias_resolution_is_atomic_persistent_and_warns(tmp_path):
     asyncio.run(scenario())
 
 
-def test_exact_name_reuse_works_when_subject_is_not_recalled(tmp_path, monkeypatch):
+def test_exact_name_reuse_works_when_domain_is_not_recalled(tmp_path, monkeypatch):
     async def scenario():
         engine = await FluxFold.open(
             db_path=str(tmp_path / "exact.db"),
@@ -109,36 +109,36 @@ def test_exact_name_reuse_works_when_subject_is_not_recalled(tmp_path, monkeypat
         await engine.add_episode(
             first.memory_space_id, _episode("1", "Alice likes hiking", 0)
         )
-        engine.config = FluxFoldConfig(subject_candidate_min_similarity=1.0)
+        engine.config = FluxFoldConfig(domain_candidate_min_similarity=1.0)
         result = await engine.add_episode(
             first.memory_space_id, _episode("2", "Alice bought land", 1)
         )
-        assert result.subjects_created == 0
-        assert len(engine.memory_bank()[0].subjects) == 1
+        assert result.domains_created == 0
+        assert len(engine.memory_bank()[0].domains) == 1
         other = await engine.create_or_open_space("other")
         await engine.add_episode(
             other.memory_space_id, _episode("other-1", "Alice plays piano", 0)
         )
-        assert len(engine._store.anchor_names(other.memory_space_id)) == 1
+        assert len(engine._store.entity_names(other.memory_space_id)) == 1
         with engine._store._connect() as db:
-            assert db.execute("SELECT count(*) FROM anchors").fetchone()[0] == 2
-            subject = engine._store.active_subject_ids(first.memory_space_id)[0]
+            assert db.execute("SELECT count(*) FROM entities").fetchone()[0] == 2
+            domain = engine._store.active_domain_ids(first.memory_space_id)[0]
             with pytest.raises(sqlite3.IntegrityError):
                 db.execute(
-                    "INSERT INTO subjects SELECT 'duplicate', memory_space_id, ' ALICE ', normalized_name, summary, lifecycle_status, new_memory_count, summary_revision, created_at, updated_at, retired_at, retired_by_operation_id FROM subjects WHERE subject_id=?",
-                    (subject,),
+                    "INSERT INTO domains SELECT 'duplicate', memory_space_id, ' ALICE ', normalized_name, summary, lifecycle_status, new_memory_count, summary_revision, created_at, updated_at, retired_at, retired_by_operation_id FROM domains WHERE domain_id=?",
+                    (domain,),
                 )
         await engine.close()
 
     asyncio.run(scenario())
 
 
-def test_failed_link_does_not_persist_anchors(tmp_path):
+def test_failed_link_does_not_persist_entities(tmp_path):
     class FailingProvider(FakeGenerationProvider):
         async def generate(self, request):
-            if request.stage == "subject_linking":
+            if request.stage == "domain_linking":
                 raise StageFailure(
-                    "subject_linking", ErrorClass.INVALID_STRUCTURED_OUTPUT, "invalid"
+                    "domain_linking", ErrorClass.INVALID_STRUCTURED_OUTPUT, "invalid"
                 )
             return await super().generate(request)
 
@@ -153,14 +153,14 @@ def test_failed_link_does_not_persist_anchors(tmp_path):
             await engine.add_episode(
                 space.memory_space_id, _episode("1", "Alice likes hiking", 0)
             )
-        assert engine._store.anchor_names(space.memory_space_id) == ()
-        assert engine._store.active_subject_ids(space.memory_space_id) == ()
+        assert engine._store.entity_names(space.memory_space_id) == ()
+        assert engine._store.active_domain_ids(space.memory_space_id) == ()
         await engine.close()
 
     asyncio.run(scenario())
 
 
-def test_batch_anchor_proposals_resolve_against_earlier_proposals(tmp_path):
+def test_batch_entity_proposals_resolve_against_earlier_proposals(tmp_path):
     async def scenario():
         engine = await FluxFold.open(
             db_path=str(tmp_path / "batch.db"),
@@ -183,7 +183,7 @@ def test_batch_anchor_proposals_resolve_against_earlier_proposals(tmp_path):
     asyncio.run(scenario())
 
 
-def test_split_reuses_existing_target_and_unions_anchor_membership(tmp_path):
+def test_split_reuses_existing_target_and_unions_entity_membership(tmp_path):
     class Provider(FakeGenerationProvider):
         def __init__(self):
             super().__init__()
@@ -192,17 +192,17 @@ def test_split_reuses_existing_target_and_unions_anchor_membership(tmp_path):
         async def generate(self, request):
             if request.stage == "memory_extraction":
                 payload = json.loads(request.user_prompt)
-                anchor = payload["episode"]["messages"][0]["content"]
+                entity = payload["episode"]["messages"][0]["content"]
                 return response(
                     {
                         "result": "memories",
                         "memories": [
-                            {"content": f"{anchor} fact {index}", "anchors": [anchor]}
+                            {"content": f"{entity} fact {index}", "entities": [entity]}
                             for index in range(6)
                         ],
                     }
                 )
-            if request.stage == "subject_split":
+            if request.stage == "domain_split":
                 self.requests.append(request)
                 return response(self.split_output)
             return await super().generate(request)
@@ -221,15 +221,15 @@ def test_split_reuses_existing_target_and_unions_anchor_membership(tmp_path):
         await engine.add_episode(space.memory_space_id, _episode("2", "Bob", 1))
         catalog = {
             entry.name: entry.object_id
-            for entry in engine._store.subject_names(space.memory_space_id)
+            for entry in engine._store.domain_names(space.memory_space_id)
         }
-        snapshot = engine._store.subject_snapshot(
+        snapshot = engine._store.domain_snapshot(
             space.memory_space_id, catalog["Alice"]
         )
         ids = [memory.memory_id for memory in snapshot.memories]
         generation.split_output = {
             "result": "full_split",
-            "subjects": [
+            "domains": [
                 {
                     "name": " bob ",
                     "links": [{"memory_id": mid, "basis": "direct"} for mid in ids[:3]],
@@ -253,12 +253,12 @@ def test_split_reuses_existing_target_and_unions_anchor_membership(tmp_path):
             )
         output = FullSplitOutput.model_validate(generation.split_output)
         engine._validate_split(space.memory_space_id, output, snapshot)
-        await engine._split_subject(
+        await engine._split_domain(
             space.memory_space_id, first.operation_id, snapshot, signature, "test"
         )
-        memberships = engine._store.subject_anchor_names(space.memory_space_id)
+        memberships = engine._store.domain_entity_names(space.memory_space_id)
         assert memberships[catalog["Bob"]] == {"Alice", "Bob"}
-        target = engine._store.subject_snapshot(space.memory_space_id, catalog["Bob"])
+        target = engine._store.domain_snapshot(space.memory_space_id, catalog["Bob"])
         assert len(target.memories) == 9
         assert target.new_memory_count == 2
         assert (
@@ -267,18 +267,18 @@ def test_split_reuses_existing_target_and_unions_anchor_membership(tmp_path):
             ]
             == "direct"
         )
-        assert catalog["Bob"] in engine._store.pending_summary_refresh_subject_ids(
+        assert catalog["Bob"] in engine._store.pending_summary_refresh_domain_ids(
             space.memory_space_id, first.operation_id
         )
-        assert catalog["Alice"] not in engine._store.active_subject_ids(
+        assert catalog["Alice"] not in engine._store.active_domain_ids(
             space.memory_space_id
         )
         assert [
             request
             for request in generation.requests
-            if request.stage == "subject_split"
-        ][0].user_prompt.find("anchors") == -1
-        output.subjects[1].name = "BOB"
+            if request.stage == "domain_split"
+        ][0].user_prompt.find("entities") == -1
+        output.domains[1].name = "BOB"
         with pytest.raises(ValidationError, match="unique"):
             engine._validate_split(space.memory_space_id, output, snapshot)
         await engine.close()
@@ -293,9 +293,9 @@ def test_name_scoring_and_zero_recall_defaults():
     assert scores[0] > scores[2] > scores[1] == 0
     config = FluxFoldConfig()
     assert (
-        config.subject_candidate_min_similarity
+        config.domain_candidate_min_similarity
         == config.memory_candidate_min_similarity
-        == config.search_subject_min_similarity
+        == config.search_domain_min_similarity
         == config.search_memory_min_similarity
         == 0
     )
@@ -309,7 +309,7 @@ def test_size_warnings_do_not_truncate_extraction_or_candidates(tmp_path, monkey
                     {
                         "result": "memories",
                         "memories": [
-                            {"content": f"Alice fact {index}", "anchors": ["Alice"]}
+                            {"content": f"Alice fact {index}", "entities": ["Alice"]}
                             for index in range(21)
                         ],
                     }
@@ -335,19 +335,19 @@ def test_size_warnings_do_not_truncate_extraction_or_candidates(tmp_path, monkey
             for event in events
         )
         entries = tuple(
-            NameEntry(str(index), f"Subject {index}", np.array([1.0]))
+            NameEntry(str(index), f"Domain {index}", np.array([1.0]))
             for index in range(33)
         )
-        monkeypatch.setattr(engine._store, "subject_names", lambda _: entries)
+        monkeypatch.setattr(engine._store, "domain_names", lambda _: entries)
         monkeypatch.setattr(
             engine._store,
-            "subject_anchor_names",
-            lambda _: {str(index): {f"Anchor {index // 3}"} for index in range(33)},
+            "domain_entity_names",
+            lambda _: {str(index): {f"Entity {index // 3}"} for index in range(33)},
         )
-        candidates, _ = engine._recall_initial_subject_candidates(
+        candidates, _ = engine._recall_initial_domain_candidates(
             space.memory_space_id,
             [np.array([1.0])],
-            [[f"Anchor {index}" for index in range(11)]],
+            [[f"Entity {index}" for index in range(11)]],
         )
         assert len(candidates) == 44
         assert any(
@@ -360,7 +360,7 @@ def test_size_warnings_do_not_truncate_extraction_or_candidates(tmp_path, monkey
     asyncio.run(scenario())
 
 
-def test_model_switch_rebuilds_anchor_vectors_and_space_delete_cleans_relations(
+def test_model_switch_rebuilds_entity_vectors_and_space_delete_cleans_relations(
     tmp_path,
 ):
     async def scenario():
@@ -374,7 +374,7 @@ def test_model_switch_rebuilds_anchor_vectors_and_space_delete_cleans_relations(
         await engine.add_episode(
             space.memory_space_id, _episode("1", "Alice likes hiking", 0)
         )
-        old_id = engine._store.anchor_names(space.memory_space_id)[0].object_id
+        old_id = engine._store.entity_names(space.memory_space_id)[0].object_id
         await engine.close()
         engine = await FluxFold.open(
             db_path=str(path),
@@ -384,7 +384,7 @@ def test_model_switch_rebuilds_anchor_vectors_and_space_delete_cleans_relations(
         rebuilt = await engine.rebuild_retrieval_embeddings(space.memory_space_id)
         with engine._store._connect() as db:
             row = db.execute(
-                "SELECT anchor_id, model_signature_id FROM anchors"
+                "SELECT entity_id, model_signature_id FROM entities"
             ).fetchone()
             assert tuple(row) == (old_id, rebuilt.model_signature_id)
         await engine.add_episode(
@@ -392,14 +392,14 @@ def test_model_switch_rebuilds_anchor_vectors_and_space_delete_cleans_relations(
         )
         await engine.delete_space(space.memory_space_id)
         with engine._store._connect() as db:
-            for table in ("anchors", "anchor_subjects", "memory_anchors"):
+            for table in ("entities", "entity_domains", "memory_entities"):
                 assert db.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
         await engine.close()
 
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("version", ["4", "5"])
+@pytest.mark.parametrize("version", ["4", "5", "6"])
 def test_old_schema_rejected_before_applying_new_ddl(tmp_path, version):
     from fluxfold.storage import Store
 
@@ -419,7 +419,7 @@ def test_old_schema_rejected_before_applying_new_ddl(tmp_path, version):
         ).fetchall() == [("schema_metadata",)]
 
 
-def test_direct_assignments_cover_anchors_without_counting_inherited_memberships(
+def test_direct_assignments_cover_entities_without_counting_inherited_memberships(
     tmp_path,
 ):
     from fluxfold.models import LinkingOutput
@@ -437,12 +437,12 @@ def test_direct_assignments_cover_anchors_without_counting_inherited_memberships
                         "memories": [
                             {
                                 "content": "A joint fact about six people.",
-                                "anchors": [f"Person {index}" for index in range(6)],
+                                "entities": [f"Person {index}" for index in range(6)],
                             }
                         ],
                     }
                 )
-            if request.stage == "subject_linking":
+            if request.stage == "domain_linking":
                 self.requests.append(request)
                 payload = json.loads(request.user_prompt)
                 return response(
@@ -453,15 +453,13 @@ def test_direct_assignments_cover_anchors_without_counting_inherited_memberships
                                 "memory_id": memory["memory_id"],
                                 "direct_assignments": [
                                     {
-                                        "anchor": anchor,
-                                        "subject": "Person 0"
-                                        if self.shared
-                                        else anchor,
+                                        "entity": entity,
+                                        "domain": "Person 0" if self.shared else entity,
                                     }
-                                    for anchor in memory["anchors"]
+                                    for entity in memory["entities"]
                                 ],
                                 # Duplicate contextual references to a direct target must collapse.
-                                "contextual_subjects": ["Person 0", "Person 0"],
+                                "contextual_domains": ["Person 0", "Person 0"],
                             }
                             for memory in payload["new_memories"]
                         ],
@@ -480,20 +478,20 @@ def test_direct_assignments_cover_anchors_without_counting_inherited_memberships
         first = await engine.add_episode(
             space.memory_space_id, _episode("1", "six people", 0)
         )
-        assert first.subjects_created == first.links_created == 6
+        assert first.domains_created == first.links_created == 6
         payload = json.loads(
             next(
                 r.user_prompt
                 for r in generation.requests
-                if r.stage == "subject_linking"
+                if r.stage == "domain_linking"
             )
         )
         assert payload["new_memories"][0]["link_limit"] == 6
-        assert "base_subjects" not in payload
-        # Simulate the all-anchor memberships inherited by split children.
+        assert "base_domains" not in payload
+        # Simulate the all-entity memberships inherited by split children.
         with engine._store._transaction() as db:
             db.execute(
-                "INSERT OR IGNORE INTO anchor_subjects SELECT anchor_id, subject_id FROM anchors CROSS JOIN subjects"
+                "INSERT OR IGNORE INTO entity_domains SELECT entity_id, domain_id FROM entities CROSS JOIN domains"
             )
         second = await engine.add_episode(
             space.memory_space_id, _episode("2", "six people again", 1)
@@ -506,33 +504,33 @@ def test_direct_assignments_cover_anchors_without_counting_inherited_memberships
         assert third.links_created == 1
         ids = [
             memory.memory_id
-            for memory in engine._store.subject_snapshot(
+            for memory in engine._store.domain_snapshot(
                 space.memory_space_id,
-                engine._store.subject_names(space.memory_space_id)[0].object_id,
+                engine._store.domain_names(space.memory_space_id)[0].object_id,
             ).memories
         ]
         assert payload["new_memories"][0]["memory_id"] in ids
-        anchors = [f"Person {index}" for index in range(6)]
+        entities = [f"Person {index}" for index in range(6)]
         valid = {
             "result": "links",
             "memories": [
                 {
                     "memory_id": "test-id",
                     "direct_assignments": [
-                        {"anchor": name, "subject": name} for name in anchors
+                        {"entity": name, "domain": name} for name in entities
                     ],
-                    "contextual_subjects": [],
+                    "contextual_domains": [],
                 }
             ],
         }
         output = LinkingOutput.model_validate(valid)
-        output.memories[0].direct_assignments[-1].anchor = anchors[0]
+        output.memories[0].direct_assignments[-1].entity = entities[0]
         with pytest.raises(ValidationError, match="exactly one direct assignment"):
             engine._validate_linking(
                 output,
                 ["test-id"],
-                {"test-id": set(anchors)},
-                [anchors],
+                {"test-id": set(entities)},
+                [entities],
                 space.memory_space_id,
             )
         await engine.close()
@@ -540,7 +538,7 @@ def test_direct_assignments_cover_anchors_without_counting_inherited_memberships
     asyncio.run(scenario())
 
 
-def test_retired_subjects_are_recalled_rebuilt_and_reactivated_without_old_links(
+def test_retired_domains_are_recalled_rebuilt_and_reactivated_without_old_links(
     tmp_path,
 ):
     class Provider(FakeGenerationProvider):
@@ -552,17 +550,17 @@ def test_retired_subjects_are_recalled_rebuilt_and_reactivated_without_old_links
                     {
                         "result": "memories",
                         "memories": [
-                            {"content": f"Alice fact {index}", "anchors": ["Alice"]}
+                            {"content": f"Alice fact {index}", "entities": ["Alice"]}
                             for index in range(12)
                         ],
                     }
                 )
-            if request.stage == "subject_split":
+            if request.stage == "domain_split":
                 return response(self.split_output)
             return await super().generate(request)
 
     async def scenario():
-        generation = Provider(always_new_subject=True)
+        generation = Provider(always_new_domain=True)
         path = str(tmp_path / "lifecycle.db")
         engine = await FluxFold.open(
             db_path=path,
@@ -572,15 +570,15 @@ def test_retired_subjects_are_recalled_rebuilt_and_reactivated_without_old_links
         space = await engine.create_or_open_space("lifecycle")
         sid = space.memory_space_id
         first = await engine.add_episode(sid, _episode("1", "Alice facts", 0))
-        root = engine._store.subject_names(sid)[0].object_id
+        root = engine._store.domain_names(sid)[0].object_id
 
-        async def split(subject_id, names, operation_id):
-            snapshot = engine._store.subject_snapshot(sid, subject_id)
+        async def split(domain_id, names, operation_id):
+            snapshot = engine._store.domain_snapshot(sid, domain_id)
             ids = [memory.memory_id for memory in snapshot.memories]
             half = len(ids) // 2
             generation.split_output = {
                 "result": "full_split",
-                "subjects": [
+                "domains": [
                     {
                         "name": name,
                         "links": [
@@ -590,7 +588,7 @@ def test_retired_subjects_are_recalled_rebuilt_and_reactivated_without_old_links
                     for name, part in zip(names, [ids[:half], ids[half:]], strict=True)
                 ],
             }
-            await engine._split_subject(
+            await engine._split_domain(
                 sid,
                 operation_id,
                 snapshot,
@@ -607,36 +605,34 @@ def test_retired_subjects_are_recalled_rebuilt_and_reactivated_without_old_links
         with engine._store._connect() as db:
             with pytest.raises(sqlite3.IntegrityError):
                 db.execute(
-                    "INSERT INTO subjects SELECT 'duplicate-root', memory_space_id, name, normalized_name, summary, 'active', new_memory_count, summary_revision, created_at, updated_at, NULL, NULL FROM subjects WHERE subject_id=?",
+                    "INSERT INTO domains SELECT 'duplicate-root', memory_space_id, name, normalized_name, summary, 'active', new_memory_count, summary_revision, created_at, updated_at, NULL, NULL FROM domains WHERE domain_id=?",
                     (root,),
                 )
         catalog = {
-            entry.name: entry.object_id for entry in engine._store.subject_names(sid)
+            entry.name: entry.object_id for entry in engine._store.domain_names(sid)
         }
         work = catalog["Alice work"]
         old_work_memories = await split(
             work, ["Alice work projects", "Alice work team"], first.operation_id
         )
-        assert root not in engine._store.active_subject_ids(sid)
-        assert work not in engine._store.active_subject_ids(sid)
+        assert root not in engine._store.active_domain_ids(sid)
+        assert work not in engine._store.active_domain_ids(sid)
         vector = (await engine._embed_queries(["Alice"]))[0]
-        candidates, _ = engine._recall_initial_subject_candidates(
+        candidates, _ = engine._recall_initial_domain_candidates(
             sid, [vector], [["Alice"]]
         )
         assert len(candidates) == 4
         assert "Alice" in {item["name"] for item in candidates}
-        hits = engine._store.candidate_subjects(
-            sid, vector, top_k=20, min_similarity=-1
-        )
-        assert {root, work} <= {hit.subject_id for hit in hits}
+        hits = engine._store.candidate_domains(sid, vector, top_k=20, min_similarity=-1)
+        assert {root, work} <= {hit.domain_id for hit in hits}
         assert (
-            next(hit for hit in hits if hit.subject_id == root).attached_memory_id
+            next(hit for hit in hits if hit.domain_id == root).attached_memory_id
             is None
         )
         result = await engine.search(sid, "Alice")
-        assert not {root, work} & {subject.subject_id for subject in result.subjects}
-        # Retrieval alone does not restore either retired subject.
-        assert root not in engine._store.active_subject_ids(sid)
+        assert not {root, work} & {domain.domain_id for domain in result.domains}
+        # Retrieval alone does not restore either retired domain.
+        assert root not in engine._store.active_domain_ids(sid)
         await engine.close()
         engine = await FluxFold.open(
             db_path=path,
@@ -644,37 +640,37 @@ def test_retired_subjects_are_recalled_rebuilt_and_reactivated_without_old_links
             embedding_provider=FakeEmbeddingProvider(revision="2"),
         )
         rebuilt = await engine.rebuild_retrieval_embeddings(sid)
-        assert rebuilt.subjects_embedded == 5
-        assert len(engine._store.subject_names(sid)) == 5
+        assert rebuilt.domains_embedded == 5
+        assert len(engine._store.domain_names(sid)) == 5
         second = await engine.add_episode(sid, _episode("2", "new Alice facts", 1))
-        assert second.subjects_created == 0
-        restored = engine._store.subject_snapshot(sid, root)
+        assert second.domains_created == 0
+        restored = engine._store.domain_snapshot(sid, root)
         assert len(restored.memories) == 12
         assert not old_root_memories & {
             memory.memory_id for memory in restored.memories
         }
-        assert work not in engine._store.active_subject_ids(sid)
+        assert work not in engine._store.active_domain_ids(sid)
         # Split also reuses a retired target with the same normalized name.
         await split(root, [" ALICE WORK ", "Alice travel"], second.operation_id)
-        assert work in engine._store.active_subject_ids(sid)
-        reused = engine._store.subject_snapshot(sid, work)
+        assert work in engine._store.active_domain_ids(sid)
+        reused = engine._store.domain_snapshot(sid, work)
         assert len(reused.memories) == 6
         assert not old_work_memories & {memory.memory_id for memory in reused.memories}
         with engine._store._connect() as db:
             row = db.execute(
-                "SELECT retired_at, retired_by_operation_id FROM subjects WHERE subject_id=?",
+                "SELECT retired_at, retired_by_operation_id FROM domains WHERE domain_id=?",
                 (work,),
             ).fetchone()
             assert tuple(row) == (None, None)
             assert (
                 db.execute(
-                    "SELECT count(*) FROM subjects WHERE normalized_name='alice work'"
+                    "SELECT count(*) FROM domains WHERE normalized_name='alice work'"
                 ).fetchone()[0]
                 == 1
             )
             assert (
                 db.execute(
-                    "SELECT count(*) FROM domain_operation_effects WHERE object_id=? AND effect_type='reactivated'",
+                    "SELECT count(*) FROM memory_operation_effects WHERE object_id=? AND effect_type='reactivated'",
                     (work,),
                 ).fetchone()[0]
                 == 1
@@ -684,8 +680,8 @@ def test_retired_subjects_are_recalled_rebuilt_and_reactivated_without_old_links
     asyncio.run(scenario())
 
 
-def test_public_search_filters_empty_subjects_before_top_k(tmp_path):
-    from fluxfold.storage import PreparedSubject
+def test_public_search_filters_empty_domains_before_top_k(tmp_path):
+    from fluxfold.storage import PreparedDomain
 
     async def scenario():
         engine = await FluxFold.open(
@@ -693,7 +689,7 @@ def test_public_search_filters_empty_subjects_before_top_k(tmp_path):
             generation_provider=FakeGenerationProvider(),
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig(
-                search_subject_top_k=1, search_subject_min_similarity=-1.0
+                search_domain_top_k=1, search_domain_min_similarity=-1.0
             ),
         )
         space = await engine.create_or_open_space("empty")
@@ -705,24 +701,24 @@ def test_public_search_filters_empty_subjects_before_top_k(tmp_path):
             space.memory_space_id, engine._embedding.model_info
         )
         with engine._store._transaction() as db:
-            engine._store._insert_subject(
+            engine._store._insert_domain(
                 db,
                 space.memory_space_id,
-                PreparedSubject("empty", "empty exact match", None, vector, None),
+                PreparedDomain("empty", "empty exact match", None, vector, None),
                 added.operation_id,
                 signature,
                 1,
             )
-        write_hits = engine._store.candidate_subjects(
+        write_hits = engine._store.candidate_domains(
             space.memory_space_id, vector, top_k=1, min_similarity=-1
         )
-        assert write_hits[0].subject_id == "empty"
-        public = engine._store._scan_subjects(
+        assert write_hits[0].domain_id == "empty"
+        public = engine._store._scan_domains(
             space.memory_space_id, vector, 1, -1, public=True
         )
         assert len(public) == 1 and public[0][0] != "empty"
         result = await engine.search(space.memory_space_id, "empty exact match")
-        assert all(subject.subject_id != "empty" for subject in result.subjects)
+        assert all(domain.domain_id != "empty" for domain in result.domains)
         await engine.close()
 
     asyncio.run(scenario())

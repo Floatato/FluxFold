@@ -50,7 +50,7 @@ MIRIX 和 Hindsight 则完全没有对各自的记忆划分做消融。MIRIX 的
 
 ### 1.4 动态聚类的现有尝试与其失效点
 
-另一类工作放弃固定类型，改为按内容动态形成组织单元。它们与 FluxFold 的 subject 最为接近，因此需要逐一说明差别。
+另一类工作放弃固定类型，改为按内容动态形成组织单元。它们与 FluxFold 的 domain 最为接近，因此需要逐一说明差别。
 
 **EverMemOS 的 MemScene** 是增量语义聚类：新 MemCell 计算 embedding，在时间间隔满足 `tc - tlast(S) ≤ Δmax` 的候选 scene 中找质心 cosine 最高者，满足 `sim > τ` 且无 profile 冲突则并入并用滑动均值更新质心，否则新建 scene。这一设计有两处结构性弱点，且论文自己的数据就暴露了它们：
 
@@ -100,7 +100,7 @@ MIRIX 和 Hindsight 则完全没有对各自的记忆划分做消融。MIRIX 的
 
 但这些优势主要发生在添加与整理阶段。进入检索阶段后，系统需要判断的是“哪一条记忆能够回答当前 query”，而图中表达的是“哪些信息彼此存在结构关联”。**结构关联（association）并不等同于 query 条件下的证据相关性（query-conditioned relevance）。**
 
-图记忆通常同时使用两类信号：`content-based relevance`（BM25 等 lexical 或 embedding cosine 等 semantic）直接比较 query 与节点内容；`structural relevance` 先依据 query 找 anchor，再沿邻接关系扩展，用 hop distance 或传播 activation 衡量接近程度。具体实现各异——Mem0<sup>g</sup> 同时使用 entity-centric graph retrieval 和 query-to-triplet semantic retrieval；Graphiti 支持 BM25、cosine、BFS 及多种 reranker，默认搜索主要是 BM25、cosine 与 RRF 的组合。因此问题不在某个具体打分公式，而在所有邻域扩展共同面对的限制：**图距离只说明候选与 anchor 在现有图中有多近，不保证它对当前 query 有多重要。**
+图记忆通常同时使用两类信号：`content-based relevance`（BM25 等 lexical 或 embedding cosine 等 semantic）直接比较 query 与节点内容；`structural relevance` 先依据 query 找 entity，再沿邻接关系扩展，用 hop distance 或传播 activation 衡量接近程度。具体实现各异——Mem0<sup>g</sup> 同时使用 entity-centric graph retrieval 和 query-to-triplet semantic retrieval；Graphiti 支持 BM25、cosine、BFS 及多种 reranker，默认搜索主要是 BM25、cosine 与 RRF 的组合。因此问题不在某个具体打分公式，而在所有邻域扩展共同面对的限制：**图距离只说明候选与 entity 在现有图中有多近，不保证它对当前 query 有多重要。**
 
 这一限制在个人 Agent 场景中尤其明显。如果抽取策略反复把事实连接到 `user`、常见人物或高频主题，这些节点就会成为 hub，大量内容距离 `user` 只有一到两跳，hop distance 因而失去区分力。SYNAPSE 的消融量化了这一点：关闭 Fan Effect（不按节点出度稀释 activation）后，Open-Domain 从 25.9 跌至 16.8，平均 F1 从 40.5 跌至 36.1，论文的解释正是 common-entity hub 积累了过多能量并淹没了具体信号。
 
@@ -187,52 +187,52 @@ CompassMem 引入了 query-conditioned 的主动探索：Planner 把 query 拆�
 
 FluxFold 的核心工程判断是：**读取路径不使用 LLM，全部 LLM 成本前移到写入与整理阶段。**
 
-公开 `search(query)` 只做精确向量检索——两个通道分别计算 query 与 active subject name embedding、active memory content embedding 的 cosine 相似度，按 top-k 和最低相似度阈值筛选，合并后只按真实 link 去重整理，不计算融合分数、不重排、不做第二轮筛选，也不改写 query。按 §3.3 的量级分组，这把检索成本放在“纯向量”一档，同时避免了 §1.3 的路由单点失效。
+公开 `search(query)` 只做精确向量检索——两个通道分别计算 query 与 active domain name embedding、active memory content embedding 的 cosine 相似度，按 top-k 和最低相似度阈值筛选，合并后只按真实 link 去重整理，不计算融合分数、不重排、不做第二轮筛选，也不改写 query。按 §3.3 的量级分组，这把检索成本放在“纯向量”一档，同时避免了 §1.3 的路由单点失效。
 
-相应地，写入阶段承担五类 LLM 调用：memory extraction、批量 Subject linking、Subject review、Subject split、统一 Subject summary refresh。这个取舍的合理性依赖一个前提：**在写入时把关系整理清楚，检索时就不必用 LLM 临时重建关系。** 这个前提是否成立，需要实验验证；§6.6 列出了它可能不成立的情形。
+相应地，写入阶段承担五类 LLM 调用：memory extraction、批量 Domain linking、Domain review、Domain split、统一 Domain summary refresh。这个取舍的合理性依赖一个前提：**在写入时把关系整理清楚，检索时就不必用 LLM 临时重建关系。** 这个前提是否成立，需要实验验证；§6.6 列出了它可能不成立的情形。
 
-### 6.2 设计一：subject 作为有界、可自我具体化的动态组织单元
+### 6.2 设计一：domain 作为有界、可自我具体化的动态组织单元
 
-`subject` 是围绕人物、项目、话题、事件或其他可独立组织范围的一组记忆，通过 `subject_memory_links` 与 memory 多对多关联。它与前述各类组织单元的关键差别在于**规模有界且会自我具体化**：
+`domain` 是围绕人物、项目、话题、事件或其他可独立组织范围的一组记忆，通过 `domain_memory_links` 与 memory 多对多关联。它与前述各类组织单元的关键差别在于**规模有界且会自我具体化**：
 
-- **有界维护。** 一个 subject 自上次成功 review 或 split 后每新增 8 条带有新 active link 的 memory，触发一次 review。review 读取该 subject 当前**全部** active memories（而非仅新增的 8 条），可以保留、修改和全局退役记忆，用兄妹记忆编译正文（指代补全、约束写回、实例对齐、类别上提）；summary 留给本 episode 最后的统一 refresh。这正是 §1.1 中固定分类无法提供的操作：一个规模可控、语义内聚、可被完整复核的子集。
-- **达到阈值后分裂。** active memory 数达到 24 或 latest content 总字符数达到 8,000 时尝试 split，结果只能是 `full_split`（创建 2–5 个更具体的新 subject，原 subject 退役）、`partial_split`（拆出 1–4 个新 subject，原 subject 保留 ID、name 和 active 状态）或 `defer_split`（当前记忆无法形成有意义的分组，记录 warning，下次再有 link 时重试）。分组依据是“未来是否需要独立检索、更新和增长”，而不是平均分配数量；结果 name 必须保留原主体锚点并表达具体领域、项目模块、事件阶段或人物关系，不允许 `Other`、`Misc` 这类没有语义边界的名称。
+- **有界维护。** 一个 domain 自上次成功 review 或 split 后每新增 8 条带有新 active link 的 memory，触发一次 review。review 读取该 domain 当前**全部** active memories（而非仅新增的 8 条），可以保留、修改和全局退役记忆，用兄妹记忆编译正文（指代补全、约束写回、实例对齐、类别上提）；summary 留给本 episode 最后的统一 refresh。这正是 §1.1 中固定分类无法提供的操作：一个规模可控、语义内聚、可被完整复核的子集。
+- **达到阈值后分裂。** active memory 数达到 24 或 latest content 总字符数达到 8,000 时尝试 split，结果只能是 `full_split`（创建 2–5 个更具体的新 domain，原 domain 退役）、`partial_split`（拆出 1–4 个新 domain，原 domain 保留 ID、name 和 active 状态）或 `defer_split`（当前记忆无法形成有意义的分组，记录 warning，下次再有 link 时重试）。分组依据是“未来是否需要独立检索、更新和增长”，而不是平均分配数量；结果 name 必须保留原主体实体并表达具体领域、项目模块、事件阶段或人物关系，不允许 `Other`、`Misc` 这类没有语义边界的名称。
 
-这使得 subject 的语义随记忆积累而演进：初期可能接近实体（`Mike`），随后分化出 `Mike's dietary preferences`、`用户在项目 A 中的代码风格偏好` 这类更具体的组织单元。
+这使得 domain 的语义随记忆积累而演进：初期可能接近实体（`Mike`），随后分化出 `Mike's dietary preferences`、`用户在项目 A 中的代码风格偏好` 这类更具体的组织单元。
 
 **与最接近的参考工作的差别：**
 
-| 参考单元 | 组织方式 | 与 subject 的关键差别 |
+| 参考单元 | 组织方式 | 与 domain 的关键差别 |
 |---|---|---|
-| EverMemOS MemScene | 质心相似度 + 时间窗 `Δmax` 增量吸收 | 只吸收不分裂，质心随成员增多而钝化；`Δmax` 切断长周期主题；LoCoMo 实测平均规模 1.84、Separation +0.007。subject 无时间门、无质心，且到达阈值必须尝试分裂 |
-| MemBox Trace | event 相似度 + LLM 验证的事件轨迹 | 论文自述只覆盖事件型内容，不覆盖偏好、关系、人格、持续约束。subject 不限定内容形态 |
-| CompassMem Topic | 对全部节点批量 K-means | 重聚类破坏组织单元的稳定身份，无法围绕它做增量维护。subject 有稳定 ID，partial split 明确保留原 ID 与 name |
-| ByteRover Context Tree | LLM 直接 curate 的 Domain→Topic→Subtopic 层次 | 维护一棵持久层次树，需要保证全局一致性。FluxFold 不保存 subject 层级、不主动维护包含关系；包含关系只在 LLM 单次判断“direct 归属只落到更具体的那个”时使用，不落库、不校验 |
-| 图记忆的 entity node | 抽取时按实体命名 | entity 的语义在系统生命周期内固定，度数无上界；subject 的语义会具体化，规模有软阈值并触发整理 |
+| EverMemOS MemScene | 质心相似度 + 时间窗 `Δmax` 增量吸收 | 只吸收不分裂，质心随成员增多而钝化；`Δmax` 切断长周期主题；LoCoMo 实测平均规模 1.84、Separation +0.007。domain 无时间门、无质心，且到达阈值必须尝试分裂 |
+| MemBox Trace | event 相似度 + LLM 验证的事件轨迹 | 论文自述只覆盖事件型内容，不覆盖偏好、关系、人格、持续约束。domain 不限定内容形态 |
+| CompassMem Topic | 对全部节点批量 K-means | 重聚类破坏组织单元的稳定身份，无法围绕它做增量维护。domain 有稳定 ID，partial split 明确保留原 ID 与 name |
+| ByteRover Context Tree | LLM 直接 curate 的 Domain→Topic→Subtopic 层次 | 维护一棵持久层次树，需要保证全局一致性。FluxFold 不保存 domain 层级、不主动维护包含关系；包含关系只在 LLM 单次判断“direct 归属只落到更具体的那个”时使用，不落库、不校验 |
+| 图记忆的 entity node | 抽取时按实体命名 | entity 的语义在系统生命周期内固定，度数无上界；domain 的语义会具体化，规模有软阈值并触发整理 |
 
-**subject 在检索中的桥接作用**也与 hub 节点不同。`search` 的两个通道互相附带关联实体：Subject 通道召回最多 5 个 subject，每个附带其 active memories 中与 query 最相似的 1 条；Memory 通道召回最多 15 条 memory，每条附带其 active subjects 中 name embedding 与 query 最相似的 1 个。结果按 subject 去重分组，只有 Subject 通道直接命中的最多 5 个 subject 展示 summary；Memory 通道额外带入的 subject 只展示 name。因为 subject name 是较短、较概括的文本，两条互相不相似的记忆可以同时与同一个 subject name 保持较高相似度，subject 因而成为它们之间的桥。与图 hub 的区别在于：subject 的成员集合是**有界且被整理过的**（review 编译成员正文、统一 refresh 重写 summary、split 拆分过大的 subject），而 hub 节点的邻居是无界累积的——§3.1 中 SYNAPSE 需要 Fan Effect 抑制的正是后者。
+**domain 在检索中的桥接作用**也与 hub 节点不同。`search` 的两个通道互相附带关联对象：Domain 通道召回最多 5 个 domain，每个附带其 active memories 中与 query 最相似的 1 条；Memory 通道召回最多 15 条 memory，每条附带其 active domains 中 name embedding 与 query 最相似的 1 个。结果按 domain 去重分组，只有 Domain 通道直接命中的最多 5 个 domain 展示 summary；Memory 通道额外带入的 domain 只展示 name。因为 domain name 是较短、较概括的文本，两条互相不相似的记忆可以同时与同一个 domain name 保持较高相似度，domain 因而成为它们之间的桥。与图 hub 的区别在于：domain 的成员集合是**有界且被整理过的**（review 编译成员正文、统一 refresh 重写 summary、split 拆分过大的 domain），而 hub 节点的邻居是无界累积的——§3.1 中 SYNAPSE 需要 Fan Effect 抑制的正是后者。
 
-不过必须准确描述这个机制的分工。一次 search 只做一跳附带、每个候选只附带 1 个关联实体，且 Subject 通道按 **name** 排序、仅该通道命中才展示 summary。因此：
+不过必须准确描述这个机制的分工。一次 search 只做一跳附带、每个候选只附带 1 个关联对象，且 Domain 通道按 **name** 排序、仅该通道命中才展示 summary。因此：
 
-- **association_search 与 contextual link 负责装箱**：把常识上会被新记忆改变、约束或补全、但文本并不相似的记录收进同一 subject。没有这一步，review 看不见箱子外面的那一跳。
-- **统一 summary refresh 负责可展示的索引卡**：link、review 和 split 全部结束后，根据目标 subject 当时的全部成员重写 summary，供 Subject 通道命中时使用。它不改 memory 正文，也不参与默认的 subject 排序。
+- **association_search 与 contextual link 负责装箱**：把常识上会被新记忆改变、约束或补全、但文本并不相似的记录收进同一 domain。没有这一步，review 看不见箱子外面的那一跳。
+- **统一 summary refresh 负责可展示的索引卡**：link、review 和 split 全部结束后，根据目标 domain 当时的全部成员重写 summary，供 Domain 通道命中时使用。它不改 memory 正文，也不参与默认的 domain 排序。
 - **review 负责箱内编译**：用兄妹记忆补全指代、把约束写回被影响的 memory（带时限）、对齐平行实例的句式、上提类别词，并重算 content embedding。只有这一步能让 Memory 通道在 query 只命中其中一跳时仍检索到完整证据；跨记忆关系由随后的 refresh 写入 summary。
 
-§2.2 的种牙/饮酒例子中，种牙记忆写入时 association_search 把饮食 subject 拉进候选并建 contextual；refresh 让饮食 summary 立刻带上术后限制；review 再把时限写进饮酒偏好正文。三者缺一，纯向量读路径都会在某一类 query 上失败。这也意味着该能力依赖 linking 召回、summary 质量和 review 改写，而不是检索结构本身。
+§2.2 的种牙/饮酒例子中，种牙记忆写入时 association_search 把饮食 domain 拉进候选并建 contextual；refresh 让饮食 summary 立刻带上术后限制；review 再把时限写进饮酒偏好正文。三者缺一，纯向量读路径都会在某一类 query 上失败。这也意味着该能力依赖 linking 召回、summary 质量和 review 改写，而不是检索结构本身。
 
-FluxFold 把 memory version、provenance 和 active link 作为事实源，subject summary 只是写入期生成的派生检索文本。每个 episode 持久化自己的 refresh targets 和完成状态，失败恢复只重试未完成项；系统仍不扫描全空间。候选集合限定为 link 新增 memory 的 subject、被 review 的 subject、link/split 新建 subject，并排除 full split 退役的 subject。共享 memory 因另一个 subject 的 review 发生变化时，其他 linked subjects 不被扩散加入集合，因而仍可能保留旧表述。这个取舍既让本 episode 明确负责的 summary 可恢复收敛，又避免一次局部修改扩散成全空间 LLM 维护。
+FluxFold 把 memory version、provenance 和 active link 作为事实源，domain summary 只是写入期生成的派生检索文本。每个 episode 持久化自己的 refresh targets 和完成状态，失败恢复只重试未完成项；系统仍不扫描全空间。候选集合限定为 link 新增 memory 的 domain、被 review 的 domain、link/split 新建 domain，并排除 full split 退役的 domain。共享 memory 因另一个 domain 的 review 发生变化时，其他 linked domains 不被扩散加入集合，因而仍可能保留旧表述。这个取舍既让本 episode 明确负责的 summary 可恢复收敛，又避免一次局部修改扩散成全空间 LLM 维护。
 
 ### 6.3 设计二：写入期的主动关联检索与双通道候选召回
 
 针对 §2 的问题，以及 §3.2 中 LoCoMo multi-hop / open-domain 与 LongMemEval multi-session 的难点，FluxFold 在写入阶段把「装箱」和「编译」分开：
 
-**name-only 被动召回。** 以每条新 memory content 为 query，按 subject name embedding 取相似度 ≥ 0.25 的前 5 个。每条 memory 的前 2 个直接保留；所有命中再按 subject 聚合，以跨 memories 的最高相似度排序取全局前 10。两部分合并去重后，linking prompt 只展示 subject ID 和 name，不展示相似度、候选 memory 或 subject summary。相比 A-MEM 的 5 个 dense memory 近邻，这一入口直接比较组织单元，并通过批次聚合让多条相关 memories 共同扩大有限候选池。
+**name-only 被动召回。** 以每条新 memory content 为 query，按 domain name embedding 取相似度 ≥ 0.25 的前 5 个。每条 memory 的前 2 个直接保留；所有命中再按 domain 聚合，以跨 memories 的最高相似度排序取全局前 10。两部分合并去重后，linking prompt 只展示 domain ID 和 name，不展示相似度、候选 memory 或 domain summary。相比 A-MEM 的 5 个 dense memory 近邻，这一入口直接比较组织单元，并通过批次聚合让多条相关 memories 共同扩大有限候选池。
 
-**最多五次主动关联检索。** 批量 linking 作为一个 agent loop，最多调用 5 次 `association_search(query)`。query 必须写成某条新记忆本身（加上常识）会改变或约束的另一主题名称，而不是复述新记忆：种牙去找 `Mike's dietary preferences` / `Mike's diet plan`，驾照停权去找 `Mike's travel plans` / `Mike's commute`，夜班去找 `Mike's evening plans` / `Mike's sleep schedule`。主动结果保留原来的双通道详细展示：Subject 通道带代表 memory，Memory 通道带关联 subject；各轮结果累积供最终决策使用。搜到的可以是漏掉的 direct home，也可以是 contextual 目标。Linking 只决定成员关系，不改写已有正文。
+**最多五次主动关联检索。** 批量 linking 作为一个 agent loop，最多调用 5 次 `association_search(query)`。query 必须写成某条新记忆本身（加上常识）会改变或约束的另一主题名称，而不是复述新记忆：种牙去找 `Mike's dietary preferences` / `Mike's diet plan`，驾照停权去找 `Mike's travel plans` / `Mike's commute`，夜班去找 `Mike's evening plans` / `Mike's sleep schedule`。主动结果保留原来的双通道详细展示：Domain 通道带代表 memory，Memory 通道带关联 domain；各轮结果累积供最终决策使用。搜到的可以是漏掉的 direct home，也可以是 contextual 目标。Linking 只决定成员关系，不改写已有正文。
 
-**批量决策、episode 原子提交。** 程序为本 episode 的全部新 memory 分配临时 `memory_ref`，合并初始候选后用一个 agent loop 输出整批 links。多条 memory 可以共同引用同一个新 subject ref；最终校验完成后才分配正式 subject ID，并把整批 memory、provenance、links 和 extraction completion 原子提交，因此工具轮次不会暴露部分正式结果。
+**批量决策、episode 原子提交。** 程序为本 episode 的全部新 memory 分配临时 `memory_ref`，合并初始候选后用一个 agent loop 输出整批 links。多条 memory 可以共同引用同一个新 domain ref；最终校验完成后才分配正式 domain ID，并把整批 memory、provenance、links 和 extraction completion 原子提交，因此工具轮次不会暴露部分正式结果。
 
-每条 link 记录 `direct` 或 `contextual` 依据：`direct` 表示该 subject 是这条 memory 的组织归属；`contextual` 表示 memory 会具体补全、约束、更新或解释该 subject 下已归档的信息。`contextual` 不表示较低优先级，两类 link 都参与 review、summary 和 search，第一版不据此调整检索分数。把文本不相似、但会被这条新记忆改变或约束的记录收进同一 subject，正是通过这次装箱完成的。
+每条 link 记录 `direct` 或 `contextual` 依据：`direct` 表示该 domain 是这条 memory 的组织归属；`contextual` 表示 memory 会具体补全、约束、更新或解释该 domain 下已归档的信息。`contextual` 不表示较低优先级，两类 link 都参与 review、summary 和 search，第一版不据此调整检索分数。把文本不相似、但会被这条新记忆改变或约束的记录收进同一 domain，正是通过这次装箱完成的。
 
 需要说明的是，`association_search` 目前上限为 5 次调用，且 design.md 已将“对关闭、单轮与多轮主动关联性检索做消融，评估关联召回率、错误 link 和调用成本”列为待验证项。按 §5 的结论，这项消融必须通过**重建 memory space** 进行，不能在固定记忆库上关闭读取通道。
 
@@ -244,8 +244,8 @@ FluxFold 把 memory version、provenance 和 active link 作为事实源，subje
 - memory 的稳定身份（`memory_id`）与内容历史（`memory_versions`）分离，历史版本各自保留自己的 provenance。修改记忆创建新版本，旧版本 `is_latest` 置 0。
 - **review 可以按需读取来源。** 仅当 content 与元数据不足以解决重复、冲突、纠正、状态变化、信息归属或若干记忆必须共享的日期时，首轮可以输出 `provenance_request`，一次最多指定 8 个 memory ID，系统返回这些记忆当前 provenance 涉及的全部 episodes；获得来源后必须输出最终结果，不能再次请求。这是与 Graphiti、Mem0 的直接差别——后两者的冲突判断 prompt 里没有任何来源正文的位置。
 - **冲突不被默认覆盖。** review 不能默认新事实覆盖旧事实，也不能仅因时间较早退役某条记忆；只允许拼接共同描述同一个、不可独立更新事实的 memories，不同但相关、可以分别变化的事实继续分开（包括同一问题的两跳）；无法解决的冲突应保留，由随后统一生成的 summary 准确表达不确定性。
-- **同一 subject 内编译正文。** 在不去掉独立生命周期的前提下，review 用兄妹记忆把不完整指代写全、把约束写进被影响的那条、把平行实例改成可并列检索的句式、把实例上提为类别词，使 Memory 通道在 query 只命中一跳时仍能检索到完整证据。这是 extractor「不跨 episode 推测」之后、读路径纯向量之前的加工步骤。
-- **退役是逻辑删除。** `retired` 记忆保留正文、provenance、原 subject links 和 operation history，不再参与任何召回、审核、分裂、summary 或公开 search。`domain_operations` 与 `domain_operation_effects` 是 append-only 的结构化审计记录，episode、历史版本和 domain operation 用约束或 trigger 防止修改和删除。
+- **同一 domain 内编译正文。** 在不去掉独立生命周期的前提下，review 用兄妹记忆把不完整指代写全、把约束写进被影响的那条、把平行实例改成可并列检索的句式、把实例上提为类别词，使 Memory 通道在 query 只命中一跳时仍能检索到完整证据。这是 extractor「不跨 episode 推测」之后、读路径纯向量之前的加工步骤。
+- **退役是逻辑删除。** `retired` 记忆保留正文、provenance、原 domain links 和 operation history，不再参与任何召回、审核、分裂、summary 或公开 search。`memory_operations` 与 `memory_operation_effects` 是 append-only 的结构化审计记录，episode、历史版本和 memory operation 用约束或 trigger 防止修改和删除。
 
 这使 §4.1 末尾的例子有了可执行路径：两条表面冲突的偏好记忆触发 review，模型判断仅凭文本无法裁决，请求 provenance，读到两条来源 episode 分别属于科研项目与个人工具的对话，据此把两条记忆各自改写为带条件的表述，并把新的 provenance 集合一并写入。整个过程留下可追溯的 operation 记录。
 
@@ -253,10 +253,10 @@ FluxFold 把 memory version、provenance 和 active link 作为事实源，subje
 
 FluxFold 不维护常驻的用户画像。它对 §4.2 作用域问题的处理是机制性的，而不是语义理解性的：
 
-1. **按需召回而非常驻。** subject summary 与 memory content 只在 query 与之相似度超过阈值时才进入结果，不占据固定的 system prompt 位置。
-2. **分裂降低了错误召回的相似度。** 这是 split 机制的一个直接副效应：一个名为“用户”的粗粒度 subject 与几乎任何查询都有中等相似度；而“用户在项目 A 中的代码风格偏好”这样的名称，对“推荐一款饮品”这类查询的相似度会低于 0.25 的阈值，因而不会被召回。**记忆越具体，被误召回的概率越低。**
+1. **按需召回而非常驻。** domain summary 与 memory content 只在 query 与之相似度超过阈值时才进入结果，不占据固定的 system prompt 位置。
+2. **分裂降低了错误召回的相似度。** 这是 split 机制的一个直接副效应：一个名为“用户”的粗粒度 domain 与几乎任何查询都有中等相似度；而“用户在项目 A 中的代码风格偏好”这样的名称，对“推荐一款饮品”这类查询的相似度会低于 0.25 的阈值，因而不会被召回。**记忆越具体，被误召回的概率越低。**
 
-必须明确：这不等于系统“理解”了当前场景是否适用某条偏好，它只是让不适用的记忆在向量空间上离当前 query 更远。效果的强弱完全取决于 subject name 的具体化程度和阈值设置，而这两者目前都未经校准。
+必须明确：这不等于系统“理解”了当前场景是否适用某条偏好，它只是让不适用的记忆在向量空间上离当前 query 更远。效果的强弱完全取决于 domain name 的具体化程度和阈值设置，而这两者目前都未经校准。
 
 ### 6.6 尚未解决的问题与必须验证的假设
 
@@ -270,10 +270,10 @@ FluxFold 不维护常驻的用户画像。它对 §4.2 作用域问题的处理�
 
 **组织侧的已知缺口。**
 
-- **无 link 回填。** 新建 subject 只建立当前 episode 组织批次中由 LLM 选定的 memory links，不回填更早 episode 的 memories。一个在交互后期才成立的 subject，永远不会关联到它本应涵盖的早期记忆。
-- **summary 成本与陈旧窗口。** 一个 episode 对 link 新增 memory 的 subject、被 review 的 subject 和 link/split 新建 subject 分别执行全量 summary refresh，按 subject 去重、最多并发 5 个，并持久化失败待办。系统不因共享 memory 被修改或退役而刷新其他 linked subjects，因此避免了全空间维护成本，却允许这些非目标 summary 长期陈旧。需要通过实验同时衡量调用成本、summary 质量和陈旧信息对检索的影响。
-- **review 编译有延迟。** 每 8 条新 link 才改写 memory 正文并重 embed；此前 Memory 通道可能命中尚未补全指代或写回约束的旧 content，只能靠 Subject 通道命中时的 refresh summary。这是成本换实时性的取舍，对 multi-hop / open-domain 的影响需要实测。
-- **软阈值不设上限。** 实验版不限制单个 subject 最终关联的 memory 数量或总字符数，`defer_split` 是合法结果。理论上一个语义确实无法细分的 subject 可以无限增长，而 review 每 8 条新记忆就要读取它的**全部** active memories，成本随规模线性上升。
+- **无 link 回填。** 新建 domain 只建立当前 episode 组织批次中由 LLM 选定的 memory links，不回填更早 episode 的 memories。一个在交互后期才成立的 domain，永远不会关联到它本应涵盖的早期记忆。
+- **summary 成本与陈旧窗口。** 一个 episode 对 link 新增 memory 的 domain、被 review 的 domain 和 link/split 新建 domain 分别执行全量 summary refresh，按 domain 去重、最多并发 5 个，并持久化失败待办。系统不因共享 memory 被修改或退役而刷新其他 linked domains，因此避免了全空间维护成本，却允许这些非目标 summary 长期陈旧。需要通过实验同时衡量调用成本、summary 质量和陈旧信息对检索的影响。
+- **review 编译有延迟。** 每 8 条新 link 才改写 memory 正文并重 embed；此前 Memory 通道可能命中尚未补全指代或写回约束的旧 content，只能靠 Domain 通道命中时的 refresh summary。这是成本换实时性的取舍，对 multi-hop / open-domain 的影响需要实测。
+- **软阈值不设上限。** 实验版不限制单个 domain 最终关联的 memory 数量或总字符数，`defer_split` 是合法结果。理论上一个语义确实无法细分的 domain 可以无限增长，而 review 每 8 条新记忆就要读取它的**全部** active memories，成本随规模线性上升。
 - **分裂是否会被触发，需要实测。** EverMemOS 在 LoCoMo（每 conversation 约 71 个 MemCell）上聚出平均规模 1.84 的 scene，这是一个警示：在 benchmark 规模的数据上，组织单元仍可能达不到 24 条 memory / 8,000 字符的分裂阈值。若 split 在两个数据集上极少触发，则“自我具体化”这一核心机制在实验中不会被检验到，需要补充设计针对性的评测数据或继续调整阈值。
 - **provenance 深度受限。** 一次 review 只允许一次 provenance request（最多 8 个 memory ID），一个 memory version 最多关联 6 个 episode。跨越很多轮次逐步演化的长期冲突，可能超出这个预算。
 

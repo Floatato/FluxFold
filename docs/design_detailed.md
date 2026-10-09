@@ -16,23 +16,23 @@
 #### 1.1.1 存储边界
 
 - SQLite 是实验版正式数据和关系的唯一事实源。
-- 数据集 session 作为已经划定边界的 `situational episode` 直接进入记忆提取流程，
+- 数据集 session 作为已经划定边界的 `episode` 直接进入记忆提取流程，
 不经过 durable inbox 或 situation boundary detection。
-- SQLite 保存 episode、memory unit、provenance、anchor 及其归属关系、subject、subject–memory link、
-embedding、处理状态和 domain operation。
-- memory、subject 和 provenance 是正式数据；embedding 是可从对应文本重新生成的
+- SQLite 保存 episode、memory、provenance、entity 及其归属关系、domain、domain–memory link、
+embedding、处理状态和 memory operation。
+- memory、domain 和 provenance 是正式数据；embedding 是可从对应文本重新生成的
 检索数据。
-- memory latest version、active subject–memory link 和 provenance 是事务性事实；subject
+- memory latest version、active domain–memory link 和 provenance 是事务性事实；domain
 summary 是由这些事实派生的检索摘要。每次 episode 的 add operation 持久化本次必须完成的
 summary refresh targets，并分别记录完成状态。结构性写入已提交但 refresh 尚未全部完成时，
 summary 可以暂时为空或过期；安全重放只重试仍未完成且仍 active 的 targets，不做全空间扫描。
-共享 memory 被其他 subject 的 review 修改或退役时，除被 review 的 subject 本身外，不把
-链接该 memory 的其他 subjects 自动加入本 episode 的 refresh targets。
+共享 memory 被其他 domain 的 review 修改或退役时，除被 review 的 domain 本身外，不把
+链接该 memory 的其他 domains 自动加入本 episode 的 refresh targets。
 - 实验版使用 SQLite 加 NumPy 完成精确向量扫描，不使用图数据库、向量数据库或 ANN
 索引。
 - Markdown 和 benchmark 输出是数据库状态的导出结果，不是可写事实源。
 
-FluxFold 当前的关系是以 subject–memory 多对多关联和 memory–episode provenance 为主的
+FluxFold 当前的关系是以 domain–memory 多对多关联和 memory–episode provenance 为主的
 浅层关系。它们使用外键和关联表表达，不需要图数据库。
 
 #### 1.1.2 SQLite 通用约定
@@ -43,14 +43,14 @@ FluxFold 当前的关系是以 subject–memory 多对多关联和 memory–epis
 - 布尔值使用 `INTEGER`，并限制为 `0` 或 `1`。
 - 所有文本长度都计算确定性预处理后字符串的 Unicode code point 数，并简称为“字符数”；
 不使用估算 token 数或 UTF-8 字节数。应用层使用同一规则校验 message、memory content、
-subject name、summary、query 及其他文本的长度、容量阈值、裁剪位置和
+domain name、summary、query 及其他文本的长度、容量阈值、裁剪位置和
 输出上限。表中保存 `char_count` 时，事务提交前重新计算并拒绝不一致的值。
 - embedding 使用 little-endian、连续的 `float32 BLOB` 保存。
 - 数据表优先使用 SQLite `STRICT` table。
 - 数据库启用 `PRAGMA foreign_keys = ON` 和 WAL。
 - 正式数据的外键默认使用 `ON DELETE RESTRICT`。退出 active 集合通过状态或关系结束时间
 表达，不依赖级联物理删除。
-- episode、历史版本和 domain operation 使用约束或 trigger 防止修改和删除。
+- episode、历史版本和 memory operation 使用约束或 trigger 防止修改和删除。
 
 
 
@@ -58,20 +58,23 @@ subject name、summary、query 及其他文本的长度、容量阈值、裁剪�
 
 ```text
 memory_spaces
-├── situational_episodes
+├── episodes
 │   └── episode_blocks
 ├── episode_extractions
-├── memory_units
+├── memories
 │   └── memory_versions
-│       ├── memory_version_provenance ──> situational_episodes
+│       ├── memory_version_provenance ──> episodes
 │       └── memory_embeddings
-└── subjects
-    ├── subject_embeddings
-    └── subject_memory_links ──> memory_units
+├── entities
+│   ├── entity_domains ──> domains
+│   └── memory_entities ──> memories
+└── domains
+    ├── domain_embeddings
+    └── domain_memory_links ──> memories
 
 embedding_model_signatures
-domain_operations
-└── domain_operation_effects
+memory_operations
+└── memory_operation_effects
 ```
 
 
@@ -95,7 +98,7 @@ domain_operations
 
 
 
-##### `situational_episodes`
+##### `episodes`
 
 实验版将一个数据集 session 规范化为一个不可变 episode。
 
@@ -151,18 +154,18 @@ tool arguments 和 tool result 均不进入 Memory Engine，也不进入 episode
 
 协议角色与现实参与者分开表示，以同时支持 Agent transcript 和多参与者 benchmark 数据。
 
-#### 1.1.5 Memory unit、版本与 provenance
+#### 1.1.5 Memory、版本与 provenance
 
 
 
-##### `memory_units`
+##### `memories`
 
-所有长期记忆统一使用无子类型的 `memory unit` 表示。
+所有长期记忆统一使用无子类型的 `memory` 表示。
 
 
 | 字段                        | 含义                         |
 | ------------------------- | -------------------------- |
-| `memory_id`               | memory unit 的稳定身份          |
+| `memory_id`               | memory 的稳定身份          |
 | `memory_space_id`         | 所属 memory space            |
 | `lifecycle_status`        | `active` 或 `retired`       |
 | `latest_source_at`        | 当前 provenance 中最新的来源时间，可为空 |
@@ -176,14 +179,14 @@ tool arguments 和 tool result 均不进入 Memory Engine，也不进入 episode
 派生的物化字段，表示这条记忆最近一次在来源对话中被观察或提及的时间，用于以后计算
 时序衰减等新近性信号；它不表示 memory 的系统写入时间或 content 所描述事件的发生时间。
 
-每个来源 episode 的时间锚点优先取 `source_ended_at`，缺失时取 `source_started_at`；
-`latest_source_at` 是当前 latest memory version 的全部 provenance 时间锚点中的最大值。
+每个来源 episode 的时间定位点优先取 `source_ended_at`，缺失时取 `source_started_at`；
+`latest_source_at` 是当前 latest memory version 的全部 provenance 时间定位点中的最大值。
 没有可用来源时间时保持 `NULL`，不得使用 `created_at` 补造。provenance 被完整替换时必须
 重新计算该字段，因此移除最新来源可以使它变早。该时间戳是持久化检索属性，不保存随
 查询时间变化的 recency score。它可供结构化 search 调用方或未来的新近性机制使用，
 但不默认展示给写入阶段 LLM，也不渲染到面向 Agent 的检索文本中。
 
-`retired` 是全局逻辑删除状态。退役 memory 保留正文、provenance、原 subject links 和
+`retired` 是全局逻辑删除状态。退役 memory 保留正文、provenance、原 domain links 和
 operation history，但不再参与任何候选召回、审核、分裂、summary 生成或公开 search。
 
 ##### `memory_versions`
@@ -195,7 +198,7 @@ memory ID 表示稳定身份，version 保存该身份的内容历史。版本�
 | 字段                        | 含义                    |
 | ------------------------- | --------------------- |
 | `memory_version_id`       | memory version ID     |
-| `memory_id`               | 所属 memory unit        |
+| `memory_id`               | 所属 memory        |
 | `version_no`              | 从 1 开始递增的版本号          |
 | `is_latest`               | 是否为该 memory 的最新版本     |
 | `content`                 | 自包含的正式记忆正文            |
@@ -217,7 +220,7 @@ provenance 关联的 episode 获得。
 
 `memory_version_provenance` 是 memory version 与来源 episode 之间的多对多关联表，只定位
 到 episode 级别。一个 memory version 由一个或多个 episodes 支持；一个 episode 可以
-同时支持零到多个 memory versions。`memory unit` 的当前 provenance 指其 latest version
+同时支持零到多个 memory versions。`memory` 的当前 provenance 指其 latest version
 的关联集合，历史版本分别保留各自的 provenance。
 
 ```text
@@ -230,18 +233,20 @@ overlap context 不得成为本次新记忆的 provenance。一个 memory versio
 必须包含 1--6 个不同 episode；prompt 与结构化校验使用相同上限，超过时不得截断。
 provenance 和 episode 来源时间是 `latest_source_at` 的事实来源。
 
-#### 1.1.6 Subject 与 subject–memory link
+#### 1.1.6 Domain 与 domain–memory link
 
 
 
-##### `subjects`
+##### `domains`
 
-`subject` 是动态维护、可分裂的记忆组织单元。
+`domain`（记忆域）是围绕一个或多个 entity 动态维护、可分裂的记忆组织范围。
+初始 domain 可以与 entity 同名，之后按更具体的范围分裂；domains 可以共享 memories，
+不构成固定分类或持久化父子层级。
 
 
 | 字段                          | 含义                                    |
 | --------------------------- | ------------------------------------- |
-| `subject_id`                | subject ID                            |
+| `domain_id`                | domain ID                            |
 | `memory_space_id`           | 所属 memory space                       |
 | `name`                      | 简短且可独立理解的名称                           |
 | `normalized_name`           | 合并空白并 casefold 后的唯一名称键               |
@@ -250,90 +255,91 @@ provenance 和 episode 来源时间是 `latest_source_at` 的事实来源。
 | `new_memory_count`          | 上次成功审核或分裂后新增的 memory 数量               |
 | `summary_revision`          | summary 每次整体重写时递增的 CAS version          |
 | `created_at` / `updated_at` | 系统时间                                  |
-| `retired_at`                | subject 被替换的时间，可为空                    |
-| `retired_by_operation_id`   | 产生替换的 subject split operation，可为空     |
+| `retired_at`                | domain 被替换的时间，可为空                    |
+| `retired_by_operation_id`   | 产生替换的 domain split operation，可为空     |
 
 
-同一 memory space 内，所有 active、retired subject 的 `normalized_name` 共同满足唯一约束。
-数据库使用独立 UUID，LLM 使用唯一 name 引用 subject。名称在对象整个生命周期内保持不变。
-Subject review 只修改或退役 memories；full split 退役原 subject，partial split 保留原 subject。
-初始同名容器也遵循相同的退役规则。退役保留 ID、name、summary、embeddings 和 anchor 关系，
-关闭原 links 并将新增计数清零。仅召回 retired subject 不改变状态；link 或 split 实际向它
+同一 memory space 内，所有 active、retired domain 的 `normalized_name` 共同满足唯一约束。
+数据库使用独立 UUID，LLM 使用唯一 name 引用 domain。名称在对象整个生命周期内保持不变。
+Domain review 只修改或退役 memories；full split 退役原 domain，partial split 保留原 domain。
+初始同名容器也遵循相同的退役规则。退役保留 ID、name、summary、embeddings 和 entity 关系，
+关闭原 links 并将新增计数清零。仅召回 retired domain 不改变状态；link 或 split 实际向它
 写入新 link 时，在同一事务中恢复 active、清除 retired metadata、记录 reactivated effect。
 恢复不重新打开历史 links，summary 随本 episode 的持久化 refresh targets 更新。
 
-Linking、review 和 split 不读取 summary，也不生成或改写它。Extraction 后程序为 anchor
-准备同名初始 subject；split 可创建细粒度 subject。新 subject 初始 `summary` 为 `NULL`、
-`summary_revision` 为 0，新增计数为零。对已有 subject 添加新 memory link 时递增其计数。
+Linking、review 和 split 不读取 summary，也不生成或改写它。Extraction 后程序为 entity
+准备同名初始 domain；split 可创建细粒度 domain。新 domain 初始 `summary` 为 `NULL`、
+`summary_revision` 为 0，新增计数为零。对已有 domain 添加新 memory link 时递增其计数。
 本 episode 的结构性维护完成后，由 1.2.4 的统一 summary refresh 处理持久化 targets。
-Review 修改或退役共享 memory 时，不同步刷新其他 subjects。
+Review 修改或退役共享 memory 时，不同步刷新其他 domains。
 
-Subject 审计的容量使用当前 active links 关联的 active memory 数量和 latest version
+Domain 审计的容量使用当前 active links 关联的 active memory 数量和 latest version
 `char_count` 之和计算，不额外保存容易失去一致性的累计容量字段。
 
-##### `anchors`、`anchor_subjects` 与 `memory_anchors`
+##### `entities`、`entity_domains` 与 `memory_entities`
 
-当前实验 schema version 为 6；打开数据库先验证版本，不迁移旧运行数据库。
-基础锚点是有稳定名称的宏观人物、组织、命名项目或其他独立实体。
-唯一允许未命名的实体是用户，使用 `User`；其他实体必须有来源明确给出的独立名称。
-`anchors` 保存 `anchor_id`（UUID）、`memory_space_id`、name、normalized_name、
+当前实验 schema version 为 7；打开数据库先验证版本，不迁移旧运行数据库。
+`entity`（实体）是具有独立身份和稳定规范名称的记忆归属对象，包括宏观人物、组织、命名项目或其他独立实体。
+它表示 memory 主要描述的对象，不是正文中所有被提及的实体。
+允许未命名的实体是用户和助手，分别使用 `User` 和 `Assistant`；其他实体必须有来源明确给出的独立名称。
+`entities` 保存 `entity_id`（UUID）、`memory_space_id`、name、normalized_name、
 name 向量、model_signature_id 和 created_at；`(memory_space_id, normalized_name)` 唯一。
 名称规范化只合并空白并 casefold，不删除标点、数字或其他身份信息。
-anchor name 与向量使用当前 retrieval embedding signature；切换模型时一起重建。
+entity name 与向量使用当前 retrieval embedding signature；切换模型时一起重建。
 
-`anchor_subjects(anchor_id, subject_id)` 以这对 ID 为主键，表示该 subject 属于哪些锚点的
-组织与候选召回范围，不保证其中每条 memory 都描述全部锚点。新 anchor 初始拥有同名
-subject，若该 subject 已存在则复用（包括 retired）。`memory_anchors(memory_id, anchor_id)` 保存
-extraction 确定的归属，同样以这对 ID 为主键。锚点和两种关系随 add transaction 原子提交。
-Review 不修改锚点归属；split 的新 subject 全量继承父 subject 的锚点，复用已有 target 时
-与其原关系取并集。退役 subject 的锚点关系保留并参与写入侧候选召回。删除 space 时一起删除。
+`entity_domains(entity_id, domain_id)` 以这对 ID 为主键，表示该 domain 属于哪些实体的
+组织与候选召回范围，不保证其中每条 memory 都描述全部实体。新 entity 初始拥有同名
+domain，若该 domain 已存在则复用（包括 retired）。`memory_entities(memory_id, entity_id)` 保存
+extraction 确定的归属，同样以这对 ID 为主键。实体和两种关系随 add transaction 原子提交。
+Review 不修改实体归属；split 的新 domain 全量继承父 domain 的实体，复用已有 target 时
+与其原关系取并集。退役 domain 的实体关系保留并参与写入侧候选召回。删除 space 时一起删除。
 
-##### `subject_memory_links`
+##### `domain_memory_links`
 
 
 | 字段                          | 含义                           |
 | --------------------------- | ---------------------------- |
 | `link_id`                   | 一次 link 生命周期 ID              |
-| `subject_id`                | subject                      |
-| `memory_id`                 | memory unit                  |
+| `domain_id`                | domain                      |
+| `memory_id`                 | memory                  |
 | `link_basis`                | 建立依据：`direct` 或 `contextual` |
 | `linked_at` / `unlinked_at` | link 生命周期                    |
 | `opened_by_operation_id`    | 建立 link 的 operation          |
 | `closed_by_operation_id`    | 结束 link 的 operation，可为空      |
 
 
-`unlinked_at IS NULL` 表示 active link。同一 subject–memory 对在解除后重新建立时插入
-新行，不复用旧行。`direct` 表示该 subject 是这条 memory 的组织归属：memory 是该
-subject 要收的那种事实、事件、状态、决定或目标。`contextual` 表示该 subject 不是归属，
+`unlinked_at IS NULL` 表示 active link。同一 domain–memory 对在解除后重新建立时插入
+新行，不复用旧行。`direct` 表示该 domain 是这条 memory 的组织归属：memory 是该
+domain 要收的那种事实、事件、状态、决定或目标。`contextual` 表示该 domain 不是归属，
 但 memory 与其下已归档的信息存在具体的约束、影响、更新或解释关系；关系可以由任一方
-施加，未来对该 subject 的回答需要看见这条记忆，即使两边文本不相似。每条 new memory
-至少建立一个 `direct` link，且可以有多个 `direct` link；全部 active subject links 合计不得
-超过 `max(memory_active_subject_link_max, 该 memory 的 anchor 数量)`，默认基础值为 5。
+施加，未来对该 domain 的回答需要看见这条记忆，即使两边文本不相似。每条 new memory
+至少建立一个 `direct` link，且可以有多个 `direct` link；全部 active domain links 合计不得
+超过 `max(memory_active_domain_link_max, 该 memory 的 entity 数量)`，默认基础值为 5。
 `contextual` link 按需建立，不表示较低优先级。
 SQLite 使用 `CHECK (link_basis IN ('direct', 'contextual'))` 约束取值。
 
 `link_basis` 在一次 link 生命周期内保持不变。需要重新分类时关闭旧 link，并以新的
-`link_basis` 建立新 link。Subject review 读取当前 subject 下每条 memory 的
+`link_basis` 建立新 link。Domain review 读取当前 domain 下每条 memory 的
 `link_basis`，但不修改它；两类 link 都参与 review、summary 和 search，第一版不根据
 该字段过滤或调整检索分数。
 
-任何流程新建 direct link 时，如果 LLM 判断候选 subjects 中一个是另一个的语义具体化，
-只建立指向该 memory 真正归属且更具体 subject 的 direct link。该规则不禁止一条 memory
-同时关联两个没有包含关系的领域，也不排除指向存在上述具体关系的其他 subject 的
+任何流程新建 direct link 时，如果 LLM 判断候选 domains 中一个是另一个的语义具体化，
+只建立指向该 memory 真正归属且更具体 domain 的 direct link。该规则不禁止一条 memory
+同时关联两个没有包含关系的领域，也不排除指向存在上述具体关系的其他 domain 的
 contextual link。
-包含关系只由 LLM 根据当前输入判断；程序不保存 subject 层级、不主动维护包含关系，也
-不对一般性的语义包含关系作校验。Partial split 中原 subject 与本次新 subjects 之间的关系由操作类型直接确定，按下述 split 规则关闭旧 links。
+包含关系只由 LLM 根据当前输入判断；程序不保存 domain 层级、不主动维护包含关系，也
+不对一般性的语义包含关系作校验。Partial split 中原 domain 与本次新 domains 之间的关系由操作类型直接确定，按下述 split 规则关闭旧 links。
 
-Subject 分裂时：
+Domain 分裂时：
 
-- full split 关闭全部输入 memories 指向原 subject 的 links；partial split 只关闭被移入本次
-新 subjects 的 memories 指向原 subject 的 links；
-- 保留这些 memories 指向本次 split 范围之外其他 subjects 的 links；
+- full split 关闭全部输入 memories 指向原 domain 的 links；partial split 只关闭被移入本次
+新 domains 的 memories 指向原 domain 的 links；
+- 保留这些 memories 指向本次 split 范围之外其他 domains 的 links；
 - 对每条新建结果 link 重新判断 `link_basis`，不能直接继承原分类；partial split 中未移出的
 原 links 保持不变；
-- 归属在结果 subject 上的 memories 用于确定分组与命名，contextual memories 只关联到
-仍存在具体联系的结果 subject；
-- 每个新 subject 至少有一条 `direct` link，事务结束后每个 active memory 仍至少有
+- 归属在结果 domain 上的 memories 用于确定分组与命名，contextual memories 只关联到
+仍存在具体联系的结果 domain；
+- 每个新 domain 至少有一条 `direct` link，事务结束后每个 active memory 仍至少有
 一条 active `direct` link。
 
 memory 退役时关闭它的所有 active links，但保留 link rows 作为历史记录。
@@ -356,7 +362,7 @@ document 都直接编码原文。模型在第一次实际编码时加载，首�
 默认关闭 ONNX Runtime telemetry。调用方仍可显式传入其他 embedding
 provider。每个 memory space 按用途选择 active signature：
 
-- `retrieval`：memory、subject 和 query 检索；
+- `retrieval`：memory、domain 和 query 检索；
 - `boundary`：正式版的 message boundary detection。
 
 同一次相似度计算不得混用不同 signature。模型切换时，先生成对应用途的全部必要
@@ -368,17 +374,17 @@ embedding，再原子切换 active signature。
 embedding 输入只包含 memory content。memory 被修改时生成新 embedding；memory 退役时
 删除其检索 embedding，正文仍可用于重建。
 
-##### `subject_embeddings`
+##### `domain_embeddings`
 
-每个 active 或 retired subject 维护：
+每个 active 或 retired domain 维护：
 
-- `name`：只编码 subject name；
-- `name_summary`：当 summary 非空时，编码 subject name 与当前 summary。
+- `name`：只编码 domain name；
+- `name_summary`：当 summary 非空时，编码 domain name 与当前 summary。
 
-表以 `(subject_id, embedding_kind, model_signature_id)` 唯一标识一条 embedding，并保存
-输入文本的 hash。新 subject 立即生成 `name` embedding；首次 summary refresh 才生成
+表以 `(domain_id, embedding_kind, model_signature_id)` 唯一标识一条 embedding，并保存
+输入文本的 hash。新 domain 立即生成 `name` embedding；首次 summary refresh 才生成
 `name_summary`，后续 summary 变化时更新它。公开 search 默认使用 `name`，写入阶段的
-Subject 候选通道始终使用 `name`。
+Domain 候选通道始终使用 `name`。
 
 embedding 统一保存 dimension、source hash、vector 和 created time，并验证：
 
@@ -388,7 +394,7 @@ byte_length(vector) = dimension * 4
 
 
 
-#### 1.1.8 处理状态与 domain operation
+#### 1.1.8 处理状态与 memory operation
 
 
 
@@ -401,52 +407,52 @@ byte_length(vector) = dimension * 4
 `completed` 可以对应 `0..N` 条 memory，因此不能用 provenance 是否存在判断 episode
 是否处理过。一个 episode 在同一 memory space 中只允许有一个 completed 结果；使用不同
 配置重跑 benchmark 时创建新的 memory space。LLM 推理和 embedding 计算在事务外完成；
-最终 memory、subjects、links、embeddings 和 completion record 一起提交，避免重试产生
+最终 memory、domains、links、embeddings 和 completion record 一起提交，避免重试产生
 部分结果或重复 memory。
 
-`terminal_failure` 不产生 memory、subject、link 或 domain operation。相同来源的安全重放
+`terminal_failure` 不产生 memory、domain、link 或 memory operation。相同来源的安全重放
 返回已经记录的失败，不重复调用模型；benchmark 按来源顺序继续处理后续 session。临时传输、
 限流或服务不可用在所属操作内重试耗尽后不写入该状态，而是保留未完成 episode 供显式恢复。
 
-##### `domain_operations`
+##### `memory_operations`
 
-`domain_operations` 是 append-only 的结构化审计记录。operation 表示一次业务原子变化，
+`memory_operations` 是 append-only 的结构化审计记录。operation 表示一次业务原子变化，
 而不是每个单表写入。第一版至少包含：
 
 - `add_episode_memories`
-- `review_subject`
-- `split_subject`
-- `refresh_subject_summary`
+- `review_domain`
+- `split_domain`
+- `refresh_domain_summary`
 - `retire_memory`
 
 operation 保存 memory space、actor、规则或模型配置、简短 reason 和提交时间。
-`domain_operation_effects` 统一记录受影响的 memory、memory version、subject 或 link 及其
+`memory_operation_effects` 统一记录受影响的 memory、memory version、domain 或 link 及其
 effect type。link row 同时通过 open/close operation ID 保留关系变化来源。
 
-`episode_summary_refresh_targets` 以 `add_episode_memories` operation 和 subject ID 为主键，
-保存该 episode 的 refresh 候选及其完成 operation ID。候选包括 link 新增 memory 的 subjects、
-被 review 的 subjects，以及 link/split 创建的新 subjects；full split 事务从本 episode 的集合
-删除被退役的原 subject。成功 refresh 与 target 完成标记在同一事务提交，因此重放不会重复
+`episode_summary_refresh_targets` 以 `add_episode_memories` operation 和 domain ID 为主键，
+保存该 episode 的 refresh 候选及其完成 operation ID。候选包括 link 新增 memory 的 domains、
+被 review 的 domains，以及 link/split 创建的新 domains；full split 事务从本 episode 的集合
+删除被退役的原 domain。成功 refresh 与 target 完成标记在同一事务提交，因此重放不会重复
 已经完成的 refresh。
 
 #### 1.1.9 原子事务与并发校验
 
 以下变化分别作为一个 SQLite transaction 提交：
 
-1. **Add episode memories**：写入 extraction completion、memory units、latest versions、
-  provenance、`latest_source_at`、embeddings、anchors、memory–anchor/anchor–subject 关系、subjects、links、summary refresh targets 和
-   operation effects；新 subject 只写入 name 与 name embedding。
-2. **Review subject**：写入全部 memory 新版本和 provenance，退役指定 memories 并关闭其
+1. **Add episode memories**：写入 extraction completion、memories、latest versions、
+  provenance、`latest_source_at`、embeddings、entities、memory–entity/entity–domain 关系、domains、links、summary refresh targets 和
+   operation effects；新 domain 只写入 name 与 name embedding。
+2. **Review domain**：写入全部 memory 新版本和 provenance，退役指定 memories 并关闭其
   active links，重新计算受影响 memory 的 `latest_source_at`，更新 embeddings，将当前
-   subject 的新增计数置零，把被 review 的 subject 加入 refresh targets，并记录 operation
+   domain 的新增计数置零，把被 review 的 domain 加入 refresh targets，并记录 operation
    effects；不读取或改写任何 summary。
-3. **Split subject**：按规范化名称复用已有 active 或 retired subjects 或创建新 subjects 及 name
-   embeddings，继承原 subject 的全部锚点。full split 关闭原 subject 的全部 links 并退役它；
-   partial split 只关闭移出 memories 的原 links，保留原 subject 并将其新增计数置零。
-   结果 links 按最终 memory/subject ID 去重，已有 direct 不降级；contextual 升为 direct 时
-   关闭旧 link 并建立新 link。新 subject 的新增计数为零，复用目标只累计真正新增的 memories。
-   全部结果 subjects 加入 durable refresh targets，并记录 operation effects。
-4. **Refresh subject summary**：对一个 pending target，当前 active links 不超过 2 时
+3. **Split domain**：按规范化名称复用已有 active 或 retired domains 或创建新 domains 及 name
+   embeddings，继承原 domain 的全部实体。full split 关闭原 domain 的全部 links 并退役它；
+   partial split 只关闭移出 memories 的原 links，保留原 domain 并将其新增计数置零。
+   结果 links 按最终 memory/domain ID 去重，已有 direct 不降级；contextual 升为 direct 时
+   关闭旧 link 并建立新 link。新 domain 的新增计数为零，复用目标只累计真正新增的 memories。
+   全部结果 domains 加入 durable refresh targets，并记录 operation effects。
+4. **Refresh domain summary**：对一个 pending target，当前 active links 不超过 2 时
    不调用 LLM，直接使用单个空格 `" "`；否则以全部当前 active memories 生成
    完整 summary。在成员集合、内容、link basis 和 revision 未变化时整体替换
    summary、更新 `name_summary` embedding，并把该 target 标为完成，不重置
@@ -454,28 +460,28 @@ effect type。link row 同时通过 open/close operation ID 保留关系变化�
 5. **Switch embedding model**：新 signature 的全部必要 embeddings 准备完成后，切换对应
   用途的 active signature。
 
-LLM 运行期间不持有数据库事务。提交前必须重新验证 memory/subject IDs、memory space、
+LLM 运行期间不持有数据库事务。提交前必须重新验证 memory/domain IDs、memory space、
 provenance、active links、`link_basis`、输入 revision、content hash 和 model signature。
-Subject review 和 split 与作用范围冲突的写入由 application 层串行执行，并使用 subject
+Domain review 和 split 与作用范围冲突的写入由 application 层串行执行，并使用 domain
 revision 或等价 CAS 防止基于陈旧输入提交。
 
 #### 1.1.10 Retention 与关键索引
 
 - episode、episode blocks、memory versions、provenance、已结束 links 和 domain
 operations 长期保留。
-- retired memory 保留正式内容，不保留检索 embedding；retired subject 同时保留 embeddings，供写入侧召回与复用。
+- retired memory 保留正式内容，不保留检索 embedding；retired domain 同时保留 embeddings，供写入侧召回与复用。
 - 普通日志和 benchmark 中间文件不属于正式数据，可以按运行策略清理。
 
 第一版至少建立以下查询方向的索引：
 
-- 一个 memory space 中的 active memories 和 active subjects；
+- 一个 memory space 中的 active memories 和 active domains；
 - active memories 的 `latest_source_at`；
 - memory 的 latest version 和版本历史；
 - episode 到 memory versions 的 provenance 反查；
-- subject 到 active memories、memory 到 active subjects；
-- 每对 subject–memory 最多一个 active link；
-- active model signature 下的 memory 和两种 subject embeddings；
-- memory space 内按时间读取 domain operations。
+- domain 到 active memories、memory 到 active domains；
+- 每对 domain–memory 最多一个 active link；
+- active model signature 下的 memory 和两种 domain embeddings；
+- memory space 内按时间读取 memory operations。
 
 每个 active memory 至少一个 active `direct` link 的跨表不变量由 transaction service
 校验。
@@ -495,11 +501,11 @@ generation provider 的 context window 和 API 参数是外部约束，不转换
 
 | 配置或行为                         | 实验版值                                   |
 | ----------------------------- | -------------------------------------- |
-| subject name prompt 指导        | 建议不超过 10 words                         |
-| subject name 字符硬上限            | 120 字符                                 |
-| LLM 新生成 subject summary prompt 指导 | 建议不超过 200 words                   |
-| LLM 新生成 subject summary 字符硬上限 | 2,000 字符                               |
-| memory content prompt 指导      | 建议不超过 50 words                         |
+| domain name prompt 指导        | 建议不超过 10 words                         |
+| domain name 字符硬上限            | 120 字符                                 |
+| LLM 新生成 domain summary prompt 指导 | 建议不超过 200 words                   |
+| LLM 新生成 domain summary 字符硬上限 | 2,000 字符                               |
+| memory content prompt 指导      | 建议不超过 70 words                         |
 | memory content 字符硬上限          | 1,000 字符                               |
 | review 改写 memory prompt 指导    | 建议不超过 100 words                        |
 | review 改写 memory 字符硬上限       | 800 字符                                 |
@@ -511,7 +517,7 @@ generation provider 的 context window 和 API 参数是外部约束，不转换
 
 
 episode 字符数只计算 user/assistant message 正文，不计算 ID、时间戳或 JSON 结构开销。
-实验版与 benchmark 的 dataset session 超限时明确失败，不裁剪或重新划分 session。subject
+实验版与 benchmark 的 dataset session 超限时明确失败，不裁剪或重新划分 session。domain
 name、LLM 新生成 summary 和 memory content 超限时不得静默截断；它们构成结构化校验失败。
 
 #### 1.1.12 LLM、embedding 与数据库运行参数
@@ -522,10 +528,10 @@ LLM 阶段参数如下：
 | 阶段                | temperature | top-p |
 | ----------------- | ----------- | ----- |
 | memory extraction | 0.1         | 不传    |
-| subject linking   | 0.0         | 不传    |
-| Subject review    | 0.1         | 不传    |
-| Subject split     | 0.1         | 不传    |
-| Subject summary refresh | 0.1   | 不传    |
+| domain linking   | 0.0         | 不传    |
+| Domain review    | 0.1         | 不传    |
+| Domain split     | 0.1         | 不传    |
+| Domain summary refresh | 0.1   | 不传    |
 
 
 所有阶段均不设置 `max_output_tokens`。普通运行不设置 seed；generation provider 支持 seed
@@ -582,7 +588,7 @@ prompt 必须给出与程序校验一致的完整判别联合字段、嵌套结�
 发送给 LLM 的 Pydantic 校验反馈把数组下标归一为 `[*]` 并折叠重复错误，最多保留 8 类、
 2,000 字符；单条说明最多 300 字符。JSON 语法错误只保留行列和解析原因，业务校验错误保留
 可操作的约束说明。若 provider 没有返回响应正文，明确标记无正文，不复用更早一次输出。
-Subject split 无法形成合法语义分组时使用明确的
+Domain split 无法形成合法语义分组时使用明确的
 `defer_split` 结果；声称执行 split 却违反 schema 或业务不变量的输出仍按
 `invalid_structured_output` 修复。
 
@@ -596,8 +602,8 @@ Subject split 无法形成合法语义分组时使用明确的
 | `provider_pool_timeout_seconds`             | 30 秒        | 从连接池取得连接的 timeout                               |
 | `embedding_batch_size`                      | 100         | 一次 embedding provider 请求最多编码的文本数                |
 | `embedding_batch_concurrency_per_operation` | 4           | 单个 embedding 逻辑操作内部同时执行的 batch 请求上限            |
-| `subject_summary_refresh_llm_link_threshold` | 2      | active links 不超过此值时不调用 LLM 生成 summary        |
-| `subject_summary_refresh_concurrency_per_episode` | 5     | 一个 episode 内同时执行的 subject summary refresh 上限          |
+| `domain_summary_refresh_llm_link_threshold` | 2      | active links 不超过此值时不调用 LLM 生成 summary        |
+| `domain_summary_refresh_concurrency_per_episode` | 5     | 一个 episode 内同时执行的 domain summary refresh 上限          |
 | `exact_scan_batch_rows`                     | 8,192       | NumPy 精确扫描时每批从 SQLite 读取并计算的 embedding 行数       |
 | `sqlite_busy_timeout_ms`                    | 5,000 毫秒    | SQLite 遇到锁竞争时等待锁释放的最长时间                         |
 | `sqlite_transaction_max_retries`            | 5           | 初次 SQLite transaction 冲突后的额外重试次数                |
@@ -606,7 +612,7 @@ Subject split 无法形成合法语义分组时使用明确的
 | `sqlite_wal_autocheckpoint_pages`           | 1,000 pages | SQLite WAL 自动 checkpoint 的 page 阈值              |
 
 
-memory 或 subject 创建、相关文本更新时立即计算对应 embedding。一个逻辑操作同时产生多个
+memory 或 domain 创建、相关文本更新时立即计算对应 embedding。一个逻辑操作同时产生多个
 文本时按 100 个一批合并请求，并只在该次操作内部最多并发 4 个 batch；该 semaphore 不跨
 逻辑操作、memory space 或进程共享，也不是全局 provider 限流器。8 个文本形成 1 次请求，
 250 个文本形成 3 次可并发请求。单个文本的批次就是 1。全部必要 embedding 在事务外生成
@@ -620,7 +626,7 @@ provider 与 generation 共用同一套 OpenAI-compatible SDK timeout 与 `max_r
 SQLite 固定使用 WAL、`synchronous=NORMAL`。事务冲突最多额外重试 5 次，使用 full
 jitter，不设置退避最大时间。同一 memory space 的 `add_episode` 整段串行：extraction、
 候选召回、linking、正式写入以及本 episode 的全部 review/split/summary refresh 完成后，才
-开始后序 episode。link、review 和 split 按确定性顺序串行；最终不同 subjects 的
+开始后序 episode。link、review 和 split 按确定性顺序串行；最终不同 domains 的
 summary refresh 可同时执行，单个 episode 上限为 5，每个成功结果仍使用独立事务提交。
 本 episode 的 pending targets 未全部完成前，不开始后序 episode。不设置跨 space 的全局
 维护并发、provider 并发限制或单次 `add_episode` 的维护操作数量上限。不同 memory space
@@ -632,20 +638,20 @@ summary refresh 可同时执行，单个 episode 上限为 5，每个成功结�
 清空全部 memory spaces、通过 `add_episode(memory_space_id, episode)` 向指定 space 添加一个
 已规范化 dataset episode，以及在指定
 space 中检索记忆。它还提供检索 embedding 的全量重建：先为全部 active memory latest
-content、全部 active 和 retired subject 的 name，以及 summary 非空 subject 的 name-summary 和全部 anchor name 生成新 signature 下的向量，再在一个事务
+content、全部 active 和 retired domain 的 name，以及 summary 非空 domain 的 name-summary 和全部 entity name 生成新 signature 下的向量，再在一个事务
 中校验来源快照并切换 active retrieval signature。删除指定 space 和清空全部 spaces 都能通过单条管理命令完成；它们是
 memory-space 级管理操作，会清除目标 space 的整套数据，不改变普通流程中 episode、历史
-版本和 domain operation 的不可变约束。
+版本和 memory operation 的不可变约束。
 
 Dataset adapter 只把来源格式转换为统一 episode。Memory Engine 不直接接受
 LongMemEval-S 或 LoCoMo_refined 的原始 record，adapter 也不实现或复制 extraction、
-Subject linking、Subject review、Subject split、正式写入或 search 逻辑。
+Domain linking、Domain review、Domain split、正式写入或 search 逻辑。
 
 `add_episode` 的语义是 `add_into_memory_store`，不是正式版 `add_into_buffer`。调用返回时，
 该 episode 已完成全部 stateful maintenance，合法地产生零条 memory，或以异常报告一个已
 持久化、可确定性重放的终态失败。同一规范化来源身份和相同 canonical payload 的重复提交是同一次逻辑 `add_episode` 的安全重放，
 不重复调用模型或写入；同一来源身份对应不同 canonical payload 时拒绝覆盖原 episode。
-一次 `add_episode` 不暴露部分提交的正式 memory 或 subject 状态。
+一次 `add_episode` 不暴露部分提交的正式 memory 或 domain 状态。
 
 Public search 的结构化结果是 library 的事实输出；供主 Agent 使用的文本由同一结构化结果
 独立渲染，不得改变其中的对象、关系或顺序。同步或异步调用形式、准确函数签名、具体返回
@@ -658,7 +664,7 @@ Public search 的结构化结果是 library 的事实输出；供主 Agent 使�
 #### 1.2.1 实验版入口与总体流程
 
 实验版每次通过 `add_episode` 添加一个已经划定边界、不可再切分的 dataset session；LongMemEval-S 的一个
-haystack session 和 LoCoMo_refined 的一个 session 分别形成一个 situational episode，
+haystack session 和 LoCoMo_refined 的一个 session 分别形成一个 episode，
 不经过 durable inbox 或 boundary detection。Episode 只包含按来源顺序排列的 user 与
 assistant messages；adapter 不使用 LLM 补全、改写、猜测或按时间重新排序来源内容。
 
@@ -727,12 +733,12 @@ Canonical payload 是确定性规范化后实际保存的 episode，包含 paylo
 ```text
 episode
 → memory extraction
-→ extraction 锚点名称解析与必要的批量消歧
-→ 准备 anchor 同名初始 subject（全生命周期精确复用），分配正式 memory_id
-→ 每条新 memory 在每个 anchor 下召回前 3 个 subject name，额外加入同名 subject 后批次去重
-→ 为整批新 memories 执行一个 Subject linking agent loop
-→ 原子写入 memory、anchor、归属关系、provenance、embedding、subject、links 和 operation
-→ 先执行已触发的 Subject split / Subject review
+→ extraction 实体名称解析与必要的批量消歧
+→ 准备 entity 同名初始 domain（全生命周期精确复用），分配正式 memory_id
+→ 每条新 memory 在每个 entity 下召回前 3 个 domain name，额外加入同名 domain 后批次去重
+→ 为整批新 memories 执行一个 Domain linking agent loop
+→ 原子写入 memory、entity、归属关系、provenance、embedding、domain、links 和 operation
+→ 先执行已触发的 Domain split / Domain review
 → 构造并持久化本 episode 的 summary refresh targets
 → 最多并发 5 个 target，分别更新 summary
 ```
@@ -757,7 +763,7 @@ failure 不回滚正式状态，恢复时从持久化 refresh targets 重试未�
 
 #### 1.2.2 Memory extraction
 
-`memory extractor` 从当前 episode 提取 `0..N` 条自包含 memory unit。是否值得提取以
+`memory extractor` 从当前 episode 提取 `0..N` 条自包含 memory。是否值得提取以
 “遗忘是否会明显损害未来交互”为核心判断：会影响连续性、个性化、任务继续、后续指代、
 状态变化或重要决定的信息应当提取；寒暄、可重新生成的通用知识、未被接受的建议、机械
 操作过程和没有未来用途的重复内容通常不提取。
@@ -773,7 +779,7 @@ memory 必须脱离 episode 后仍可理解。能够从来源确定所指对象�
 重组 episode 明确支持的信息，不能推测动机或因果；Assistant 建议只有被 User 明确接受后
 才能写成已确认方案。外部事实的来源归属、不确定性、计划/进行中/完成/失败/取消等状态必须保留。
 同一 episode 内的明确纠正以最终状态为准；跨 episode 的重复、冲突、状态变化，以及同一
-subject 内的指代补全、约束写回和实例对齐，交给 Subject review 处理。
+domain 内的指代补全、约束写回和实例对齐，交给 Domain review 处理。
 
 message 有 `observed_at` 时，其相对时间只以该时间为基准；否则使用 episode 的
 `source_started_at` / `source_ended_at` 范围。换算为来源所能支持的最精确日历日期、
@@ -788,12 +794,12 @@ episode 包含 messages 和有值的 `source_started_at`、`source_ended_at`、
 `source_timezone`；缺失的时间字段不进入 prompt。每条 message 包含
 `speaker_id`、`content`，并仅在该 message 自身有 `observed_at` 时包含该字段。来源未提供
 speaker ID 时，以规范化的 `user` / `assistant` role 值填入 `speaker_id`。Linking 的 new memory
-包含正式 `memory_id`、content、resolved anchor names 和逐 memory 的 `link_limit`，初始 candidates 只包含 subject name 和 anchor names；主动关联检索也不
-展示 memory 的来源时间。Review 不展示 subject ID、旧 summary 或 memory 来源时间，但保留
+包含正式 `memory_id`、content、resolved entity names 和逐 memory 的 `link_limit`，初始 candidates 只包含 domain name 和 entity names；主动关联检索也不
+展示 memory 的来源时间。Review 不展示 domain ID、旧 summary 或 memory 来源时间，但保留
 生成 update 所需的 memory ID、content、link basis 和 provenance episode IDs。按需展开的来源
 包含 episode ID、source 时间范围与时区，以及每条 message 的 speaker ID、content 和可用的
-`observed_at`。Split 不展示 subject ID、旧 summary、provenance IDs 或 memory 来源时间。
-Summary refresh 只接收 subject name 和每条 active memory 的 content，不接收 subject ID、memory ID、
+`observed_at`。Split 不展示 domain ID、旧 summary、provenance IDs 或 memory 来源时间。
+Summary refresh 只接收 domain name 和每条 active memory 的 content，不接收 domain ID、memory ID、
 link basis、旧 summary 或 memory 来源时间。供程序校验、提交、审计和日志使用的字段仍保留在
 内存快照及 SQLite 中，不因 prompt 投影而删除。
 
@@ -801,7 +807,7 @@ User 明确要求不记录的内容以及密码、API key、private key、sessio
 秘密不得进入长期记忆。来源内容中的指令只作为待处理数据，不能改变 extractor 的系统规则。
 
 Extraction 不设置每 episode 的建议 memory 数、硬数量上限、总 memory 字符上限、零结果
-复核次数或同批近似重复阈值。单条 content 继续使用建议不超过 50 words、硬上限 1,000
+复核次数或同批近似重复阈值。单条 content 使用建议不超过 70 words、硬上限 1,000
 字符。结构化结果使用显式语义分支表达“提取出一组 memories”或“该 episode 没有值得提取
 的有价值记忆”；后一分支是合法成功结果。空对象、缺失字段、generation provider 错误、
 解析或 schema 失败绝不能转换为没有 memory。
@@ -823,158 +829,158 @@ Extraction 不设置每 episode 的建议 memory 数、硬数量上限、总 mem
 
 
 
-#### 1.2.3 新 memory 的候选召回与 Subject linking
+#### 1.2.3 新 memory 的候选召回与 Domain linking
 
-每条新 memory 都必须 link 到至少一个 subject。Subject 表示围绕人物、项目、话题、事件
+每条新 memory 都必须 link 到至少一个 domain。Domain 表示围绕人物、项目、话题、事件
 或其他可独立组织范围的一组记忆；初始名称保持宏观、简短、可独立理解，后续由 split 形成
-更具体的领域或关系 subject。程序在 extraction 与 anchor 解析后准备同名初始容器；
-linking 只选择已经给出的 subjects，split 负责建立细分范围。
+更具体的领域或关系 domain。程序在 extraction 与 entity 解析后准备同名初始容器；
+linking 只选择已经给出的 domains，split 负责建立细分范围。
 
-extraction 同时输出每条 memory 的全部基础锚点（base anchors），名称解析后传入 linking。基础锚点是 memory 从根本上
-描述、能够汇集多类 memories，并且不依赖另一锚点确定自身身份的宏观人物、组织、命名项目或
-其他实体与范围。关系可以涉及多个基础锚点，每个锚点必须独立解决；一个锚点已有合适归属不能
-替另一个锚点完成归档。地点、物品、属性、例子或偶然提及不会仅因出现在 memory 中就成为
-基础锚点。基础锚点作为持久化身份与组织入口，由 `anchor_subjects` 关联可供检索的 subjects。
+extraction 同时输出每条 memory 的全部基础实体（base entities），名称解析后传入 linking。基础实体是 memory 从根本上
+描述、能够汇集多类 memories，并且不依赖另一实体确定自身身份的宏观人物、组织、命名项目或
+其他实体与范围。关系可以涉及多个基础实体，每个实体必须独立解决；一个实体已有合适归属不能
+替另一个实体完成归档。地点、物品、属性、例子或偶然提及不会仅因出现在 memory 中就成为
+基础实体。基础实体作为持久化身份与组织入口，由 `entity_domains` 关联可供检索的 domains。
 
-Extraction 中唯一允许不具备来源明确姓名或名称的 anchor 是未命名用户 `User`。
+Extraction 中允许不具备来源明确姓名或名称的 entity 是未命名用户 `User` 和未命名助手 `Assistant`。
 其他实体必须有自身的明确名称，不能以关系称谓、角色或所有格描述代替，也不得编造名称。
 未命名亲属、同事或组织的有效信息保留在 memory content 中，归属到该 memory 所描述的
-具有独立身份的人物锚点。例如（假设用户未命名）：
+具有独立身份的人物实体。例如（假设用户未命名）：
 
-- “My dad loves gardening.” 保留父亲爱好这一事实，anchors 为 `["User"]`，不能使用 `User's dad`。
-- “My dad, Robert, and I go hiking together.” 的 anchors 为 `["User", "Robert"]`。
-- “Mike's wife is a vegetarian.” 的 anchors 为 `["Mike"]`，不能使用 `Mike's wife`。
-- “Mike and his wife Anna go hiking together.” 的 anchors 为 `["Mike", "Anna"]`。
-- “I plan to leave my company.” 的 anchors 为 `["User"]`，不能使用 `User's company`。
+- “My dad loves gardening.” 保留父亲爱好这一事实，entities 为 `["User"]`，不能使用 `User's dad`。
+- “My dad, Robert, and I go hiking together.” 的 entities 为 `["User", "Robert"]`。
+- “Mike's wife is a vegetarian.” 的 entities 为 `["Mike"]`，不能使用 `Mike's wife`。
+- “Mike and his wife Anna go hiking together.” 的 entities 为 `["Mike", "Anna"]`。
+- “I plan to leave my company.” 的 entities 为 `["User"]`，不能使用 `User's company`。
 
-基础锚点的依赖范围（dependent scope）是依靠该锚点才能确定身份的更窄方面、活动、所有物、
+基础实体的依赖范围（dependent scope）是依靠该实体才能确定身份的更窄方面、活动、所有物、
 偏好、旅行、计划、未命名项目、事件或关系，例如 `James's game project`。来源将一个明确命名
-的项目或事件作为具有稳定自身身份的持续对象时，它可以成为基础锚点；描述性的所有格范围仍是
+的项目或事件作为具有稳定自身身份的持续对象时，它可以成为基础实体；描述性的所有格范围仍是
 依赖范围。
 
-direct link 的必要条件是目标 subject 是当前 memory 对某一基础锚点的组织归属：memory
-属于该 subject 要收的那种事实、事件、状态、决定或目标，依据 subject 收的是哪类东西判断，
-而不是记忆是否碰巧提到它。每个基础锚点独立执行以下顺序：
+direct link 的必要条件是目标 domain 是当前 memory 对某一基础实体的组织归属：memory
+属于该 domain 要收的那种事实、事件、状态、决定或目标，依据 domain 收的是哪类东西判断，
+而不是记忆是否碰巧提到它。每个基础实体独立执行以下顺序：
 
-1. 只考察范围可能承接当前锚点的已有 subject candidates；属于其他锚点的合适 subject
-   candidate 不参与本锚点决策。
-2. 存在合适 subject candidates 时，只选择 memory 真正归属的最细粒度候选。已有依赖范围
-   subject 可以被选择，因为 split 已经确立了该边界；不得选择并不适合的更细 subject，且不
+1. 只考察范围可能承接当前实体的已有 domain candidates；属于其他实体的合适 domain
+   candidate 不参与本实体决策。
+2. 存在合适 domain candidates 时，只选择 memory 真正归属的最细粒度候选。已有依赖范围
+   domain 可以被选择，因为 split 已经确立了该边界；不得选择并不适合的更细 domain，且不
    得为了重复同一归属而同时 direct 或 contextual link 到其更粗父级。
-3. 没有更细粒度候选适合时，选择 candidates 中已经准备好的 anchor 同名 subject。
-   Linking 不创建 subject；细粒度 subject 由 split 产生。
+3. 没有更细粒度候选适合时，选择 candidates 中已经准备好的 entity 同名 domain。
+   Linking 不创建 domain；细粒度 domain 由 split 产生。
 
 例如 `Mike bought a camera for the Beijing trip` 选择 `Mike's Beijing trip`，不同时选择 `Mike`。
 `Mike is learning Spanish` 没有合适细分范围时选择 `Mike`。`James is developing a game project`
-选择已有且合适的项目 subject，否则使用 `James`，不创建 `James's game project`。
-`Project Aurora` 若为 extraction 给出的独立 anchor，程序已经准备它的同名 subject。
+选择已有且合适的项目 domain，否则使用 `James`，不创建 `James's game project`。
+`Project Aurora` 若为 extraction 给出的独立 entity，程序已经准备它的同名 domain。
 
 `Mike and John are good friends` 对 Mike、John 分别选择一个目标；没有合适细分范围时分别
-选 `Mike`、`John`。如果已有适合且关联双方 anchors 的 `Mike and John's friendship`，
-两个 anchor 均可选择它，最终只保存一条 direct link。
+选 `Mike`、`John`。如果已有适合且关联双方 entities 的 `Mike and John's friendship`，
+两个 entity 均可选择它，最终只保存一条 direct link。
 
-Subject 的 anchor 成员关系用于候选资格，不能代替本次 assignment。比如 split 后
-`Mike's dietary preferences` 和 `John's Beijing trip` 均继承 Mike、John 两个 anchors，
+Domain 的 entity 成员关系用于候选资格，不能代替本次 assignment。比如 split 后
+`Mike's dietary preferences` 和 `John's Beijing trip` 均继承 Mike、John 两个 entities，
 对“Mike 吃素，John 下周去北京”，分别将 Mike 分配给前者、John 分配给后者是合法的。
-程序检查每个 anchor 恰有一项 assignment，不按目标 subject 的全部继承关系反推分配次数。
+程序检查每个 entity 恰有一项 assignment，不按目标 domain 的全部继承关系反推分配次数。
 
-全部基础锚点决定 direct targets 后，先合并去重，再判断 contextual links。contextual link
-连接的既有 subject 不是 memory 的组织归属，但 memory 与该 subject 中的信息存在具体的约束、
+全部基础实体决定 direct targets 后，先合并去重，再判断 contextual links。contextual link
+连接的既有 domain 不是 memory 的组织归属，但 memory 与该 domain 中的信息存在具体的约束、
 影响、更新或解释关系，未来检索时需要共同可见；约束或影响可以来自任一方向。它包括正文未
 点名、只凭常识才能发现的跨域关系，例如种牙手术与饮食偏好、驾驶计划与驾照限制。缺失的
-contextual 范围绝不触发新建 subject。
+contextual 范围绝不触发新建 domain。
 
-对于每条 new memory 的每个 resolved anchor，被动召回扫描该 anchor 关联的 active 和
-retired subjects，以 memory content 向量对 subject name 向量排序，取相似度不低于 0 的
-前 3 个；该 anchor 的同名 subject 不占这 3 个名额，并额外加入同一个 candidates。
-所有结果按唯一 name 合并为批次共享池，无全局 top-k 截断，不另设 base_subjects。
-同名 subject 即使为空或 retired 也必须提供。初始候选只展示 name 与 anchor names，
+对于每条 new memory 的每个 resolved entity，被动召回扫描该 entity 关联的 active 和
+retired domains，以 memory content 向量对 domain name 向量排序，取相似度不低于 0 的
+前 3 个；该 entity 的同名 domain 不占这 3 个名额，并额外加入同一个 candidates。
+所有结果按唯一 name 合并为批次共享池，无全局 top-k 截断，不另设 base_domains。
+同名 domain 即使为空或 retired 也必须提供。初始候选只展示 name 与 entity names，
 不展示 ID、summary、分数或关联 memory。去重后超过 30 个时输出 warning，继续处理。
 
-每条 memory 的 link_limit 为 `max(memory_active_subject_link_max, anchor 数量)`，默认
-基础值为 5；先保证每个 anchor 的 direct assignment，再按需添加 contextual。
-相同 memory–subject 对合并，direct 优先；linking、split 和存储事务检查相同的有效上限。
+每条 memory 的 link_limit 为 `max(memory_active_domain_link_max, entity 数量)`，默认
+基础值为 5；先保证每个 entity 的 direct assignment，再按需添加 contextual。
+相同 memory–domain 对合并，direct 优先；linking、split 和存储事务检查相同的有效上限。
 
 ##### 名称解析与条件消歧
 
-Extraction 后解析 anchor names，先查询同一 space 的全部已知 anchors，normalized_name 精确相等直接复用，不受候选 top-k 或召回阈值影响。
+Extraction 后解析 entity names，先查询同一 space 的全部已知 entities，normalized_name 精确相等直接复用，不受候选 top-k 或召回阈值影响。
 其余名称与已有对象和本批较早的新名称比较：name 向量余弦相似度 ≥ 0.8 或 BM25 分数 ≥ 2.0
 即进入疑似重复候选。BM25 只用于写入名称消歧，采用 Unicode `\w+` token、k1=1.2、b=0.75，
 语料是当前比较范围内的名称；该分数不是概率，阈值可配置。
 
 本阶段的疑似项一次性反馈给 LLM，携带原输入和此前输出；无疑似项不增加调用。
-Anchor 候选只提供 name，不向 LLM 提供向量或 BM25 分数。反馈 prompt 简短要求判断是否
+Entity 候选只提供 name，不向 LLM 提供向量或 BM25 分数。反馈 prompt 简短要求判断是否
 同一实体；相同则选候选名称，否则保留提出的名称。这个简洁要求仅适用于名称反馈；
-LINKING_SYSTEM 独立完整说明输入、每 anchor 的决策顺序、direct/contextual 边界、主动检索、
+LINKING_SYSTEM 独立完整说明输入、每 entity 的决策顺序、direct/contextual 边界、主动检索、
 输出约束和具体示例，不假设 LLM 能看到其他阶段的 prompt 或设计文档。
 该回合只输出名称映射，不重新 extraction 或改写 memory 内容。程序校验映射完整且目标合法，
 沿本批较早名称的映射解析最终 canonical name，同步替换全部引用，再按最终对象去重；
 无效输出沿用 structured-output 有限修复及终态失败路径。非精确名称被确认复用时输出
 `name_normalized` warning，包含阶段、对象类型、原名称与 canonical name。相似但保留的对象不警告。
 
-Extraction 和 anchor 解析后，程序在 linking 前准备同名初始 subject 及其 anchor 关系，
-已存在的名称直接复用，包括 retired subject。新容器、anchors 和关系与整个 add 原子提交；
+Extraction 和 entity 解析后，程序在 linking 前准备同名初始 domain 及其 entity 关系，
+已存在的名称直接复用，包括 retired domain。新容器、entities 和关系与整个 add 原子提交；
 linking 失败不残留半成品。新容器可能暂时没有 memory links。Review 和 split 的 prompt
-不包含 anchor 信息，程序负责稳定关系维护。Split 只做精确名称复用，不做近似消歧。
+不包含 entity 信息，程序负责稳定关系维护。Split 只做精确名称复用，不做近似消歧。
 
-本 episode 的全部新 memories 共用一个 Subject linking agent loop。模型每一轮可以返回整批
+本 episode 的全部新 memories 共用一个 Domain linking agent loop。模型每一轮可以返回整批
 最终 `links`，也可以返回一个 `association_search(query)` 工具请求；单次 loop 最多执行 5 次
 主动检索，第 6 个模型回合必须在已经累积的结果上给出最终 links。每次主动检索的候选展示
-保持详细的 Subject + Memory 双通道结构：Subject 通道包含 subject name、相似度和最相关的
-一条关联 memory，Memory 通道包含 memory content、相似度和最相关的关联 subject；
+保持详细的 Domain + Memory 双通道结构：Domain 通道包含 domain name、相似度和最相关的
+一条关联 memory，Memory 通道包含 memory content、相似度和最相关的关联 domain；
 结果按 query 分轮累积，之前轮次不会被后续结果覆盖。
 
 主动检索用于寻找可能影响或约束当前 memory、可能被当前 memory 影响或约束，或者与它存在
-其他超出文本语义相似度的逻辑关系的一个或多个 subjects。query 写成这些可能 subjects 的
+其他超出文本语义相似度的逻辑关系的一个或多个 domains。query 写成这些可能 domains 的
 名称，而不是复述 new memory。主动检索寻找不适合作为当前 memory 的 direct 归属的
 contextual 目标。prompt 要求模型在输出 links 前逐条检查这种跨主题关系；不能仅因已经能选择
-direct subject、正文没有点名另一领域、或被动候选看似合理而跳过。Linking 只决定成员关系，不改写
-已有 memory 正文；同一 subject 内的指代补全、约束写回、实例对齐和类别上提由 Subject review
+direct domain、正文没有点名另一领域、或被动候选看似合理而跳过。Linking 只决定成员关系，不改写
+已有 memory 正文；同一 domain 内的指代补全、约束写回、实例对齐和类别上提由 Domain review
 完成。
 
 
 | 配置项                                        | 值    | 含义                                             |
 | ------------------------------------------ | ---- | ---------------------------------------------- |
-| `anchor_subject_candidate_top_k`           | 3    | 每条 memory 每个 anchor 的 subject 候选上限 |
+| `entity_domain_candidate_top_k`           | 3    | 每条 memory 每个 entity 的 domain 候选上限 |
 | `name_resolution_min_similarity`          | 0.8  | 名称消歧候选的向量阈值 |
 | `name_resolution_bm25_threshold`          | 2.0  | 名称消歧候选的 BM25 阈值 |
 | `extraction_memory_warning_threshold`     | 20   | 提取条数超过此值时 warning |
 | `linking_candidate_warning_threshold`     | 30   | 初始去重候选数超过此值时 warning |
-| `subject_candidate_min_similarity`         | 0 | Subject 通道允许候选进入结果的最低 query-subject name 余弦相似度 |
-| `association_subject_candidate_top_k`      | 8    | 每次主动检索 Subject 通道的 subject 上限                  |
-| `subject_candidate_attached_memory_k`      | 1    | 每个 Subject 通道候选附带的关联 memory 数                  |
+| `domain_candidate_min_similarity`         | 0 | Domain 通道允许候选进入结果的最低 query-domain name 余弦相似度 |
+| `association_domain_candidate_top_k`      | 8    | 每次主动检索 Domain 通道的 domain 上限                  |
+| `domain_candidate_attached_memory_k`      | 1    | 每个 Domain 通道候选附带的关联 memory 数                  |
 | `memory_candidate_top_k`                   | 8    | Memory 通道最多保留的 memory 数                        |
 | `memory_candidate_min_similarity`          | 0 | Memory 通道允许候选进入结果的最低 query-memory 余弦相似度        |
-| `memory_candidate_attached_subject_k`      | 1    | 每个 Memory 通道候选附带的关联 subject 数                  |
+| `memory_candidate_attached_domain_k`      | 1    | 每个 Memory 通道候选附带的关联 domain 数                  |
 | `association_search_max_calls`             | 5    | 一个批次 linking agent loop 的主动检索调用上限              |
-| `memory_link_preferred_min`                | 1    | Prompt 建议一条 memory 通常至少链接的 subject 数           |
-| `memory_link_preferred_max`                | 4    | Prompt 建议一条 memory 通常最多链接的 subject 数           |
-| `memory_active_subject_link_max`           | 5    | 每条 memory 的 link 上限基础值；有效上限取此值与 anchor 数量的较大值      |
+| `memory_link_preferred_min`                | 1    | Prompt 建议一条 memory 通常至少链接的 domain 数           |
+| `memory_link_preferred_max`                | 4    | Prompt 建议一条 memory 通常最多链接的 domain 数           |
+| `memory_active_domain_link_max`           | 5    | 每条 memory 的 link 上限基础值；有效上限取此值与 entity 数量的较大值      |
 
 
-主动检索的 Subject 通道按 query 与 active/retired subject name embedding 取前 8 个，再删除相似度
-低于 0 的 subject。每个保留 subject 附带其 active memories 中与 query 最相似的 1 条；
-没有 linked memory 时只提供 subject。
+主动检索的 Domain 通道按 query 与 active/retired domain name embedding 取前 8 个，再删除相似度
+低于 0 的 domain。每个保留 domain 附带其 active memories 中与 query 最相似的 1 条；
+没有 linked memory 时只提供 domain。
 
 主动检索的 Memory 通道按 query 与 active memory content embedding 取前 8 条，再删除相似度低于
-0 的 memory。每条保留 memory 附带其 active subjects 中 name embedding 与 query 最
-相似的 1 个；没有 subject 时只提供 memory。
+0 的 memory。每条保留 memory 附带其 active domains 中 name embedding 与 query 最
+相似的 1 个；没有 domain 时只提供 memory。
 
-主动检索的两个通道完成后，候选按真实 subject-memory 关系组织成去重的 subject groups；
-先列 Subject 通道 subjects，再列仅由 Memory 通道引入的 subjects，同一 subject 和同一组内
+主动检索的两个通道完成后，候选按真实 domain-memory 关系组织成去重的 domain groups；
+先列 Domain 通道 domains，再列仅由 Memory 通道引入的 domains，同一 domain 和同一组内
 的 memory 只展示一次。不同新 memories 的候选视图互相独立，只在各自视图内去重，不跨
-memory 去重或共享召回上限。主动结果不展示 subject summary。这些候选检索只使用向量相似度；
+memory 去重或共享召回上限。主动结果不展示 domain summary。这些候选检索只使用向量相似度；
 公开 search 和 association_search 保持纯向量；BM25 仅用于上述写入名称消歧。
 
 程序在 extraction 后为全部新 memories 分配正式 `memory_id`，输入、linking 输出和落库
 始终使用同一个 ID。批次候选池完成后启动一次 linking loop；输出覆盖所有 memories。
-全部 assignment 校验成功后，将准备好的 subjects、anchors、关系、memory、provenance、
+全部 assignment 校验成功后，将准备好的 domains、entities、关系、memory、provenance、
 embeddings、links、恢复状态和 extraction completion 原子提交，中间检索不暴露部分写入。
 
-LLM 判断每个已给出的 anchor 最适合的 subject，再判断 contextual subjects；程序由这两类
-字段生成 `direct` 或 `contextual` basis。`direct` 表示该 subject 是这条 memory 的组织归属。`contextual`
-是跨语义范围的检索桥：memory 的归属在别处，但它与该 subject 下的信息存在具体的约束、
-影响、更新或解释关系；无论关系由哪一方施加，未来 query 命中该 subject 时都需要一并可见，
+LLM 判断每个已给出的 entity 最适合的 domain，再判断 contextual domains；程序由这两类
+字段生成 `direct` 或 `contextual` basis。`direct` 表示该 domain 是这条 memory 的组织归属。`contextual`
+是跨语义范围的检索桥：memory 的归属在别处，但它与该 domain 下的信息存在具体的约束、
+影响、更新或解释关系；无论关系由哪一方施加，未来 query 命中该 domain 时都需要一并可见，
 即使两边文本不相似。
 
 以下例子补充说明 direct 与 contextual 的边界：
@@ -993,55 +999,55 @@ LLM 判断每个已给出的 anchor 最适合的 subject，再判断 contextual 
 做被动召回，它与饮食偏好文本不相似，通常不会出现。
 
 例如 new memory 是 `Mike recently had dental implant surgery` 时，query 可以写
-`Mike's dietary preferences, Mike's diet plan`，因为手术可能约束这些 subjects 描述的内容；
+`Mike's dietary preferences, Mike's diet plan`，因为手术可能约束这些 domains 描述的内容；
 new memory 是 `Mike plans to drive to Boston next weekend` 时，query 可以写
-`Mike's driving licence, Mike's driving restrictions`，因为这些 subjects 中的信息可能反过来
-约束新计划是否可行。每次 query 可以包含一个或多个可能的 subject 名称，整个 batch agent
+`Mike's driving licence, Mike's driving restrictions`，因为这些 domains 中的信息可能反过来
+约束新计划是否可行。每次 query 可以包含一个或多个可能的 domain 名称，整个 batch agent
 loop 仍最多调用 5 次主动检索。
 
-Linking 把这些记忆收进同一 subject 之后，并不改写旧正文。公开 search 按 memory content
-和 subject name 排序，每个 subject 只附带 1 条 memory，且仅 Subject 通道命中的 subject
+Linking 把这些记忆收进同一 domain 之后，并不改写旧正文。公开 search 按 memory content
+和 domain name 排序，每个 domain 只附带 1 条 memory，且仅 Domain 通道命中的 domain
 展示 summary。因此跨记忆的指代补全、约束写回、平行实例对齐和类别上提，由随后的
-Subject review（可改 memory 正文并重 embed）和最终 summary refresh（只写 summary）完成。
+Domain review（可改 memory 正文并重 embed）和最终 summary refresh（只写 summary）完成。
 
-Prompt 要求先完成逐 anchor 的 direct 分配，再添加有用的 contextual links，不以填满额度为目标；
-硬校验要求至少一个 direct link，全部 active links 不超过该 memory 的有效 link_limit。已有 subject 与其语义具体化 subject 同时
+Prompt 要求先完成逐 entity 的 direct 分配，再添加有用的 contextual links，不以填满额度为目标；
+硬校验要求至少一个 direct link，全部 active links 不超过该 memory 的有效 link_limit。已有 domain 与其语义具体化 domain 同时
 成为候选时，direct 归属只选择该 memory 真正归属且更具体的一个；该规则不排除指向存在
-上述具体关系的其他 subject 的 contextual link。程序不校验或持久化 subject 的包含关系。
+上述具体关系的其他 domain 的 contextual link。程序不校验或持久化 domain 的包含关系。
 
-每当新 memory 建立指向已有 subject 的 active link，原子 add 递增其 `new_memory_count`；新建
-subject 的初始计数为零。add 不 append memory content，也不更新 summary embedding；所有 link
-目标同时进入本 episode 持久化的 refresh targets。本 episode 新建 subject 的 `summary` 为 `NULL`、`summary_revision` 为 0，
+每当新 memory 建立指向已有 domain 的 active link，原子 add 递增其 `new_memory_count`；新建
+domain 的初始计数为零。add 不 append memory content，也不更新 summary embedding；所有 link
+目标同时进入本 episode 持久化的 refresh targets。本 episode 新建 domain 的 `summary` 为 `NULL`、`summary_revision` 为 0，
 首次 summary 统一由最终 refresh 阶段生成。
 
-#### 1.2.4 Subject review
+#### 1.2.4 Domain review
 
-一个 subject 自上次成功 review 或 split 后，每新增 8 条具有新 active link 的 memory，
+一个 domain 自上次成功 review 或 split 后，每新增 8 条具有新 active link 的 memory，
 触发一次 review：
 
 
 | 配置项                                   | 值   | 含义                                                  |
 | ------------------------------------- | --- | --------------------------------------------------- |
-| `subject_review_new_memory_threshold` | 8   | 自上次成功 review/split 后新增到该 subject 的 memory 数量触发阈值    |
-| `review_provenance_memory_max`        | 8   | 一次 Subject review provenance request 最多指定的 memory 数 |
+| `domain_review_new_memory_threshold` | 8   | 自上次成功 review/split 后新增到该 domain 的 memory 数量触发阈值    |
+| `review_provenance_memory_max`        | 8   | 一次 Domain review provenance request 最多指定的 memory 数 |
 | `memory_provenance_episode_max`       | 6   | 一个 memory version 最多关联的来源 episode 数                 |
 | `review_memory_content_max_chars`     | 800 | review 改写后的 memory content 字符硬上限                    |
 
 
-direct/contextual 使用同一计数；同一 memory-subject 对只计一次。review 读取该 subject
+direct/contextual 使用同一计数；同一 memory-domain 对只计一次。review 读取该 domain
 当前全部 active memories，而非仅新增的 8 条。成功后计数清零，失败不清零。不按 summary
 长度触发 review；本 episode 的统一 summary refresh 见本节末尾。
 
-审核输入包含 subject name，以及每条 active memory 的 ID、content、相对当前 subject 的
+审核输入包含 domain name，以及每条 active memory 的 ID、content、相对当前 domain 的
 link basis 和 provenance episode IDs。审核允许保留、修改和全局退役 memory，不允许新建、拆分
 memory、调整 links 或读写 summary。修改创建新 memory version 并重算 content embedding；改写后的
 content 建议不超过 100 words，程序按 800 字符硬上限校验。退役关闭该
 memory 的全部 active links，使其退出候选、review、split、summary 和公开 search，但保留
 历史正文、provenance、links 与 operation。
 
-Linking 只把记忆收进 subject。公开 search 按 memory content 与 subject name 排序，每个
-subject 只附带 1 条 memory，且仅 Subject 通道命中时展示 summary。因此 review 必须编译
-本 subject 内已有成员，使每条被保留的 memory 对将检索到它的 query 自洽，而不是把跨记忆
+Linking 只把记忆收进 domain。公开 search 按 memory content 与 domain name 排序，每个
+domain 只附带 1 条 memory，且仅 Domain 通道命中时展示 summary。因此 review 必须编译
+本 domain 内已有成员，使每条被保留的 memory 对将检索到它的 query 自洽，而不是把跨记忆
 关系只写在 summary 里。适用时：
 
 - 用兄妹记忆补全缺失的专名、地点或日期：已有 `Nora plans to return to her home country in
@@ -1076,17 +1082,17 @@ provenance 时，它表示包含 1--6 个不同 episode IDs 的完整替换集�
 只允许拼接共同描述同一个、不可独立更新事实的 memories。不同但相关、可以分别变化的事实
 继续分开，包括日后同一问题的两跳。审核不能默认新事实覆盖旧事实，也不能仅因时间较早
 退役；无法解决的冲突应保留，由最终 summary refresh 准确表达不确定性。共享 memory 的内容
-或生命周期修改立即全局生效，但不把链接这些 memories 的其他 subjects 加入 refresh targets。
+或生命周期修改立即全局生效，但不把链接这些 memories 的其他 domains 加入 refresh targets。
 
-完成本 episode 触发的全部 split 与 review 后，系统统一刷新以下 subjects：link 导致 memory
-新增的 subjects、被 review 的 subjects、以及 link 或 split 创建的新 subjects；full split
-退役的 subjects 从集合中排除。这个集合不包含仅因 review 更新或退役共享 memory 而受影响的
-其他 linked subjects。targets 归属于本 episode 的 add operation，并在结构性事务中持久化；
-同一 subject 只保留一个 target。
+完成本 episode 触发的全部 split 与 review 后，系统统一刷新以下 domains：link 导致 memory
+新增的 domains、被 review 的 domains、以及 link 或 split 创建的新 domains；full split
+退役的 domains 从集合中排除。这个集合不包含仅因 review 更新或退役共享 memory 而受影响的
+其他 linked domains。targets 归属于本 episode 的 add operation，并在结构性事务中持久化；
+同一 domain 只保留一个 target。
 
 当 target 的 active links 数量小于等于 2 时，不调用 LLM，summary 直接设为单个
-空格 `" "`。其他 target 单独调用一次 LLM，输入只包含 subject name 和全部当前
-active memories 的 content，不提供 subject ID、memory ID、link basis、旧 summary 或 memory
+空格 `" "`。其他 target 单独调用一次 LLM，输入只包含 domain name 和全部当前
+active memories 的 content，不提供 domain ID、memory ID、link basis、旧 summary 或 memory
 来源时间。新 summary 不得丢失 memories 支持的关键细节，并保留 content 中已有的绝对时间表述
 及其精度，不得重写为相对时间。新 summary 建议不超过 200 words，程序按 2,000 字符硬上限校验。
 
@@ -1097,97 +1103,97 @@ active memories 的 content，不提供 subject ID、memory ID、link basis、�
 同一 episode 的不同 targets 最多并发 5 个；某个 refresh 失败时，其他已经开始的 refresh
 继续完成，成功项各自提交并保持完成状态。任何未完成项都使本 episode 形成可恢复的
 maintenance failure，不回滚已经提交的 add、review 或 split，并暂停当前 space 的后续处理。
-安全重放从持久化 targets 重建集合，只重试未完成且仍 active 的 subjects，不重复已完成项，
+安全重放从持久化 targets 重建集合，只重试未完成且仍 active 的 domains，不重复已完成项，
 也不重跑 extraction 或 linking。
 
-#### 1.2.5 Subject split
+#### 1.2.5 Domain split
 
-split 只在新 memory 建立指向某 subject 的 active link 时检查。共享 memory 因其他 subject
+split 只在新 memory 建立指向某 domain 的 active link 时检查。共享 memory 因其他 domain
 review 而更新或退役、或没有新增 link 的其他容量变化，不触发检查。
 
 
 | 配置项                                          | 值         | 含义                                                                  |
 | -------------------------------------------- | --------- | ------------------------------------------------------------------- |
-| `subject_split_memory_count_threshold`       | 24       | subject 的 active memory 数量触发 split 的阈值                              |
-| `subject_split_total_memory_chars_threshold` | 8,000 字符 | subject 下 active memory latest content 总字符数触发 split 的阈值             |
-| `subject_split_result_subject_min`           | 2         | full split 的新 subjects 数或 partial split 的原 subject 加新 subjects 总数下限 |
-| `subject_split_result_subject_max`           | 5         | full split 的新 subjects 数或 partial split 的原 subject 加新 subjects 总数上限 |
-| `subject_split_result_min_memories`          | 3         | 每个新建结果 subject 至少必须包含的 memory 数                                     |
-| `subject_split_result_target_memory_max`     | 20        | 每个新建结果 subject 的 memory 数硬上限                                          |
-| `subject_split_memory_membership_max`        | 2         | 一条输入 memory 最多可以归属的本次新建 subject 数                                   |
+| `domain_split_memory_count_threshold`       | 24       | domain 的 active memory 数量触发 split 的阈值                              |
+| `domain_split_total_memory_chars_threshold` | 8,000 字符 | domain 下 active memory latest content 总字符数触发 split 的阈值             |
+| `domain_split_result_domain_min`           | 2         | full split 的新 domains 数或 partial split 的原 domain 加新 domains 总数下限 |
+| `domain_split_result_domain_max`           | 5         | full split 的新 domains 数或 partial split 的原 domain 加新 domains 总数上限 |
+| `domain_split_result_min_memories`          | 3         | 每个新建结果 domain 至少必须包含的 memory 数                                     |
+| `domain_split_result_target_memory_max`     | 20        | 每个新建结果 domain 的 memory 数硬上限                                          |
+| `domain_split_memory_membership_max`        | 2         | 一条输入 memory 最多可以归属的本次新建 domain 数                                   |
 
 
 active memory 数达到 24，或 latest contents 总字符数达到 8,000，即满足触发条件；字符
-条件不要求另一个最小 memory 数。两个数值都是触发整理的软阈值；实验版不限制单个 subject
+条件不要求另一个最小 memory 数。两个数值都是触发整理的软阈值；实验版不限制单个 domain
 最终关联的 memory 数量或总字符数，不设置硬容量、动态阈值、冷却期或封存状态。每次又有
-memory link 到已达到任一阈值的 subject 时，都重新尝试 split。
+memory link 到已达到任一阈值的 domain 时，都重新尝试 split。
 
-split 不进行向量或 BM25 近似名称消歧。输出 subject 的 normalized_name 必须在本批内唯一，
-且不得与原 subject 相同；与其他已有 active 或 retired subject 精确同名时复用其 ID，实际接收 links 的 retired target 恢复 active。
-每个结果继承父 subject 的全部 anchors；复用目标与已有 anchors 取并集。结果分组的
+split 不进行向量或 BM25 近似名称消歧。输出 domain 的 normalized_name 必须在本批内唯一，
+且不得与原 domain 相同；与其他已有 active 或 retired domain 精确同名时复用其 ID，实际接收 links 的 retired target 恢复 active。
+每个结果继承父 domain 的全部 entities；复用目标与已有 entities 取并集。结果分组的
 3--20 条限制只约束本次迁入集合，不约束复用目标原有 memories。所有最终 links 在精确复用、
 去重后校验 direct 覆盖和每条 memory 总 link 上限；已有 direct 优先于 contextual。
 复用目标只按新增成员累计维护计数，并加入本 episode 的 summary refresh targets；
 不因 split 结果新增一个递归 maintenance loop，后续 episode 新增 link 时按常规规则维护。
 
-split 输入只包含当前 subject 的 name，以及每条 active linked memory 的 `memory_id`、content
-和相对当前 subject 的 `link_basis`；不包含其他 subjects 或它们的 links。
+split 输入只包含当前 domain 的 name，以及每条 active linked memory 的 `memory_id`、content
+和相对当前 domain 的 `link_basis`；不包含其他 domains 或它们的 links。
 LLM 不输出不可见 links；程序在提交时自动保留它们，并据此校验最终 link 不变量。
 
 split 的结构化结果只能是 `full_split`、`partial_split` 或 `defer_split`，按以下排他顺序选择；
 仅在结构上能凑出分组不代表该分组具有组织意义：
 
 - **full split** 仅用于全部输入 memories 都能自然归入 2--5 个有意义、可独立检索、更新和
-增长的更细 subjects，且没有仍需原粗粒度 subject 承接的残余 memory。原 subject 的每条
-active memory 至少进入一个、最多进入两个新 subjects；原 subject 被完整替换并退役。不得为
+增长的更细 domains，且没有仍需原粗粒度 domain 承接的残余 memory。原 domain 的每条
+active memory 至少进入一个、最多进入两个新 domains；原 domain 被完整替换并退役。不得为
 覆盖完整而把离群 memory 强塞进某组或创建 catch-all。
 - 无法 full split 时，**partial split** 仅用于 1--4 个有意义、可独立增长的群组已经突出，
-  但其余 memories 没有共同的更细范围、仍需原粗粒度 subject 承接。它创建新 subjects，同时
-  保留原 subject 的 ID、name 和 active 状态。LLM 只列出新 subjects 的 name，以及应移入
+  但其余 memories 没有共同的更细范围、仍需原粗粒度 domain 承接。它创建新 domains，同时
+  保留原 domain 的 ID、name 和 active 状态。LLM 只列出新 domains 的 name，以及应移入
   它们的 memory IDs 和 link basis。程序取
-  所有被列出 memory IDs 的并集，关闭它们指向原 subject 的 links；未被列出的 memories
-  继续留在原 subject。移出集合必须非空且不是原集合，原 subject 至少保留一条 memory；
-  不得为扩大新群组而把残余 memories 强行移出，也不能仅为给某个新 subject 增加
-  contextual link 而列出本应留在原 subject 的残余 memory。
+  所有被列出 memory IDs 的并集，关闭它们指向原 domain 的 links；未被列出的 memories
+  继续留在原 domain。移出集合必须非空且不是原集合，原 domain 至少保留一条 memory；
+  不得为扩大新群组而把残余 memories 强行移出，也不能仅为给某个新 domain 增加
+  contextual link 而列出本应留在原 domain 的残余 memory。
 - 以上两者都不适用时使用 **defer split**，包括没有连 3 条 memories 都能组成的连贯群组、
 有意义的分组会违反任一结果约束，或表面群组不是值得独立检索、更新和增长的稳定范围。它是合法
-业务结果，不修改 subjects、memories、links 或计数，并记录 warning；下次又有 memory
-link 到原 subject 且容量仍达到阈值时再次尝试。它计入 Subject split 触发次数，不计入
+业务结果，不修改 domains、memories、links 或计数，并记录 warning；下次又有 memory
+link 到原 domain 且容量仍达到阈值时再次尝试。它计入 Domain split 触发次数，不计入
 benchmark 失败样本数。
 
-每个新 subject 必须包含 3--20 条不同 memories，并且至少有一条 `direct` link；上下限均由
+每个新 domain 必须包含 3--20 条不同 memories，并且至少有一条 `direct` link；上下限均由
 程序硬校验。
-被移出原 subject 的每条 memory，在关闭指向原 subject 的 link 之后，仍必须至少有一条 active
-`direct` link：来自本次新 subjects 的新 direct，或仍指向 split 范围之外其他 subjects 的既有
-direct。一条 memory 在本次新 subjects 中最多出现两次；partial split 中出现在任一新 subject 的
-memory 到原 subject 的 link 由程序关闭，但它指向 split 范围之外其他 subjects 的 links
-保持不变。不设置结果 subject 的字符目标、总 link 倍数或整体重叠率上限。
+被移出原 domain 的每条 memory，在关闭指向原 domain 的 link 之后，仍必须至少有一条 active
+`direct` link：来自本次新 domains 的新 direct，或仍指向 split 范围之外其他 domains 的既有
+direct。一条 memory 在本次新 domains 中最多出现两次；partial split 中出现在任一新 domain 的
+memory 到原 domain 的 link 由程序关闭，但它指向 split 范围之外其他 domains 的 links
+保持不变。不设置结果 domain 的字符目标、总 link 倍数或整体重叠率上限。
 
 分组依据是未来是否需要独立检索、更新和增长，而不是平均分配数量。日后同一问题需要同路
 检索的记忆应留在一起，例如搬家与点名来源国的事实、将被计数的平行实例；若必须拆开，保
-留仍成立的 contextual link。直接归属的 memories 决定新 subject 的范围与名称；contextual
-memories 只能在该范围成立后补充，不能单独成为新建 subject 的理由。结果 name 应保留原主体
-锚点并表达具体领域、项目模块、事件阶段或人物关系；不得使用没有语义边界的 Other、Misc 等
-名称，也不得仅按日期、一次性聚类或当前 memories 的摘要命名。结果 subjects 存在语义包含
+留仍成立的 contextual link。直接归属的 memories 决定新 domain 的范围与名称；contextual
+memories 只能在该范围成立后补充，不能单独成为新建 domain 的理由。结果 name 应保留原主体
+实体并表达具体领域、项目模块、事件阶段或人物关系；不得使用没有语义边界的 Other、Misc 等
+名称，也不得仅按日期、一次性聚类或当前 memories 的摘要命名。结果 domains 存在语义包含
 关系时，LLM 只把 memory 分配给它真正归属且更具体的一个；程序不校验或维护这种包含关系。
-所有新 links 的 `link_basis` 都相对新 subject 重新判断，不能继承输入中相对原 subject 的值；
-contextual memory 只进入仍有具体联系的新 subject。
+所有新 links 的 `link_basis` 都相对新 domain 重新判断，不能继承输入中相对原 domain 的值；
+contextual memory 只进入仍有具体联系的新 domain。
 
-例如，原 subject `Mike` 中有三条饮食 memories 和三条旅行 memories，且它们覆盖全部内容
+例如，原 domain `Mike` 中有三条饮食 memories 和三条旅行 memories，且它们覆盖全部内容
 时，可以 full split 为 `Mike's dietary preferences` 与 `Mike's travel plans`。如果另有一条
-无法与其他 memories 形成 health subject 的种牙记忆，则使用 partial split：饮食和旅行
-memories 移入新 subjects，种牙记忆不出现在输出中并继续留在 `Mike`。不能一边让它留在
-`Mike`，一边在本次 split 输出中把它 contextual link 到饮食 subject，因为任何被列出的
-memory 都会移出原 subject。如果至少三条 health memories 已形成稳定范围，种牙记忆可以
-direct link 到新的 health subject，并在确有饮食约束时 contextual link 到饮食 subject。
+无法与其他 memories 形成 health domain 的种牙记忆，则使用 partial split：饮食和旅行
+memories 移入新 domains，种牙记忆不出现在输出中并继续留在 `Mike`。不能一边让它留在
+`Mike`，一边在本次 split 输出中把它 contextual link 到饮食 domain，因为任何被列出的
+memory 都会移出原 domain。如果至少三条 health memories 已形成稳定范围，种牙记忆可以
+direct link 到新的 health domain，并在确有饮食约束时 contextual link 到饮食 domain。
 
-full split 和 partial split 都在一个事务中提交新 subjects、name embeddings、refresh targets
-和 link 变化，memory content 与 provenance 不变；不读取或生成 summary。成功后新建结果 subjects 的新增计数为零，复用目标累计真正新增成员；partial split 保留原 subject 的旧 summary，直到最终 refresh。
+full split 和 partial split 都在一个事务中提交新 domains、name embeddings、refresh targets
+和 link 变化，memory content 与 provenance 不变；不读取或生成 summary。成功后新建结果 domains 的新增计数为零，复用目标累计真正新增成员；partial split 保留原 domain 的旧 summary，直到最终 refresh。
 Review 与 split 同时满足时先执行 split：
 full 或 partial split 成功后无需立即 review；defer split 后仍执行已经达到触发条件的 review。
 
 JSON、schema、字段类型或非法 ID 错误归入 `invalid_structured_output`，按 1.1.12 的规则
-立即反馈并修复。结果虽然符合 schema 但违反 ID 覆盖、结果数量、最少 memories、新 subject
+立即反馈并修复。结果虽然符合 schema 但违反 ID 覆盖、结果数量、最少 memories、新 domain
 缺少 direct、移出后某条 memory 不再有任何 active direct，或 membership 等业务不变量时也
 归入同类；不能静默改写为 defer split。LLM 判断不存在有意义的合法分组时应直接输出
 `defer_split`。
@@ -1223,7 +1229,7 @@ QA 都原子保存 checkpoint；尚未完成 extraction 的 episode 在崩溃恢
 answer 以 `predictions.jsonl` 中已写入的 question ID 为 checkpoint：每完成一题立即追加
 prediction 与对应的紧凑 `search_records.jsonl` 机器记录；再次运行同一 run 的 answer 时跳过
 这些 ID，不删除已有预测。机器记录保存生成检索汇总和人类审计日志所需的 query、延迟、回答
-LLM input tokens，以及最终展示的 subject、summary、memory、相似度和检索路径。
+LLM input tokens，以及最终展示的 domain、summary、memory、相似度和检索路径。
 Benchmark runner 不提供完整 item 外层 retry；generation 与 embedding 的 transport retry
 由 OpenAI-compatible SDK 执行，structured-output repair 和 SQLite transaction 只执行各自
 所属操作内的有限重试。模型给出的结构和业务均有效但错误的答案不重试。一次 full 或 sample 脚本只
@@ -1240,11 +1246,11 @@ answer 根据 `search_records.jsonl` 覆盖生成三份产物：
 
 - `search_summary.json` 汇总检索延迟的 mean、p50、p90、max；每 query 回答 LLM input
   tokens 的 mean、max、min；每 query 的 summary chars、memory content chars 和最终 rendered
-  context chars 的 mean、max、min；subject 与 memory retrieval similarity 的 per-query top1、
-  mean、min 各自跨 query 的 mean、max、min；以及每 query 实际展示的 subject、summary、
+  context chars 的 mean、max、min；domain 与 memory retrieval similarity 的 per-query top1、
+  mean、min 各自跨 query 的 mean、max、min；以及每 query 实际展示的 domain、summary、
   memory 数量均值。没有召回对应对象的 query 不参与 similarity 汇总。
-- `search_audit.md` 按数据集 question 顺序逐题展示 query、实际展示的 subject/summary/memory
-  数量，以及按 query-subject name 相似度降序排列的 subject groups。每个 group 展示 subject
+- `search_audit.md` 按数据集 question 顺序逐题展示 query、实际展示的 domain/summary/memory
+  数量，以及按 query-domain name 相似度降序排列的 domain groups。每个 group 展示 domain
   name、相似度、检索路径和实际送入回答 prompt 的 summary；组内 memories 按 query-memory
   相似度降序展示 content、相似度和检索路径，不展示内部 ID。
 - `answer_llm_input_samples.md` 保存数据集顺序前 3 个回答请求的完整 system prompt 和 user
@@ -1286,7 +1292,7 @@ LoCoMo_refined 输出 `qa_id`/`predicted_answer`，使用官方 `refined` LLM ju
 匹配。answer 阶段按数据集选择 prompt：LoCoMo_refined 要求短短语、尽量使用记忆原文、保持时间粒度，
 并在 memory 展示日期存在时以它解析相对时间；
 LongMemEval 要求覆盖全部所需事实，并在有 `question_date` 时写入 `Current Date`。检索结果
-渲染为 subject 分组，不把 memory 的 `latest_source_at` 渲染为事件日期。
+渲染为 domain 分组，不把 memory 的 `latest_source_at` 渲染为事件日期。
 
 上述临时错误在所属操作内重试耗尽后暂停当前 memory space 的 benchmark 记忆构建流水线；
 `rate_limited` 或
@@ -1299,13 +1305,13 @@ QA item 成为终态失败，不暂停其他 spaces，也不永久阻塞当前 s
 
 Add 的 memory、links 和 episode completion 一旦原子提交即永久成功，后续 maintenance
 失败不回滚它们。显式恢复 build 时，同一 episode 的幂等重放跳过 extraction 与 linking；
-已经提交的 split/review 由当前 subject 状态和计数避免重复执行，随后从
+已经提交的 split/review 由当前 domain 状态和计数避免重复执行，随后从
 `episode_summary_refresh_targets` 读取仍 active 且未完成的 targets。并发 refresh 中已经成功
 提交的 targets 带有完成 operation ID，恢复时不会重复执行；失败或尚未开始的 targets 会被
 重新构造并重试。benchmark checkpoint 只有在 episode 的全部 maintenance 完成后才跳过该
 source sequence。
 
-第一版先完整实现 extraction、Subject linking、Subject review、Subject split、Subject summary
+第一版先完整实现 extraction、Domain linking、Domain review、Domain split、Domain summary
 refresh 和 search，
 再执行正式实验；ablation study 留到以后。实验按配置直接报告各项结果，不选择优胜配置，
 也不要求把模型因素与系统设计因素隔离。
@@ -1322,8 +1328,8 @@ query，也不执行迭代检索。除数据集官方 QA 指标外，实验只�
 completion/output tokens，`total_tokens` 使用 provider 报告的总量，不由前两项相加。
 benchmark QA 回答和评测调用不计入该写入整理总量；
 - public search 检索延迟；
-- active memory 数和 active subject 数；
-- Subject split 触发次数和 Subject review 触发次数；
+- active memory 数和 active domain 数；
+- Domain split 触发次数和 Domain review 触发次数；
 - 失败样本数。
 
 每个 memory space 完成全部 session 处理并最终定型后统计记忆压缩率：
@@ -1331,30 +1337,30 @@ benchmark QA 回答和评测调用不计入该写入整理总量；
 ```text
 source_chars = 实际交给 extractor 的全部规范化 episode 正文字符数
 memory_chars = 全部 active memory latest contents 字符数
-             + 全部 active subject summaries 字符数
+             + 全部 active domain summaries 字符数
 memory_compression_rate = 1 - memory_chars / source_chars
 ```
 
 `source_chars` 包含作为正文输入的图片描述，不包含 role、时间、metadata 或评测字段。
-`memory_chars` 不包含 retired memories、历史 memory versions 或 retired subjects；这些对象
+`memory_chars` 不包含 retired memories、历史 memory versions 或 retired domains；这些对象
 只用于审计和追溯。实验逐 memory space 报告 `source_chars`、`memory_chars` 和压缩率。
 
-`build_summary.json` 还按 memory space 报告当前组织快照：`episode_count`、`active_subjects`、
-`direct_links`、`contextual_links`、`retired_memories`、`retired_subjects`、`rewritten_memories`
+`build_summary.json` 还按 memory space 报告当前组织快照：`episode_count`、`active_domains`、
+`direct_links`、`contextual_links`、`retired_memories`、`retired_domains`、`rewritten_memories`
 （latest version 号大于 1 的 active memories）、`max_links_per_memory`、
 `max_direct_links_per_memory`、`max_contextual_links_per_memory`、`mean_links_per_memory`、
-`max_memories_per_subject`、`mean_memories_per_subject`、`max_provenance_per_memory`，以及
-`subjects` 列表。列表按 name 再按 subject ID 排序，每项只含 `name`、`direct_links` 和
-`contextual_links`。link 与 provenance 计数只包含 active memories 指向 active subjects 的
+`max_memories_per_domain`、`mean_memories_per_domain`、`max_provenance_per_memory`，以及
+`domains` 列表。列表按 name 再按 domain ID 排序，每项只含 `name`、`direct_links` 和
+`contextual_links`。link 与 provenance 计数只包含 active memories 指向 active domains 的
 active links，以及 latest memory version 的 provenance。没有 active memories 或 active
-subjects 时，对应 max/mean 为 0。
+domains 时，对应 max/mean 为 0。
 
 #### 1.2.7 实验版记忆构建日志
 
 每次 memory-space build 生成三份日志：一份 JSONL 结构化事件日志，用于机器分析、统计和
 定位失败；一份 Markdown LLM 输入输出采样日志，用于人工抽查 user prompt 与模型输出；
 一份覆盖写入的 Markdown 记忆库快照，按 memory space 完成顺序展示已完成 spaces 的全部 active
-subjects 的 name 与 summary，以及各自 active linked memories 的 content。不生成
+domains 的 name 与 summary，以及各自 active linked memories 的 content。不生成
 `build_audit.md`。记忆库快照和 LLM 输入输出样本不进入结构化事件 JSONL。
 
 这三份日志是实验产物，不是 SQLite 正式数据或可写事实源，不能反向驱动记忆状态，也不能
@@ -1367,8 +1373,8 @@ subjects 的 name 与 summary，以及各自 active linked memories 的 content�
 关联 IDs、状态或结果，以及适用的对象数量、耗时和简短原因。覆盖范围至少包括：
 
 - memory-space build 的开始、完成、暂停、恢复和失败；
-- episode 的 extraction 完成、Subject linking 完成和原子提交；
-- 一次 episode 提取、创建和写入的 memory 数，新建 subject 数及新建 link 数；
+- episode 的 extraction 完成、Domain linking 完成和原子提交；
+- 一次 episode 提取、创建和写入的 memory 数，新建 domain 数及新建 link 数；
 - 本 episode 的 association search 详细结果合计涉及的唯一 candidate memory 数；初始
 name-only candidates 不包含 memory，因此未调用主动检索时该值为 0。若至少一次调用
 association search，还记录 `association_search_called = true`，以及主动结果相对初始候选额外
@@ -1376,14 +1382,14 @@ association search，还记录 `association_search_called = true`，以及主动
 - 记忆写入与整理阶段每次 LLM 调用的阶段、attempt、success/failed 结果、耗时，以及
 `input_tokens`、`output_tokens` 和 `total_tokens`；不记录 generation provider
 使用的其他 token 子类别；
-- Subject review 和 Subject split 的触发、开始、完成或失败，以及涉及的 subject ID；
-- Subject review 完成事件记录该次 review 是否请求并查看了 provenance；
-- subject summary refresh target 的建立、开始、完成或失败，以及涉及的 subject ID；
+- Domain review 和 Domain split 的触发、开始、完成或失败，以及涉及的 domain ID；
+- Domain review 完成事件记录该次 review 是否请求并查看了 provenance；
+- domain summary refresh target 的建立、开始、完成或失败，以及涉及的 domain ID；
 - split 的 `full_split`、`partial_split` 或 `defer_split` 结果；
 - review 导致的 memory 更新数和全局退役数；
 - model provider `error_class`、structured-output retry、warning、终态单项失败、临时暂停、
 配置阻塞和恢复；
-- partial split 移出的 memory 数、新建 subject 数，以及 full split 退役的原 subject。
+- partial split 移出的 memory 数、新建 domain 数，以及 full split 退役的原 domain。
 
 结构化日志保留正式 IDs 和计数，便于汇总实验指标；不为了日志给 memory 增加 name 字段。
 
@@ -1413,10 +1419,10 @@ provider 失败无法形成样本。
 按构建完成顺序排列。checkpoint 的 `completed_space_ids` 按此顺序持久化，恢复续跑时保留
 已完成 spaces 的顺序，并将新完成的 spaces 排在其后。尚在构建或暂停的 spaces 不出现在文件中；
 首次有 space 完成前不生成该文件。
-每个 space 展示全部 active subjects，每个 subject 给出 name 和 summary，其下列出当前
-active linked memories 的 content。不包含 subject ID、memory ID、link basis、retired 对象、
-来源 episode 或过程事件。同一 memory 若同时链到多个 subjects，在每个 subject 下各出现一次。
-新建尚未 refresh 的 subject 可以没有 summary 正文。该文件不保留 episode 或 link 变动的中间快照。
+每个 space 展示全部 active domains，每个 domain 给出 name 和 summary，其下列出当前
+active linked memories 的 content。不包含 domain ID、memory ID、link basis、retired 对象、
+来源 episode 或过程事件。同一 memory 若同时链到多个 domains，在每个 domain 下各出现一次。
+新建尚未 refresh 的 domain 可以没有 summary 正文。该文件不保留 episode 或 link 变动的中间快照。
 
 ### 1.3 记忆检索
 
@@ -1424,43 +1430,43 @@ active linked memories 的 content。不包含 subject ID、memory ID、link bas
 
 #### 1.3.1 公开 `search`
 
-`search(query)` 只读取 active memories、active subjects 和 active links。Subject 通道在取 top-k
-之前排除没有 active link 指向 active memory 的空 subject，不让空容器占用名额。第一版所有通道
+`search(query)` 只读取 active memories、active domains 和 active links。Domain 通道在取 top-k
+之前排除没有 active link 指向 active memory 的空 domain，不让空容器占用名额。第一版所有通道
 仅执行精确向量检索，不使用 BM25、关键词、融合、重排或第二轮筛选。query 不设应用层字符
 上限，也不静默裁剪。
 
 
 | 配置项                                    | 值    | 含义                                                |
 | -------------------------------------- | ---- | ------------------------------------------------- |
-| `search_subject_top_k`                 | 5    | 公开 search 的 Subject 通道最多召回的 subject 数             |
-| `search_subject_min_similarity`        | 0 | 公开 search 的 Subject 通道最低 query-subject name 余弦相似度 |
-| `search_subject_attached_memory_k`     | 1    | 每个公开 search Subject 通道结果附带的关联 memory 数            |
+| `search_domain_top_k`                 | 5    | 公开 search 的 Domain 通道最多召回的 domain 数             |
+| `search_domain_min_similarity`        | 0 | 公开 search 的 Domain 通道最低 query-domain name 余弦相似度 |
+| `search_domain_attached_memory_k`     | 1    | 每个公开 search Domain 通道结果附带的关联 memory 数            |
 | `search_memory_top_k`                  | 15   | 公开 search 的 Memory 通道最多召回的 memory 数               |
 | `search_memory_min_similarity`         | 0 | 公开 search 的 Memory 通道最低 query-memory 余弦相似度        |
-| `search_memory_attached_subject_k`     | 1    | 每个公开 search Memory 通道结果附带的关联 subject 数            |
+| `search_memory_attached_domain_k`     | 1    | 每个公开 search Memory 通道结果附带的关联 domain 数            |
 
 
-Subject 通道使用 subject name embedding，召回最多 5 个相似度不低于 0 的 subjects；
-每个 subject 附带 active linked memories 中与 query 最相似的 1 条。Memory 通道召回最多
-15 条相似度不低于 0 的 active memories；每条 memory 附带 active linked subjects 中
+Domain 通道使用 domain name embedding，召回最多 5 个相似度不低于 0 的 domains；
+每个 domain 附带 active linked memories 中与 query 最相似的 1 条。Memory 通道召回最多
+15 条相似度不低于 0 的 active memories；每条 memory 附带 active linked domains 中
 name embedding 与 query 最相似的 1 个。
 
-两条通道产生的 subject-memory 候选关系合并后，每条 memory 在最终结果中只展示一次。如果
-同一 memory 可归入多个候选 subjects，则归入 query-subject name 相似度最高的 subject；同分
-以稳定 ID 决定。Subject 通道直接命中的 subjects 即使最终没有 memory 也保留，并可以携带
-summary。仅由 Memory 通道引入的 subject 不携带 summary；如果最终没有分到 memory，则不
-展示。最终 subject groups 按 query-subject name 相似度降序排列，每个 group 内的 memories
+两条通道产生的 domain-memory 候选关系合并后，每条 memory 在最终结果中只展示一次。如果
+同一 memory 可归入多个候选 domains，则归入 query-domain name 相似度最高的 domain；同分
+以稳定 ID 决定。Domain 通道直接命中的 domains 即使最终没有 memory 也保留，并可以携带
+summary。仅由 Memory 通道引入的 domain 不携带 summary；如果最终没有分到 memory，则不
+展示。最终 domain groups 按 query-domain name 相似度降序排列，每个 group 内的 memories
 按 query-memory 相似度降序排列。direct/contextual links 均参与，第一版不调整权重。
 
-不设置最终 subject 数、memory 数、每 subject memory 数、返回文本总字符数、单条 summary
+不设置最终 domain 数、memory 数、每 domain memory 数、返回文本总字符数、单条 summary
 字符数、单条 memory 返回字符数或超限最小保留数量。Public library 返回结构化结果；面向
-主 Agent 的文本仅是同一 subject-group 结构的确定性呈现。结构化 `SearchMemory` 保留
+主 Agent 的文本仅是同一 domain-group 结构的确定性呈现。结构化 `SearchMemory` 保留
 `latest_source_at` 供调用方显式使用，默认文本不渲染该字段。
 
 #### 1.3.2 NumPy 精确扫描
 
 实验版不使用 query embedding cache。检索从 SQLite 分批读取当前 memory space、active
-retrieval signature 和目标实体下的全部向量，每批最多 8,192 行。归一化 query 向量与
+retrieval signature 和目标对象类型（domain 或 memory）下的全部向量，每批最多 8,192 行。归一化 query 向量与
 目标向量矩阵使用 NumPy 矩阵乘法计算 cosine similarity，并持续维护全局 top-k；分批只
 限制内存，不改变所有向量参与计算的精确语义。相同浮点值以稳定 ID 决定顺序，不设置浮点
 近似并列容差。
@@ -1474,13 +1480,13 @@ retrieval signature 和目标实体下的全部向量，每批最多 8,192 行�
 #### 1.4.1 Memory extraction
 
 Extraction 使用判别结果明确区分提取成功与“没有有价值的记忆”。有结果时 `memories`
-至少包含一项，每条 memory 的 `anchors` 为非空名称数组；超过 20 条 memories 时输出 warning 但不截断：
+至少包含一项，每条 memory 的 `entities` 为非空名称数组；超过 20 条 memories 时输出 warning 但不截断：
 
 ```json
 {
   "result": "memories",
   "memories": [
-    {"content": "A self-contained memory supported by this episode.", "anchors": ["User"]}
+    {"content": "A self-contained memory supported by this episode.", "entities": ["User"]}
   ]
 }
 ```
@@ -1497,10 +1503,10 @@ Extraction 使用判别结果明确区分提取成功与“没有有价值的记
 程序在成功 extraction 后为每条 memory 分配正式 `memory_id`，供 linking 输入、输出和落库一致使用。畸形对象、缺失判别字段或 `result = "memories"` 但数组为空均不是
 `no_valuable_memory`。
 
-#### 1.4.2 Batched Subject linking
+#### 1.4.2 Batched Domain linking
 
-一个最终 linking 结果覆盖本 episode 的全部 new memories。Anchor 和 subject 使用唯一名称，
-memory 使用程序分配的正式 ID。候选在 linking 前已包含每个 anchor 的同名 subject：
+一个最终 linking 结果覆盖本 episode 的全部 new memories。Entity 和 domain 使用唯一名称，
+memory 使用程序分配的正式 ID。候选在 linking 前已包含每个 entity 的同名 domain：
 
 ```json
 {
@@ -1509,10 +1515,10 @@ memory 使用程序分配的正式 ID。候选在 linking 前已包含每个 anc
     {
       "memory_id": "the supplied memory ID",
       "direct_assignments": [
-        {"anchor": "Mike", "subject": "Mike and John's friendship"},
-        {"anchor": "John", "subject": "Mike and John's friendship"}
+        {"entity": "Mike", "domain": "Mike and John's friendship"},
+        {"entity": "John", "domain": "Mike and John's friendship"}
       ],
-      "contextual_subjects": []
+      "contextual_domains": []
     }
   ]
 }
@@ -1521,16 +1527,16 @@ memory 使用程序分配的正式 ID。候选在 linking 前已包含每个 anc
 主动关联检索的中间请求：
 
 ```json
-{"result": "association_search", "query": "likely Subject names"}
+{"result": "association_search", "query": "likely Domain names"}
 ```
 
-程序验证每个 memory_id 恰好输出一次、每个输入 anchor 恰好分配一次、direct target 的
-anchor 成员关系包含指定 anchor。所有 subject 名称必须来自共享 candidates 或该 memory 的
+程序验证每个 memory_id 恰好输出一次、每个输入 entity 恰好分配一次、direct target 的
+entity 成员关系包含指定 entity。所有 domain 名称必须来自共享 candidates 或该 memory 的
 主动检索结果。相同目标去重，direct 优先；distinct links 不超过输入中的 link_limit。
-初始 candidates 展示 name 和 anchors，主动结果另含关联 memory 和检索分数；都不展示
-subject ID 或 summary。无额外的临时 ref、创建 subject 或 subject 消歧输出。
+初始 candidates 展示 name 和 entities，主动结果另含关联 memory 和检索分数；都不展示
+domain ID 或 summary。无额外的临时 ref、创建 domain 或 domain 消歧输出。
 
-Extraction 的条件 anchor 名称消歧回合每个疑似项一条：
+Extraction 的条件 entity 名称消歧回合每个疑似项一条：
 
 ```json
 {
@@ -1540,9 +1546,9 @@ Extraction 的条件 anchor 名称消歧回合每个疑似项一条：
 }
 ```
 
-`canonical_name` 必须是提出的名称或给定候选名。程序应用映射并去重 anchors，不改写正文。
+`canonical_name` 必须是提出的名称或给定候选名。程序应用映射并去重 entities，不改写正文。
 
-#### 1.4.3 Subject review
+#### 1.4.3 Domain review
 
 首轮只有在现有 content 与 metadata 不足以判断时才请求 provenance：
 
@@ -1585,14 +1591,14 @@ Extraction 的条件 anchor 名称消歧回合每个疑似项一条：
 取得 provenance 后不能再次请求。未列入 `updates` 或 `retirements` 的 memory 保持不变；
 retirement 的全局语义和 provenance 完整替换语义以 1.2.4 为准。
 
-#### 1.4.4 Subject split
+#### 1.4.4 Domain split
 
-Full split 输出全部新 subjects 及其完整成员关系：
+Full split 输出全部新 domains 及其完整成员关系：
 
 ```json
 {
   "result": "full_split",
-  "subjects": [
+  "domains": [
     {
       "name": "Mike's dietary preferences",
       "links": [
@@ -1613,13 +1619,13 @@ Full split 输出全部新 subjects 及其完整成员关系：
 }
 ```
 
-Partial split 只列出新 subjects 和要移走的 memories；原 subject 的最终成员集合由程序作
+Partial split 只列出新 domains 和要移走的 memories；原 domain 的最终成员集合由程序作
 集合差得到：
 
 ```json
 {
   "result": "partial_split",
-  "new_subjects": [
+  "new_domains": [
     {
       "name": "Mike's dietary preferences",
       "links": [
@@ -1637,18 +1643,18 @@ Partial split 只列出新 subjects 和要移走的 memories；原 subject 的�
 ```json
 {
   "result": "defer_split",
-  "reason": "The remaining memories do not form coherent independent subjects."
+  "reason": "The remaining memories do not form coherent independent domains."
 }
 ```
 
 `defer_split` 是语义决定；full/partial split 中的非法 ID、不完整覆盖、数量越界、新
-subject 缺少 direct，或移出后某条 memory 不再有任何 active direct，仍是需要修复的输出错误。
+domain 缺少 direct，或移出后某条 memory 不再有任何 active direct，仍是需要修复的输出错误。
 
-#### 1.4.5 Subject summary refresh
+#### 1.4.5 Domain summary refresh
 
-当 subject 的 active links 数量小于等于 2 时，不调用 LLM，将 summary 设为单个
-空格 `" "`。其他 subject 的输入仅包含 subject name，以及全部当前 active memories
-的 content；不包含 subject ID、memory ID、link basis、旧 summary 或 memory 来源时间。输出整体替换
+当 domain 的 active links 数量小于等于 2 时，不调用 LLM，将 summary 设为单个
+空格 `" "`。其他 domain 的输入仅包含 domain name，以及全部当前 active memories
+的 content；不包含 domain ID、memory ID、link basis、旧 summary 或 memory 来源时间。输出整体替换
 summary：
 
 summary 必须与 memories 一致；若 memories 能确定事件的绝对时间，读者也必须能从 summary
@@ -1665,7 +1671,7 @@ summary 必须与 memories 一致；若 memories 能确定事件的绝对时间�
 完成状态；恢复时只处理尚未完成且仍 active 的 targets。
 
 LLM 返回的空白、超出字符硬上限或包含额外字段的结果按结构化输出规则修复；合法提交必须重新
-校验输入快照仍与当前 subject 成员和 memory 内容一致。
+校验输入快照仍与当前 domain 成员和 memory 内容一致。
 
 ## 2. 第一版正式版补充设计
 
@@ -1742,7 +1748,7 @@ assistant message 必须显式保存 `message_phase = 'final'`，不能仅根据
 当 buffer 达到 message 或字符数阈值时，detector 按 2.2 节的规则选择合法边界。
 Seal episode 在一个事务中：
 
-1. 创建 `situational_episodes`；
+1. 创建 `episodes`；
 2. 将 boundary 之前的 inbox blocks 按原顺序写入 `episode_blocks`；
 3. 删除这些 inbox blocks 及其临时 boundary embeddings；
 4. 保留 boundary 之后的 blocks 作为开放 buffer；
@@ -1788,7 +1794,7 @@ buffer、worker queue、LLM 调用上下文和普通日志都不是唯一副本�
   的 blocks。
 
 `add_into_buffer` 在 receive transaction 成功后即可返回，不等待 boundary detection、
-memory extraction 或 subject 整理。同一 stream 的调用方按来源顺序提交，core 使用
+memory extraction 或 domain 整理。同一 stream 的调用方按来源顺序提交，core 使用
 `ingestion_version` CAS 防止并发覆盖；不同 streams 可以并行。
 
 Public `add` 的成功只表示完整 add unit 已可靠写入 durable inbox，不表示已经产生 memory。
@@ -1797,8 +1803,8 @@ Public `add` 的成功只表示完整 add unit 已可靠写入 durable inbox，�
 
 #### 2.1.8 Retention 与临时数据清理
 
-正式版 episode、episode messages、memory/subject history、ended links、ingestion
-receipts 和 domain operations 均不自动过期；显式删除 memory space 时清除整套数据。
+正式版 episode、episode messages、memory/domain history、ended links、ingestion
+receipts 和 memory operations 均不自动过期；显式删除 memory space 时清除整套数据。
 正式版普通日志由宿主环境收集与轮转；其内容与持久运行状态的边界见 2.4.4。benchmark
 artifacts 仍由 benchmark runner 管理。
 
@@ -1826,7 +1832,7 @@ extraction、linking、review 或 split。幂等 key 与 canonical preprocessed 
 重放返回原 receipt；相同 key 不同 hash 返回 conflict。调用方负责按来源顺序提交同一 stream，
 core 使用 `ingestion_version` CAS 防止覆盖；不同 streams 可以并行接收。
 
-Boundary detection seal 出 situational episode 后，coordinator 调用与实验版相同语义的
+Boundary detection seal 出 episode 后，coordinator 调用与实验版相同语义的
 `add_episode(memory_space_id, episode)`，即 `add_into_memory_store`。正式版只为这一共享核心
 增加 overlap context builder；extraction schema、校验、修复重试、embedding、link/write、
 maintenance 和终态失败语义不复制实现。内部调用在 episode 成功、合法零 memory 或持久化
@@ -1857,7 +1863,7 @@ hash 和策略作为结构化 truncation metadata 保存；不设置
 `truncation_marker_chars_max`。31,000 是由两项配置派生的保留预算，
 不是另一项配置。
 
-正式版 seal 后的 situational episode 不设 message 数或正文总字符硬上限。boundary
+正式版 seal 后的 episode 不设 message 数或正文总字符硬上限。boundary
 threshold 在通常情况下控制大小；无法合法切分的完整交互允许形成更大 episode。如果最终
 无法装入 generation provider context window，则归入 `context_overflow`，该 extraction item
 按永久单项失败处理，不能反向拒绝此前已成功接收的 add。
@@ -1953,7 +1959,7 @@ extraction input/context builder，共用同一 extractor prompt 契约、struct
    overlap、执行 extraction，并生成该批新 memory embeddings。episode N 完成 Stage A 后
    立即释放 lane，因此 N 等待或执行 Stage B 时，N+1 可以开始 extraction。
 2. **Stateful lane** 也按 `memory_space_write_sequence` 一次处理一个 episode，依次完成候选
-   召回、per-memory linking、原子 add commit、split/review，以及持久化 targets 的 subject
+   召回、per-memory linking、原子 add commit、split/review，以及持久化 targets 的 domain
    summary refresh。一个 episode 的全部 maintenance 完成或进入终态后，下一
    episode 才能进入这条 lane；split 与 review 同时满足时仍按 1.2.4--1.2.5 的 split-first
    规则。
@@ -1965,7 +1971,7 @@ Extraction lane 本身就是并发上限 1，不增加 extraction concurrency �
 
 同一 user 的多个线性 streams 可以写入同一个默认 memory space，但各自的 blocks、buffer、
 episode 和 overlap 始终隔离，不拼接成跨 stream episode。Seal 时分配的
-`memory_space_write_sequence` 只为共享 subjects/memories 的 stateful mutation 选出确定顺序；
+`memory_space_write_sequence` 只为共享 domains/memories 的 stateful mutation 选出确定顺序；
 不会把 `A→B→C1→D1` 与 `A→B→C2→D2` 重排成一个 stream，也不声称两条分支之间存在因果
 关系。
 
@@ -2029,7 +2035,7 @@ seal 并进入 extraction。Flush 完成表示该范围内所有工作都已进�
 合法地产生零条 memory、任一终态单项失败或 buffer 淘汰；完成不承诺每个输入都产生 memory。
 这些结果必须可以通过持久状态区分。
 
-search 永远只读取已经提交的 memories/subjects，不等待 pending extraction。connector 在
+search 永远只读取已经提交的 memories/domains，不等待 pending extraction。connector 在
 durable buffer 写入成功后退出，不等待 memory write。
 
 #### 2.2.8 Connector transcript 捕获
@@ -2072,13 +2078,13 @@ compaction 后，connector 不修改
 
 ### 2.3 正式版记忆检索与主 Agent 使用
 
-正式版复用实验版 1.3 节的纯向量双通道 search、相似度门槛、top-k、attached entity、
+正式版复用实验版 1.3 节的纯向量双通道 search、相似度门槛、top-k、attached object、
 去重和关系整理规则，不建立另一套检索实现。search 是主动检索通道，由主 Agent LLM 决定
 何时调用和 query 内容；自动 add 与主动 search 职责分离。
 
 Memory Engine core 不依赖 Claude Code、Codex 或 MCP 类型。connector 把 core 的 search
 结构化结果转换为宿主工具结果。所有 streams 在同一 user 默认 memory space 中共享 active
-memories/subjects；stream 只隔离开放 buffer 和 episode 顺序。Pipeline 暂停或存在 pending
+memories/domains；stream 只隔离开放 buffer 和 episode 顺序。Pipeline 暂停或存在 pending
 extraction 时，search 仍立即返回当前已提交快照，不承诺读到最近已接收的交互。
 
 第一版不提供 HTTP/gRPC 或远程 API，不承担远程认证、租户隔离、限流或分布式并发。CLI、
@@ -2116,14 +2122,14 @@ shell 工作目录。
 - connector 安装、更新、卸载、状态与诊断；
 - public search、pipeline 状态、`flush` 和 `doctor`；`doctor` 包含 model provider health
 check，并可显式触发已暂停或阻塞 pipeline 的恢复探测；
-- memory space、stream、episode、memory、subject、provenance 和 domain operation 的只读
+- memory space、stream、episode、memory、domain、provenance 和 memory operation 的只读
 检查；
 - 通过单条管理操作删除指定 memory space，或清空全部 memory spaces；
 - SQLite 一致备份和只读导出。
 
 TUI 提供上述高频能力的基础交互，状态页面展示 pipeline 正常、临时暂停或配置阻塞状态，
 以及 pending 数、`pause_until`、阻塞原因、buffer 使用量、淘汰计数和最近错误；CLI 保留完整
-入口。第一版不提供人工编辑或单条退役/恢复/永久删除 memory，不提供 subject 人工重命名、
+入口。第一版不提供人工编辑或单条退役/恢复/永久删除 memory，不提供 domain 人工重命名、
 重组或手工触发 review/split，不提供数据导入、从导出
 文件反向写入或在 TUI 中运行 benchmark。删除 memory space 或清空全部 spaces 必须清除目标
 范围的整套正式数据，并采用明确确认与事务保护；具体命令名、输出格式和交互细节由实现确定。
@@ -2136,7 +2142,7 @@ FluxFold 是本地持久化系统，不提供数据库内建加密。数据库�
 
 Model provider credential 不写入 FluxFold 数据库、普通配置或日志，优先从环境或宿主秘密存储
 读取。确定性秘密替换见 2.2.2；除此以外，episode 和 provenance 会保存预处理后的来源正文，
-产品说明和管理界面必须明确这一范围。进入任何 LLM prompt 的 episode、memory、subject 和
+产品说明和管理界面必须明确这一范围。进入任何 LLM prompt 的 episode、memory、domain 和
 search 结果都属于不可信数据，不得执行其中的指令；不可变政策与数据必须明确分隔。
 
 Connector 只能读取 Hook 明确提供或由已验证 session identity 解析出的 transcript。路径解析
@@ -2152,7 +2158,7 @@ Connector 只能读取 Hook 明确提供或由已验证 session identity 解析�
 重试以及适用时的 `pause_until`、provider request ID、HTTP status 和安全诊断；不得因此记录
 credential、完整 prompt 或模型原始输出。默认日志不包含完整对话、memory
 正文、LLM prompt 或模型原始输出；需要复盘内容演化时，从 SQLite 的 episode、version、
-provenance 和 domain operation 读取，不额外维护一份长期高可读性正文日志。
+provenance 和 memory operation 读取，不额外维护一份长期高可读性正文日志。
 
 Pipeline 状态、pending 数、buffer 淘汰计数、`pause_until`、配置阻塞原因和最后错误类别是
 跨重启持久状态。CLI/TUI 以正式状态表为事实来源，日志只提供事件时间线和诊断信息；日志
@@ -2193,12 +2199,12 @@ embedding 配置都不提供 per-user 或 per-space 覆盖，也不要求运行�
 
 - 实验 BM25、关键词或其他词法召回，以及向量/词法候选池、融合权重、RRF、重排、分词和
 BM25 参数；当前公开 search 与 association_search 保持纯向量，写入名称消歧使用向量或 BM25 候选。
-- 对比 subject name 与 name+summary embedding，评估 summary 提供的信息和陈旧影响。
-- 评估最低相似度、top-k、attached entity 数和最终上下文容量对不同查询类型的影响。
+- 对比 domain name 与 name+summary embedding，评估 summary 提供的信息和陈旧影响。
+- 评估最低相似度、top-k、attached object 数和最终上下文容量对不同查询类型的影响。
 - 只有精确扫描出现可复现性能瓶颈时，评估 SQLite vector extension、ANN 或外部向量索引，
 并先定义一致性、切换与重建规则。
 - 只有 memory-to-memory typed edges 和不定深度多跳成为核心能力且关系查询出现瓶颈时，
-才评估图数据库；当前 subject-memory 与 provenance 继续使用 SQLite 关系表。
+才评估图数据库；当前 domain-memory 与 provenance 继续使用 SQLite 关系表。
 
 
 
@@ -2206,9 +2212,9 @@ BM25 参数；当前公开 search 与 association_search 保持纯向量，写�
 
 - 当标注或端到端结果持续出现过切、欠切或成本问题时，对比其他 embedding/boundary 参数
 与 LLM boundary detection。
-- 对候选召回参数、Subject/Memory 通道和主动 association search 做消融，评估漏链、错链、
+- 对候选召回参数、Domain/Memory 通道和主动 association search 做消融，评估漏链、错链、
 link basis 与推理成本。
-- 如果写入顺序持续造成旧 memory 缺少后来才成立的 subject link，再评估有限 link 回填。
+- 如果写入顺序持续造成旧 memory 缺少后来才成立的 domain link，再评估有限 link 回填。
 - 根据 review/split 的去重、冲突、summary、碎片化、重叠和成本结果，实验新的 prompt、
 schema、触发条件、provenance 范围、拼接粒度和分组规则。
 - 只有公开 search 出现低相关结果或上下文挤占时，实验最终字符预算和裁剪策略。

@@ -6,7 +6,7 @@ import json
 from benchmarks.artifacts import ArtifactWriter, RunPaths
 
 from fluxfold import EpisodeBlock, FluxFold, FluxFoldConfig, NormalizedEpisode, Role
-from fluxfold.models import MemoryBankSpace, MemoryBankSubject
+from fluxfold.models import MemoryBankDomain, MemoryBankSpace
 from tests.fakes import FakeEmbeddingProvider, FakeGenerationProvider
 
 
@@ -41,7 +41,7 @@ async def _open(
         generation_provider=generation,
         embedding_provider=FakeEmbeddingProvider(),
         config=FluxFoldConfig().with_overrides(
-            subject_candidate_min_similarity=-1.0,
+            domain_candidate_min_similarity=-1.0,
             memory_candidate_min_similarity=-1.0,
             **overrides,
         ),
@@ -97,7 +97,7 @@ def test_sampling_stops_drawing_after_each_category_reaches_its_quota(
             return 0.0
 
         monkeypatch.setattr("fluxfold.engine.random.random", draw)
-        generation = FakeGenerationProvider(always_new_subject=True)
+        generation = FakeGenerationProvider(always_new_domain=True)
         events: list[dict[str, object]] = []
         engine = await _open(
             tmp_path, name="quota", generation=generation, events=events
@@ -126,7 +126,7 @@ def test_review_calls_share_one_sample_category(tmp_path, monkeypatch) -> None:
             name="review",
             generation=generation,
             events=events,
-            subject_review_new_memory_threshold=1,
+            domain_review_new_memory_threshold=1,
         )
         space = await engine.create_or_open_space("test:review")
         for index, content in enumerate(
@@ -159,8 +159,8 @@ def test_split_is_sampled_up_to_its_quota(tmp_path, monkeypatch) -> None:
             name="split",
             generation=generation,
             events=events,
-            subject_split_memory_count_threshold=3,
-            subject_review_new_memory_threshold=10,
+            domain_split_memory_count_threshold=3,
+            domain_review_new_memory_threshold=10,
         )
         for space_name in ("one", "two"):
             space = await engine.create_or_open_space(f"test:split-{space_name}")
@@ -226,7 +226,7 @@ def test_provenance_review_samples_each_llm_call(tmp_path, monkeypatch) -> None:
             name="provenance",
             generation=generation,
             events=events,
-            subject_review_new_memory_threshold=1,
+            domain_review_new_memory_threshold=1,
         )
         space = await engine.create_or_open_space("test:provenance")
         await engine.add_episode(
@@ -262,8 +262,8 @@ def test_repaired_success_samples_the_actual_repair_prompt(
             name="repair",
             generation=generation,
             events=events,
-            subject_split_memory_count_threshold=3,
-            subject_review_new_memory_threshold=10,
+            domain_split_memory_count_threshold=3,
+            domain_review_new_memory_threshold=10,
         )
         space = await engine.create_or_open_space("test:repair")
         for index in range(3):
@@ -336,7 +336,7 @@ def test_artifact_writer_overwrites_memory_bank_snapshot(tmp_path) -> None:
         MemoryBankSpace(
             "space-a",
             (
-                MemoryBankSubject(
+                MemoryBankDomain(
                     "Hiking",
                     "Alice hikes.",
                     ("Alice likes hiking.",),
@@ -348,7 +348,7 @@ def test_artifact_writer_overwrites_memory_bank_snapshot(tmp_path) -> None:
         MemoryBankSpace(
             "space-a",
             (
-                MemoryBankSubject(
+                MemoryBankDomain(
                     "Hiking",
                     "Alice hikes and owns boots.",
                     ("Alice likes hiking.", "Alice owns hiking boots."),
@@ -368,6 +368,6 @@ def test_artifact_writer_overwrites_memory_bank_snapshot(tmp_path) -> None:
     assert "- Alice likes hiking." in text
     assert "- Alice owns hiking boots." in text
     assert "## `space-b`" in text
-    assert "_(no active subjects)_" in text
-    assert "subject_id" not in text
+    assert "_(no active domains)_" in text
+    assert "domain_id" not in text
     assert "memory_id" not in text

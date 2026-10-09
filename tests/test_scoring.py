@@ -3,11 +3,11 @@ from __future__ import annotations
 from benchmarks.scoring import parse_judge_response
 
 from fluxfold.models import (
+    RankedDomainRef,
     RankedMemoryRef,
-    RankedSubjectRef,
+    SearchDomain,
     SearchMemory,
     SearchResult,
-    SearchSubject,
 )
 
 
@@ -23,14 +23,14 @@ def test_parse_official_judge_responses() -> None:
 def test_search_result_keeps_source_time_out_of_rendered_memory() -> None:
     result = SearchResult(
         query="when",
-        subjects=(SearchSubject("s1", "Caroline", None, 1.0),),
+        domains=(SearchDomain("s1", "Caroline", None, 1.0),),
         memories=(
             SearchMemory(
                 "m1", "Caroline went to the support group.", 1683417600000, 1.0
             ),
         ),
         links=(),
-        subject_channel=(RankedSubjectRef("s1", 1.0, ("m1",)),),
+        domain_channel=(RankedDomainRef("s1", 1.0, ("m1",)),),
         memory_channel=(),
     )
     rendered = result.render()
@@ -42,11 +42,11 @@ def test_search_result_keeps_source_time_out_of_rendered_memory() -> None:
 def test_search_result_globally_deduplicates_and_regroups_memories() -> None:
     result = SearchResult(
         query="query",
-        subjects=(
-            SearchSubject("direct", "Direct", "Direct summary", 0.8),
-            SearchSubject("best", "Best", "Hidden summary", 0.9),
-            SearchSubject("loser", "Loser", None, 0.7),
-            SearchSubject("winner", "Winner", None, 0.75),
+        domains=(
+            SearchDomain("direct", "Direct", "Direct summary", 0.8),
+            SearchDomain("best", "Best", "Hidden summary", 0.9),
+            SearchDomain("loser", "Loser", None, 0.7),
+            SearchDomain("winner", "Winner", None, 0.75),
         ),
         memories=(
             SearchMemory("shared", "Shared memory", None, 0.6),
@@ -54,7 +54,7 @@ def test_search_result_globally_deduplicates_and_regroups_memories() -> None:
             SearchMemory("highest", "Highest memory", None, 0.95),
         ),
         links=(),
-        subject_channel=(RankedSubjectRef("direct", 0.8, ("shared",)),),
+        domain_channel=(RankedDomainRef("direct", 0.8, ("shared",)),),
         memory_channel=(
             RankedMemoryRef("shared", 0.6, ("best",)),
             RankedMemoryRef("other", 0.7, ("loser", "winner")),
@@ -63,12 +63,12 @@ def test_search_result_globally_deduplicates_and_regroups_memories() -> None:
     )
 
     groups = result.displayed_groups()
-    assert [group.subject.subject_id for group in groups] == [
+    assert [group.domain.domain_id for group in groups] == [
         "best",
         "direct",
         "winner",
     ]
-    assert groups[0].subject.summary is None
+    assert groups[0].domain.summary is None
     assert [memory.memory_id for memory in groups[0].memories] == [
         "highest",
         "shared",
@@ -82,6 +82,6 @@ def test_search_result_globally_deduplicates_and_regroups_memories() -> None:
     assert rendered.index("Memory: Highest memory") < rendered.index(
         "Memory: Shared memory"
     )
-    assert "- Subject: Direct\n  Summary: Direct summary" in rendered
+    assert "- Domain: Direct\n  Summary: Direct summary" in rendered
     assert "Hidden summary" not in rendered
-    assert "Subject: Loser" not in rendered
+    assert "Domain: Loser" not in rendered

@@ -8,7 +8,7 @@
 ## Project Overview
 
 FluxFold is an agent memory system built from scratch. Its core bet: **push all LLM cost to the
-write path, keep the read path pure vector search.** Memories are organized into `subject`s —
+write path, keep the read path pure vector search.** Memories are organized into `domain`s —
 bounded, self-specializing organization units that are reviewed and split as they grow.
 
 - Delivery form: a Python **library**. No HTTP/gRPC service, no daemon, no network listener.
@@ -33,8 +33,8 @@ change the document in the same commit as the code, never silently diverge.
 
 ## Experimental Scope
 
-**In scope:** memory extraction, candidate recall, batched subject linking, subject review,
-subject split, public `search`, SQLite persistence, embedding management, dataset adapters for
+**In scope:** memory extraction, candidate recall, batched domain linking, domain review,
+domain split, public `search`, SQLite persistence, embedding management, dataset adapters for
 `LongMemEval-S` and `LoCoMo_refined`, benchmark runner, build logs, tests.
 
 **Out of scope (do not build):** CLI, TUI, connectors, MCP server, durable inbox, buffers,
@@ -53,7 +53,7 @@ runs/                   # local benchmark artifacts; gitignored
 scripts/setup-dev.sh    # one-time local environment bootstrap
 docs/                   # design source of truth and design rationale
 pyproject.toml uv.lock .python-version LICENSE README.md .env.example
-AGENTS.md AGENTS_CH.md
+AGENTS.md
 ```
 
 Dependency direction is one-way: `benchmarks/` → `src/fluxfold/`. Dataset adapters only
@@ -79,13 +79,13 @@ Always run tools through `uv run`. All four checks must pass before a change is 
 ```text
 dataset session
 → normalize + persist immutable episode (content_hash, source_sequence)
-→ memory extraction + anchor resolution (0..N memories with named anchors, or no_valuable_memory)
-→ prepare same-name anchor subjects and actual memory IDs
-→ per-memory, per-anchor subject-name recall (active/retired top 3 plus same-name subject; batch deduplication)
-→ batched Subject linking           (one agent loop per episode; up to 5 association_search calls)
-→ atomic commit                     (anchors, memberships, memories, versions, provenance, embeddings, subjects, reactivation, links, completion)
-→ Subject split / Subject review    (split first when both are due)
-→ Subject summary refresh           (durable episode targets, up to 5 concurrent rewrites)
+→ memory extraction + entity resolution (0..N memories with named entities, or no_valuable_memory)
+→ prepare same-name entity domains and actual memory IDs
+→ per-memory, per-entity domain-name recall (active/retired top 3 plus same-name domain; batch deduplication)
+→ batched Domain linking           (one agent loop per episode; up to 5 association_search calls)
+→ atomic commit                     (entities, memberships, memories, versions, provenance, embeddings, domains, reactivation, links, completion)
+→ Domain split / Domain review    (split first when both are due)
+→ Domain summary refresh           (durable episode targets, up to 5 concurrent rewrites)
 ```
 
 
@@ -94,7 +94,9 @@ dataset session
 
 - Fail fast. Catch only what you can genuinely recover from; let unexpected exceptions crash.
 - No defensive branches or fallbacks for conditions that cannot happen (including those the data
-model already prevents). Validate at boundaries (dataset input, model provider output) only.
+model already prevents).
+- When changing an LLM structured-output schema, review the validations on that output in the same
+change: add, adjust, or remove checks so they stay in sync with the new schema.
 - Experimental-version changes are not compatibility work: do not keep unused APIs, schema fields,
 config knobs, migration paths, shims, or feature flags just because an earlier draft used them.
 - When a change retires a path, delete all code that will no longer be used. Keep the tree small;
@@ -112,4 +114,3 @@ no commented-out leftovers, unused imports, or dead helpers.
 in the same change. A code change without the matching doc update is incomplete.
 - Describe only the resulting current design. Delete superseded descriptions instead of
 recording that something is no longer used; git holds the history.
-- `AGENTS.md` and `AGENTS_CH.md` must always be updated together and stay equivalent.

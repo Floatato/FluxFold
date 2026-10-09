@@ -16,46 +16,46 @@ from fluxfold.errors import ValidationError
 class FluxFoldConfig:
     """All configurable experimental Memory Engine policy values."""
 
-    subject_name_max_chars: int = 120
-    generated_subject_summary_max_chars: int = 2_000
+    domain_name_max_chars: int = 120
+    generated_domain_summary_max_chars: int = 2_000
     memory_content_max_chars: int = 1_000
     review_memory_content_max_chars: int = 800
     episode_message_max: int = 256
     episode_chars_max: int = 96_000
     message_chars_max: int = 32_000
     longmemeval_message_chars_max: int = 80_000
-    anchor_subject_candidate_top_k: int = 3
+    entity_domain_candidate_top_k: int = 3
     name_resolution_min_similarity: float = 0.8
     name_resolution_bm25_threshold: float = 2.0
     extraction_memory_warning_threshold: int = 20
     linking_candidate_warning_threshold: int = 30
-    subject_candidate_min_similarity: float = 0.0
-    association_subject_candidate_top_k: int = 8
-    subject_candidate_attached_memory_k: int = 1
+    domain_candidate_min_similarity: float = 0.0
+    association_domain_candidate_top_k: int = 8
+    domain_candidate_attached_memory_k: int = 1
     memory_candidate_top_k: int = 8
     memory_candidate_min_similarity: float = 0.0
-    memory_candidate_attached_subject_k: int = 1
+    memory_candidate_attached_domain_k: int = 1
     association_search_enabled: bool = True
     association_search_max_calls: int = 5
     memory_link_preferred_min: int = 1
     memory_link_preferred_max: int = 4
-    memory_active_subject_link_max: int = 5
-    subject_review_new_memory_threshold: int = 8
+    memory_active_domain_link_max: int = 5
+    domain_review_new_memory_threshold: int = 8
     review_provenance_memory_max: int = 8
     memory_provenance_episode_max: int = 6
-    subject_split_memory_count_threshold: int = 24
-    subject_split_total_memory_chars_threshold: int = 8_000
-    subject_split_result_subject_min: int = 2
-    subject_split_result_subject_max: int = 5
-    subject_split_result_min_memories: int = 3
-    subject_split_result_target_memory_max: int = 20
-    subject_split_memory_membership_max: int = 2
-    search_subject_top_k: int = 5
-    search_subject_min_similarity: float = 0.0
-    search_subject_attached_memory_k: int = 1
+    domain_split_memory_count_threshold: int = 24
+    domain_split_total_memory_chars_threshold: int = 8_000
+    domain_split_result_domain_min: int = 2
+    domain_split_result_domain_max: int = 5
+    domain_split_result_min_memories: int = 3
+    domain_split_result_target_memory_max: int = 20
+    domain_split_memory_membership_max: int = 2
+    search_domain_top_k: int = 5
+    search_domain_min_similarity: float = 0.0
+    search_domain_attached_memory_k: int = 1
     search_memory_top_k: int = 15
     search_memory_min_similarity: float = 0.0
-    search_memory_attached_subject_k: int = 1
+    search_memory_attached_domain_k: int = 1
     extraction_temperature: float = 0.1
     linking_temperature: float = 0.0
     review_temperature: float = 0.1
@@ -68,8 +68,8 @@ class FluxFoldConfig:
     provider_pool_timeout_seconds: float = 30.0
     embedding_batch_size: int = 100
     embedding_batch_concurrency_per_operation: int = 4
-    subject_summary_refresh_llm_link_threshold: int = 2
-    subject_summary_refresh_concurrency_per_episode: int = 5
+    domain_summary_refresh_llm_link_threshold: int = 2
+    domain_summary_refresh_concurrency_per_episode: int = 5
     exact_scan_batch_rows: int = 8_192
     sqlite_busy_timeout_ms: int = 5_000
     sqlite_transaction_max_retries: int = 5
@@ -108,7 +108,7 @@ class FluxFoldConfig:
         positive_names.update(
             {
                 "embedding_batch_concurrency_per_operation",
-                "subject_summary_refresh_concurrency_per_episode",
+                "domain_summary_refresh_concurrency_per_episode",
                 "benchmark_memory_space_build_concurrency",
             }
         )
@@ -118,9 +118,9 @@ class FluxFoldConfig:
                 raise ValidationError(f"configuration value must be positive: {name}")
         for name in (
             "name_resolution_min_similarity",
-            "subject_candidate_min_similarity",
+            "domain_candidate_min_similarity",
             "memory_candidate_min_similarity",
-            "search_subject_min_similarity",
+            "search_domain_min_similarity",
             "search_memory_min_similarity",
         ):
             value = getattr(self, name)
@@ -130,11 +130,11 @@ class FluxFoldConfig:
             raise ValidationError(
                 "association_search_max_calls must be between zero and five"
             )
-        if self.memory_link_preferred_max > self.memory_active_subject_link_max:
+        if self.memory_link_preferred_max > self.memory_active_domain_link_max:
             raise ValidationError("preferred link maximum exceeds the hard maximum")
         if (
-            self.subject_split_result_min_memories
-            > self.subject_split_result_target_memory_max
+            self.domain_split_result_min_memories
+            > self.domain_split_result_target_memory_max
         ):
             raise ValidationError(
                 "split result minimum exceeds the target memory maximum"

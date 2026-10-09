@@ -30,6 +30,7 @@ from fluxfold.models import (
     AddResult,
     AssociationSearchOutput,
     DeferSplitOutput,
+    DomainSnapshot,
     EmbeddingRebuildResult,
     ExtractionOutput,
     FullSplitOutput,
@@ -48,7 +49,6 @@ from fluxfold.models import (
     ReviewStageOutput,
     SearchResult,
     SplitStageOutput,
-    SubjectSnapshot,
     SummaryRefreshOutput,
 )
 from fluxfold.names import NameEntry, bm25_scores, normalized_name
@@ -74,13 +74,13 @@ from fluxfold.providers import (
     LocalMiniLMEmbeddingProvider,
 )
 from fluxfold.storage import (
-    ExistingSubjectTouch,
+    ExistingDomainTouch,
     PersistedEpisode,
+    PreparedDomain,
     PreparedLink,
     PreparedMemory,
     PreparedMemoryUpdate,
-    PreparedSplitSubject,
-    PreparedSubject,
+    PreparedSplitDomain,
     Store,
 )
 
@@ -124,7 +124,7 @@ class _PreparedAdd:
     memory_ids: tuple[str, ...]
     memory_vectors: tuple[Any, ...]
     prepared_memories: tuple[PreparedMemory, ...]
-    anchors: tuple[NameEntry, ...] = ()
+    entities: tuple[NameEntry, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,27 +272,27 @@ class FluxFold:
             sample_kind="extract",
         )
         extraction = cast(ExtractionOutput, extraction)
-        anchors: tuple[NameEntry, ...] = ()
+        entities: tuple[NameEntry, ...] = ()
         if isinstance(extraction, MemoriesExtraction):
             proposed = list(
                 dict.fromkeys(
-                    name for memory in extraction.memories for name in memory.anchors
+                    name for memory in extraction.memories for name in memory.entities
                 )
             )
             mapping, entries = await self._resolve_names(
                 memory_space_id,
                 proposed,
-                self._store.anchor_names(memory_space_id),
+                self._store.entity_names(memory_space_id),
                 "memory_extraction",
                 EXTRACTION_SYSTEM,
                 extraction_input(episode),
                 extraction.model_dump(),
             )
             for memory in extraction.memories:
-                memory.anchors = list(
-                    dict.fromkeys(mapping[name] for name in memory.anchors)
+                memory.entities = list(
+                    dict.fromkeys(mapping[name] for name in memory.entities)
                 )
-            anchors = tuple(
+            entities = tuple(
                 entries[normalized_name(name)]
                 for name in dict.fromkeys(mapping.values())
             )
@@ -342,7 +342,7 @@ class FluxFold:
             memory_ids,
             memory_vectors,
             prepared_memories,
-            anchors,
+            entities,
         )
 
     async def _commit_prepared_add(self, prepared: _PreparedAdd) -> AddResult:
@@ -350,13 +350,13 @@ class FluxFold:
         episode = prepared.episode
         current = self._store.persist_episode(memory_space_id, episode)
         if current.extraction_completed:
-            replay_subject_ids = self._store.operation_active_subject_ids(
+            replay_domain_ids = self._store.operation_active_domain_ids(
                 memory_space_id, current.completed_operation_id
             )
             maintenance = await self._complete_maintenance(
                 memory_space_id,
                 cast(str, current.completed_operation_id),
-                replay_subject_ids,
+                replay_domain_ids,
                 prepared.signature_id,
                 prepared.actor,
             )
@@ -377,8 +377,8 @@ class FluxFold:
         memory_ids = prepared.memory_ids
         memory_vectors = prepared.memory_vectors
         prepared_memories = prepared.prepared_memories
-        prepared_subjects, anchor_subjects = self._prepare_anchor_subjects(
-            memory_space_id, prepared.anchors
+        prepared_domains, entity_domains = self._prepare_entity_domains(
+            memory_space_id, prepared.entities
         )
         if contents:
             linking, linking_metrics = await self._link_memories(
@@ -387,7 +387,7 @@ class FluxFold:
                 contents,
                 memory_vectors,
                 [
-                    memory.anchors
+                    memory.entities
                     for memory in cast(MemoriesExtraction, prepared.extraction).memories
                 ],
             )
@@ -395,14 +395,14 @@ class FluxFold:
             linking = LinkingOutput(memories=[])
             linking_metrics = _LinkingMetrics(0, False, 0)
         self._event(
-            "subject_linking_completed",
+            "domain_linking_completed",
             memory_space_id=memory_space_id,
             episode_id=current.episode_id,
-            new_subjects=len(prepared_subjects),
+            new_domains=len(prepared_domains),
             links=sum(
                 len(
-                    {item.subject for item in memory.direct_assignments}
-                    | set(memory.contextual_subjects)
+                    {item.domain for item in memory.direct_assignments}
+                    | set(memory.contextual_domains)
                 )
                 for memory in linking.memories
             ),
@@ -412,35 +412,35 @@ class FluxFold:
                 linking_metrics.association_additional_candidate_memory_count
             ),
         )
-        prepared_links, subject_touches, affected_subject_ids = (
-            self._prepare_link_commit(memory_space_id, linking, prepared_subjects)
+        prepared_links, domain_touches, affected_domain_ids = self._prepare_link_commit(
+            memory_space_id, linking, prepared_domains
         )
-        known_anchor_ids = {
-            entry.object_id for entry in self._store.anchor_names(memory_space_id)
+        known_entity_ids = {
+            entry.object_id for entry in self._store.entity_names(memory_space_id)
         }
-        anchor_by_name = {entry.name: entry.object_id for entry in prepared.anchors}
+        entity_by_name = {entry.name: entry.object_id for entry in prepared.entities}
         operation_id = self._store.commit_add(
             memory_space_id=memory_space_id,
             episode_id=current.episode_id,
             input_hash=episode.content_hash,
             memories=prepared_memories,
-            subjects=prepared_subjects,
+            domains=prepared_domains,
             links=prepared_links,
-            subject_touches=subject_touches,
-            anchors=[
+            domain_touches=domain_touches,
+            entities=[
                 entry
-                for entry in prepared.anchors
-                if entry.object_id not in known_anchor_ids
+                for entry in prepared.entities
+                if entry.object_id not in known_entity_ids
             ],
-            anchor_subjects=anchor_subjects,
-            memory_anchors=[
-                (memory_id, anchor_by_name[name])
+            entity_domains=entity_domains,
+            memory_entities=[
+                (memory_id, entity_by_name[name])
                 for memory_id, memory in zip(
                     memory_ids,
                     cast(MemoriesExtraction, prepared.extraction).memories,
                     strict=True,
                 )
-                for name in memory.anchors
+                for name in memory.entities
             ]
             if contents
             else [],
@@ -454,13 +454,13 @@ class FluxFold:
             episode_id=current.episode_id,
             operation_id=operation_id,
             memories_created=len(prepared_memories),
-            subjects_created=len(prepared_subjects),
+            domains_created=len(prepared_domains),
             links_created=len(prepared_links),
         )
         maintenance = await self._complete_maintenance(
             memory_space_id,
             operation_id,
-            sorted(affected_subject_ids),
+            sorted(affected_domain_ids),
             prepared.signature_id,
             prepared.actor,
         )
@@ -469,7 +469,7 @@ class FluxFold:
             operation_id,
             current.replayed,
             len(prepared_memories),
-            len(prepared_subjects),
+            len(prepared_domains),
             len(prepared_links),
             tuple(maintenance),
         )
@@ -511,7 +511,7 @@ class FluxFold:
             raise failure
 
     async def search(self, memory_space_id: str, query: str) -> SearchResult:
-        """Search active subjects and memories using only exact vector retrieval."""
+        """Search active domains and memories using only exact vector retrieval."""
 
         if not isinstance(query, str):
             raise ValidationError("query must be a string")
@@ -534,49 +534,49 @@ class FluxFold:
         signature_id = self._store.prepare_retrieval_signature(
             self._embedding.model_info
         )
-        memory_sources, subject_sources = self._store.retrieval_embedding_sources(
+        memory_sources, domain_sources = self._store.retrieval_embedding_sources(
             memory_space_id
         )
-        anchor_sources = self._store.anchor_names(memory_space_id)
-        anchor_vectors = await self._embed_documents(
-            [entry.name for entry in anchor_sources]
+        entity_sources = self._store.entity_names(memory_space_id)
+        entity_vectors = await self._embed_documents(
+            [entry.name for entry in entity_sources]
         )
         vectors = await self._embed_documents(
             [source.content for source in memory_sources]
-            + [source.name for source in subject_sources]
+            + [source.name for source in domain_sources]
             + [
                 _name_summary(source.name, source.summary)
-                for source in subject_sources
+                for source in domain_sources
                 if source.summary is not None
             ]
         )
         memory_vectors = vectors[: len(memory_sources)]
-        subject_vectors = iter(vectors[len(memory_sources) :])
-        name_vectors = [next(subject_vectors) for _ in subject_sources]
-        summary_vectors = iter(subject_vectors)
-        prepared_subjects = [
+        domain_vectors = iter(vectors[len(memory_sources) :])
+        name_vectors = [next(domain_vectors) for _ in domain_sources]
+        summary_vectors = iter(domain_vectors)
+        prepared_domains = [
             (
                 source,
                 name_vector,
                 next(summary_vectors) if source.summary is not None else None,
             )
-            for source, name_vector in zip(subject_sources, name_vectors, strict=True)
+            for source, name_vector in zip(domain_sources, name_vectors, strict=True)
         ]
         self._store.commit_retrieval_embedding_switch(
             memory_space_id=memory_space_id,
             signature_id=signature_id,
             memories=tuple(zip(memory_sources, memory_vectors, strict=True)),
-            subjects=prepared_subjects,
-            anchors=[
+            domains=prepared_domains,
+            entities=[
                 replace(entry, vector=vector)
-                for entry, vector in zip(anchor_sources, anchor_vectors, strict=True)
+                for entry, vector in zip(entity_sources, entity_vectors, strict=True)
             ],
         )
         return EmbeddingRebuildResult(
             memory_space_id,
             signature_id,
             len(memory_sources),
-            len(subject_sources),
+            len(domain_sources),
         )
 
     def space_statistics(self, memory_space_id: str) -> dict[str, Any]:
@@ -585,7 +585,7 @@ class FluxFold:
         return self._store.space_statistics(memory_space_id)
 
     def memory_bank(self) -> tuple[MemoryBankSpace, ...]:
-        """Return active subjects and memories of every space for inspect logs."""
+        """Return active domains and memories of every space for inspect logs."""
 
         return self._store.memory_bank()
 
@@ -655,7 +655,7 @@ class FluxFold:
                     {
                         "original_input": json.loads(original_input),
                         "previous_output": original_output,
-                        "name_resolution": {"kind": "anchor", "items": feedback},
+                        "name_resolution": {"kind": "entity", "items": feedback},
                     },
                     ensure_ascii=False,
                 ),
@@ -685,7 +685,7 @@ class FluxFold:
                     severity="warning",
                     memory_space_id=memory_space_id,
                     stage=stage,
-                    object_kind="anchor",
+                    object_kind="entity",
                     proposed_name=name,
                     canonical_name=target,
                 )
@@ -697,25 +697,23 @@ class FluxFold:
         memory_ids: Sequence[str],
         contents: Sequence[str],
         vectors: Sequence[Any],
-        memory_anchors: Sequence[list[str]],
+        memory_entities: Sequence[list[str]],
     ) -> tuple[LinkingOutput, _LinkingMetrics]:
-        candidates, legal_subject_ids = self._recall_initial_subject_candidates(
-            memory_space_id, vectors, memory_anchors
+        candidates, legal_domain_ids = self._recall_initial_domain_candidates(
+            memory_space_id, vectors, memory_entities
         )
-        legal_by_memory = {
-            memory_id: set(legal_subject_ids) for memory_id in memory_ids
-        }
+        legal_by_memory = {memory_id: set(legal_domain_ids) for memory_id in memory_ids}
         new_memories = [
             {
                 "memory_id": memory_id,
                 "content": content,
-                "anchors": anchors,
+                "entities": entities,
                 "link_limit": max(
-                    self.config.memory_active_subject_link_max, len(anchors)
+                    self.config.memory_active_domain_link_max, len(entities)
                 ),
             }
-            for memory_id, content, anchors in zip(
-                memory_ids, contents, memory_anchors, strict=True
+            for memory_id, content, entities in zip(
+                memory_ids, contents, memory_entities, strict=True
             )
         ]
         association_results: list[dict[str, Any]] = []
@@ -742,12 +740,12 @@ class FluxFold:
                         )
                     return
                 self._validate_linking(
-                    value, memory_ids, legal_by_memory, memory_anchors, memory_space_id
+                    value, memory_ids, legal_by_memory, memory_entities, memory_space_id
                 )
 
             try:
                 output, turn = await self._structured_output(
-                    stage="subject_linking",
+                    stage="domain_linking",
                     system_prompt=LINKING_SYSTEM,
                     user_prompt=linking_input(
                         new_memories,
@@ -787,8 +785,8 @@ class FluxFold:
                 )
             )
             association_memory_ids.update(_candidate_memory_ids(association_candidates))
-            for memory_id, subject_ids in association_legal.items():
-                legal_by_memory[memory_id].update(subject_ids)
+            for memory_id, domain_ids in association_legal.items():
+                legal_by_memory[memory_id].update(domain_ids)
             association_results.append(
                 {
                     "query": output.query,
@@ -796,42 +794,40 @@ class FluxFold:
                 }
             )
 
-    def _recall_initial_subject_candidates(
+    def _recall_initial_domain_candidates(
         self,
         memory_space_id: str,
         vectors: Sequence[Any],
-        memory_anchors: Sequence[list[str]],
+        memory_entities: Sequence[list[str]],
     ) -> tuple[list[dict[str, Any]], set[str]]:
-        catalog = self._store.subject_names(memory_space_id)
-        memberships = self._store.subject_anchor_names(memory_space_id)
+        catalog = self._store.domain_names(memory_space_id)
+        memberships = self._store.domain_entity_names(memory_space_id)
         pool: dict[str, dict[str, Any]] = {}
-        for vector, anchors in zip(vectors, memory_anchors, strict=True):
-            for anchor in anchors:
+        for vector, entities in zip(vectors, memory_entities, strict=True):
+            for entity in entities:
                 ranked = sorted(
                     (
                         (entry, float(entry.vector @ vector))
                         for entry in catalog
-                        if anchor in memberships.get(entry.object_id, set())
-                        and normalized_name(entry.name) != normalized_name(anchor)
+                        if entity in memberships.get(entry.object_id, set())
+                        and normalized_name(entry.name) != normalized_name(entity)
                     ),
                     key=lambda item: (-item[1], normalized_name(item[0].name)),
                 )
-                for entry, score in ranked[
-                    : self.config.anchor_subject_candidate_top_k
-                ]:
-                    if score >= self.config.subject_candidate_min_similarity:
+                for entry, score in ranked[: self.config.entity_domain_candidate_top_k]:
+                    if score >= self.config.domain_candidate_min_similarity:
                         pool[entry.name] = {
                             "name": entry.name,
-                            "anchors": sorted(memberships[entry.object_id]),
+                            "entities": sorted(memberships[entry.object_id]),
                         }
         by_name = {normalized_name(entry.name): entry for entry in catalog}
-        for anchor in dict.fromkeys(
-            name for anchors in memory_anchors for name in anchors
+        for entity in dict.fromkeys(
+            name for entities in memory_entities for name in entities
         ):
-            root = by_name.get(normalized_name(anchor))
-            name = root.name if root is not None else anchor
-            linked_anchors = memberships.get(root.object_id, set()) if root else set()
-            pool[name] = {"name": name, "anchors": sorted(linked_anchors | {anchor})}
+            root = by_name.get(normalized_name(entity))
+            name = root.name if root is not None else entity
+            linked_entities = memberships.get(root.object_id, set()) if root else set()
+            pool[name] = {"name": name, "entities": sorted(linked_entities | {entity})}
         if len(pool) > self.config.linking_candidate_warning_threshold:
             self._event(
                 "linking_candidate_count_warning",
@@ -847,15 +843,15 @@ class FluxFold:
         memory_ids: Sequence[str],
         vectors: Sequence[Any],
     ) -> tuple[dict[str, dict[str, object]], dict[str, set[str]]]:
-        memberships = self._store.subject_anchor_names(memory_space_id)
+        memberships = self._store.domain_entity_names(memory_space_id)
         candidates: dict[str, dict[str, object]] = {}
         legal: dict[str, set[str]] = {}
         for memory_id, vector in zip(memory_ids, vectors, strict=True):
-            subjects = self._store.candidate_subjects(
+            domains = self._store.candidate_domains(
                 memory_space_id,
                 vector,
-                top_k=self.config.association_subject_candidate_top_k,
-                min_similarity=self.config.subject_candidate_min_similarity,
+                top_k=self.config.association_domain_candidate_top_k,
+                min_similarity=self.config.domain_candidate_min_similarity,
             )
             memories = self._store.candidate_memories(
                 memory_space_id,
@@ -864,21 +860,21 @@ class FluxFold:
                 min_similarity=self.config.memory_candidate_min_similarity,
             )
             groups: dict[str, dict[str, object]] = {}
-            for subject in subjects:
+            for domain in domains:
                 group: dict[str, object] = {
-                    "name": subject.name,
-                    "subject_similarity": subject.similarity,
+                    "name": domain.name,
+                    "domain_similarity": domain.similarity,
                     "memory_hits": [],
                 }
-                if subject.attached_memory_id is not None:
+                if domain.attached_memory_id is not None:
                     cast(list[dict[str, object]], group["memory_hits"]).append(
                         {
-                            "memory_id": subject.attached_memory_id,
-                            "content": subject.attached_memory_content,
-                            "source": "subject_channel_attachment",
+                            "memory_id": domain.attached_memory_id,
+                            "content": domain.attached_memory_content,
+                            "source": "domain_channel_attachment",
                         }
                     )
-                groups[subject.subject_id] = group
+                groups[domain.domain_id] = group
             unattached_memories: list[dict[str, object]] = []
             for memory in memories:
                 memory_value: dict[str, object] = {
@@ -887,24 +883,24 @@ class FluxFold:
                     "similarity": memory.similarity,
                     "source": "memory_channel",
                 }
-                subject_id = memory.attached_subject_id
-                if subject_id is None:
+                domain_id = memory.attached_domain_id
+                if domain_id is None:
                     unattached_memories.append(memory_value)
                     continue
-                if subject_id not in groups:
-                    groups[subject_id] = {
-                        "name": memory.attached_subject_name,
-                        "subject_similarity": None,
+                if domain_id not in groups:
+                    groups[domain_id] = {
+                        "name": memory.attached_domain_name,
+                        "domain_similarity": None,
                         "memory_hits": [],
                     }
-                hits = cast(list[dict[str, object]], groups[subject_id]["memory_hits"])
+                hits = cast(list[dict[str, object]], groups[domain_id]["memory_hits"])
                 if not any(hit["memory_id"] == memory.memory_id for hit in hits):
                     hits.append(memory_value)
-            for subject_id, group in groups.items():
-                group["anchors"] = sorted(memberships[subject_id])
+            for domain_id, group in groups.items():
+                group["entities"] = sorted(memberships[domain_id])
             legal_ids = {str(group["name"]) for group in groups.values()}
             candidates[memory_id] = {
-                "subjects": list(groups.values()),
+                "domains": list(groups.values()),
                 "unattached_memories": unattached_memories,
             }
             legal[memory_id] = legal_ids
@@ -915,94 +911,94 @@ class FluxFold:
         output: LinkingOutput,
         memory_ids: Sequence[str],
         legal_by_memory: dict[str, set[str]],
-        memory_anchors: Sequence[list[str]],
+        memory_entities: Sequence[list[str]],
         memory_space_id: str,
     ) -> None:
-        expected = dict(zip(memory_ids, memory_anchors, strict=True))
+        expected = dict(zip(memory_ids, memory_entities, strict=True))
         if len(output.memories) != len(expected) or {
             item.memory_id for item in output.memories
         } != set(expected):
             raise ValidationError("return each supplied memory_id exactly once")
-        memberships_by_id = self._store.subject_anchor_names(memory_space_id)
+        memberships_by_id = self._store.domain_entity_names(memory_space_id)
         memberships = {
             entry.name: memberships_by_id.get(entry.object_id, set())
-            for entry in self._store.subject_names(memory_space_id)
+            for entry in self._store.domain_names(memory_space_id)
         }
         known_names = {normalized_name(name): name for name in memberships}
-        for anchor in {name for anchors in memory_anchors for name in anchors}:
-            name = known_names.get(normalized_name(anchor), anchor)
-            memberships.setdefault(name, set()).add(anchor)
+        for entity in {name for entities in memory_entities for name in entities}:
+            name = known_names.get(normalized_name(entity), entity)
+            memberships.setdefault(name, set()).add(entity)
         for memory in output.memories:
-            anchors = expected[memory.memory_id]
-            assigned = [item.anchor for item in memory.direct_assignments]
-            if len(assigned) != len(anchors) or set(assigned) != set(anchors):
+            entities = expected[memory.memory_id]
+            assigned = [item.entity for item in memory.direct_assignments]
+            if len(assigned) != len(entities) or set(assigned) != set(entities):
                 raise ValidationError(
-                    f"{memory.memory_id} needs exactly one direct assignment per supplied anchor"
+                    f"{memory.memory_id} needs exactly one direct assignment per supplied entity"
                 )
-            names = {item.subject for item in memory.direct_assignments} | set(
-                memory.contextual_subjects
+            names = {item.domain for item in memory.direct_assignments} | set(
+                memory.contextual_domains
             )
             if not names <= legal_by_memory[memory.memory_id]:
                 raise ValidationError(
-                    f"subject was not a candidate for {memory.memory_id}"
+                    f"domain was not a candidate for {memory.memory_id}"
                 )
             for item in memory.direct_assignments:
-                if item.anchor not in memberships[item.subject]:
+                if item.entity not in memberships[item.domain]:
                     raise ValidationError(
-                        f"subject {item.subject} does not belong to anchor {item.anchor}"
+                        f"domain {item.domain} does not belong to entity {item.entity}"
                     )
             if len(names) > max(
-                self.config.memory_active_subject_link_max, len(anchors)
+                self.config.memory_active_domain_link_max, len(entities)
             ):
                 raise ValidationError(f"{memory.memory_id} exceeds its link_limit")
 
-    def _prepare_anchor_subjects(
+    def _prepare_entity_domains(
         self,
         memory_space_id: str,
-        anchors: Sequence[NameEntry],
-    ) -> tuple[list[PreparedSubject], list[tuple[str, str]]]:
+        entities: Sequence[NameEntry],
+    ) -> tuple[list[PreparedDomain], list[tuple[str, str]]]:
         entries = {
             normalized_name(entry.name): entry
-            for entry in self._store.subject_names(memory_space_id)
+            for entry in self._store.domain_names(memory_space_id)
         }
-        subjects = []
+        domains = []
         relations = []
-        for anchor in anchors:
-            key = normalized_name(anchor.name)
+        for entity in entities:
+            key = normalized_name(entity.name)
             if key not in entries:
-                entry = NameEntry(str(uuid4()), anchor.name, anchor.vector)
+                entry = NameEntry(str(uuid4()), entity.name, entity.vector)
                 entries[key] = entry
-                subjects.append(
-                    PreparedSubject(
+                domains.append(
+                    PreparedDomain(
                         entry.object_id, entry.name, None, entry.vector, None
                     )
                 )
-            relations.append((anchor.object_id, entries[key].object_id))
-        return subjects, sorted(relations)
+            relations.append((entity.object_id, entries[key].object_id))
+        return domains, sorted(relations)
 
     def _prepare_link_commit(
         self,
         memory_space_id: str,
         linking: LinkingOutput,
-        subjects: Sequence[PreparedSubject],
-    ) -> tuple[list[PreparedLink], list[ExistingSubjectTouch], set[str]]:
+        domains: Sequence[PreparedDomain],
+    ) -> tuple[list[PreparedLink], list[ExistingDomainTouch], set[str]]:
         known = {
             normalized_name(entry.name): entry
-            for entry in self._store.subject_names(memory_space_id)
+            for entry in self._store.domain_names(memory_space_id)
         }
         entries = dict(known)
         entries.update(
             {
-                normalized_name(subject.name): NameEntry(
-                    subject.subject_id, subject.name, subject.name_embedding
+                normalized_name(domain.name): NameEntry(
+                    domain.domain_id, domain.name, domain.name_embedding
                 )
-                for subject in subjects
+                for domain in domains
             }
         )
         links = []
         for memory in linking.memories:
-            direct = {item.subject for item in memory.direct_assignments}
-            for name in sorted(direct | set(memory.contextual_subjects)):
+            direct = {item.domain for item in memory.direct_assignments}
+            for name in sorted(direct | set(memory.contextual_domains)):
                 links.append(
                     PreparedLink(
                         memory.memory_id,
@@ -1012,20 +1008,20 @@ class FluxFold:
                 )
         known_ids = {entry.object_id for entry in known.values()}
         counts = Counter(
-            link.subject_id for link in links if link.subject_id in known_ids
+            link.domain_id for link in links if link.domain_id in known_ids
         )
         touches = [
-            ExistingSubjectTouch(
-                subject_id,
-                self._store.subject_snapshot(
-                    memory_space_id, subject_id
+            ExistingDomainTouch(
+                domain_id,
+                self._store.domain_snapshot(
+                    memory_space_id, domain_id
                 ).summary_revision,
                 count,
             )
-            for subject_id, count in counts.items()
+            for domain_id, count in counts.items()
         ]
-        affected = {link.subject_id for link in links} | {
-            subject.subject_id for subject in subjects
+        affected = {link.domain_id for link in links} | {
+            domain.domain_id for domain in domains
         }
         return links, touches, affected
 
@@ -1033,54 +1029,54 @@ class FluxFold:
         self,
         memory_space_id: str,
         add_operation_id: str,
-        affected_subject_ids: Sequence[str],
+        affected_domain_ids: Sequence[str],
         signature_id: str,
         actor: str,
     ) -> list[MaintenanceResult]:
         outcomes: list[MaintenanceResult] = []
-        for subject_id in affected_subject_ids:
+        for domain_id in affected_domain_ids:
             try:
-                subject_outcomes = await self._maintain_subject(
+                domain_outcomes = await self._maintain_domain(
                     memory_space_id,
                     add_operation_id,
-                    subject_id,
+                    domain_id,
                     signature_id,
                     actor,
                 )
-                outcomes.extend(subject_outcomes)
+                outcomes.extend(domain_outcomes)
             except StageFailure as error:
-                self._handle_maintenance_failure(memory_space_id, subject_id, error)
+                self._handle_maintenance_failure(memory_space_id, domain_id, error)
             except ProviderError as error:
                 self._handle_maintenance_failure(
                     memory_space_id,
-                    subject_id,
+                    domain_id,
                     StageFailure(
                         "maintenance_embedding", error.error_class, error.message
                     ),
                 )
 
-        refresh_subject_ids = self._store.pending_summary_refresh_subject_ids(
+        refresh_domain_ids = self._store.pending_summary_refresh_domain_ids(
             memory_space_id, add_operation_id
         )
         semaphore = asyncio.Semaphore(
-            self.config.subject_summary_refresh_concurrency_per_episode
+            self.config.domain_summary_refresh_concurrency_per_episode
         )
 
         async def refresh_one(
-            subject_id: str,
+            domain_id: str,
         ) -> MaintenanceResult | StageFailure:
             async with semaphore:
                 try:
-                    return await self._refresh_subject_summary(
+                    return await self._refresh_domain_summary(
                         memory_space_id,
                         add_operation_id,
-                        subject_id,
+                        domain_id,
                         signature_id,
                         actor,
                     )
                 except StageFailure as error:
                     self._record_summary_refresh_failure(
-                        memory_space_id, subject_id, error
+                        memory_space_id, domain_id, error
                     )
                     return error
                 except ProviderError as error:
@@ -1088,12 +1084,12 @@ class FluxFold:
                         "maintenance_embedding", error.error_class, error.message
                     )
                     self._record_summary_refresh_failure(
-                        memory_space_id, subject_id, failure
+                        memory_space_id, domain_id, failure
                     )
                     return failure
 
         refresh_results = await asyncio.gather(
-            *(refresh_one(subject_id) for subject_id in refresh_subject_ids)
+            *(refresh_one(domain_id) for domain_id in refresh_domain_ids)
         )
         failures: list[StageFailure] = []
         for result in refresh_results:
@@ -1106,19 +1102,19 @@ class FluxFold:
         return outcomes
 
     def _record_summary_refresh_failure(
-        self, memory_space_id: str, subject_id: str, error: StageFailure
+        self, memory_space_id: str, domain_id: str, error: StageFailure
     ) -> None:
         self._event(
-            "subject_summary_refresh_failed",
+            "domain_summary_refresh_failed",
             severity="error",
             memory_space_id=memory_space_id,
-            subject_id=subject_id,
+            domain_id=domain_id,
             error_class=error.error_class.value,
             reason=error.message,
         )
 
     def _handle_maintenance_failure(
-        self, memory_space_id: str, subject_id: str, error: StageFailure
+        self, memory_space_id: str, domain_id: str, error: StageFailure
     ) -> None:
         if error.error_class not in {
             ErrorClass.CONTEXT_OVERFLOW,
@@ -1131,34 +1127,34 @@ class FluxFold:
             "maintenance_terminal_failure",
             severity="error",
             memory_space_id=memory_space_id,
-            subject_id=subject_id,
+            domain_id=domain_id,
             error_class=error.error_class.value,
             reason=error.message,
         )
 
-    async def _refresh_subject_summary(
+    async def _refresh_domain_summary(
         self,
         memory_space_id: str,
         add_operation_id: str,
-        subject_id: str,
+        domain_id: str,
         signature_id: str,
         actor: str,
     ) -> MaintenanceResult:
-        snapshot = self._store.subject_snapshot(memory_space_id, subject_id)
+        snapshot = self._store.domain_snapshot(memory_space_id, domain_id)
         self._event(
-            "subject_summary_refresh_started",
+            "domain_summary_refresh_started",
             memory_space_id=memory_space_id,
-            subject_id=subject_id,
+            domain_id=domain_id,
             memory_count=len(snapshot.memories),
         )
         if (
             len(snapshot.memories)
-            <= self.config.subject_summary_refresh_llm_link_threshold
+            <= self.config.domain_summary_refresh_llm_link_threshold
         ):
             summary = " "
         else:
             output, _ = await self._structured_output(
-                stage="subject_summary_refresh",
+                stage="domain_summary_refresh",
                 system_prompt=SUMMARY_REFRESH_SYSTEM,
                 user_prompt=summary_refresh_input(snapshot),
                 adapter=TypeAdapter(SummaryRefreshOutput),
@@ -1182,37 +1178,37 @@ class FluxFold:
             config_signature=self.config.signature,
         )
         self._event(
-            "subject_summary_refresh_completed",
+            "domain_summary_refresh_completed",
             memory_space_id=memory_space_id,
-            subject_id=subject_id,
+            domain_id=domain_id,
             operation_id=operation_id,
         )
-        return MaintenanceResult(subject_id, "summary_refresh", operation_id)
+        return MaintenanceResult(domain_id, "summary_refresh", operation_id)
 
-    async def _maintain_subject(
+    async def _maintain_domain(
         self,
         memory_space_id: str,
         add_operation_id: str,
-        subject_id: str,
+        domain_id: str,
         signature_id: str,
         actor: str,
     ) -> list[MaintenanceResult]:
-        snapshot = self._store.subject_snapshot(memory_space_id, subject_id)
+        snapshot = self._store.domain_snapshot(memory_space_id, domain_id)
         memory_chars = sum(len(memory.content) for memory in snapshot.memories)
         split_due = (
-            len(snapshot.memories) >= self.config.subject_split_memory_count_threshold
-            or memory_chars >= self.config.subject_split_total_memory_chars_threshold
+            len(snapshot.memories) >= self.config.domain_split_memory_count_threshold
+            or memory_chars >= self.config.domain_split_total_memory_chars_threshold
         )
         outcomes: list[MaintenanceResult] = []
         if split_due:
             self._event(
-                "subject_split_started",
+                "domain_split_started",
                 memory_space_id=memory_space_id,
-                subject_id=subject_id,
+                domain_id=domain_id,
                 memory_count=len(snapshot.memories),
                 memory_chars=memory_chars,
             )
-            split = await self._split_subject(
+            split = await self._split_domain(
                 memory_space_id,
                 add_operation_id,
                 snapshot,
@@ -1221,45 +1217,45 @@ class FluxFold:
             )
             outcomes.append(split)
             self._event(
-                "subject_split_completed",
+                "domain_split_completed",
                 memory_space_id=memory_space_id,
-                subject_id=subject_id,
+                domain_id=domain_id,
                 operation_id=split.operation_id,
                 result=split.operation,
                 reason=split.reason,
             )
             if split.operation != "defer_split":
                 return outcomes
-            snapshot = self._store.subject_snapshot(memory_space_id, subject_id)
-        if snapshot.new_memory_count >= self.config.subject_review_new_memory_threshold:
+            snapshot = self._store.domain_snapshot(memory_space_id, domain_id)
+        if snapshot.new_memory_count >= self.config.domain_review_new_memory_threshold:
             self._event(
-                "subject_review_started",
+                "domain_review_started",
                 memory_space_id=memory_space_id,
-                subject_id=subject_id,
+                domain_id=domain_id,
                 memory_count=len(snapshot.memories),
             )
-            operation_id, provenance_viewed = await self._review_subject(
+            operation_id, provenance_viewed = await self._review_domain(
                 memory_space_id,
                 add_operation_id,
                 snapshot,
                 signature_id,
                 actor,
             )
-            outcomes.append(MaintenanceResult(subject_id, "review", operation_id))
+            outcomes.append(MaintenanceResult(domain_id, "review", operation_id))
             self._event(
-                "subject_review_completed",
+                "domain_review_completed",
                 memory_space_id=memory_space_id,
-                subject_id=subject_id,
+                domain_id=domain_id,
                 operation_id=operation_id,
                 provenance_viewed=provenance_viewed,
             )
         return outcomes
 
-    async def _review_subject(
+    async def _review_domain(
         self,
         memory_space_id: str,
         add_operation_id: str,
-        snapshot: SubjectSnapshot,
+        snapshot: DomainSnapshot,
         signature_id: str,
         actor: str,
     ) -> tuple[str, bool]:
@@ -1284,7 +1280,7 @@ class FluxFold:
             self._validate_review(memory_space_id, value, snapshot)
 
         first, _ = await self._structured_output(
-            stage="subject_review",
+            stage="domain_review",
             system_prompt=REVIEW_SYSTEM,
             user_prompt=review_input(snapshot),
             adapter=TypeAdapter(ReviewStageOutput),
@@ -1305,7 +1301,7 @@ class FluxFold:
                 self._validate_review(memory_space_id, value, snapshot)
 
             final, _ = await self._structured_output(
-                stage="subject_review",
+                stage="domain_review",
                 system_prompt=REVIEW_SYSTEM,
                 user_prompt=review_input(snapshot, provenance),
                 adapter=TypeAdapter(ReviewStageOutput),
@@ -1344,7 +1340,7 @@ class FluxFold:
         operation_id = self._store.commit_review(
             add_operation_id=add_operation_id,
             memory_space_id=memory_space_id,
-            subject_id=snapshot.subject_id,
+            domain_id=snapshot.domain_id,
             expected_revision=snapshot.summary_revision,
             updates=updates,
             retirements=review.retirements,
@@ -1358,7 +1354,7 @@ class FluxFold:
         self,
         memory_space_id: str,
         review: ReviewOutput,
-        snapshot: SubjectSnapshot,
+        snapshot: DomainSnapshot,
     ) -> None:
         current = {memory.memory_id: memory for memory in snapshot.memories}
         update_ids = [update.memory_id for update in review.updates]
@@ -1367,7 +1363,7 @@ class FluxFold:
         if len(review.retirements) != len(set(review.retirements)):
             raise ValidationError("review contains duplicate retirements")
         if not set(update_ids) | set(review.retirements) <= set(current):
-            raise ValidationError("review references a memory outside the subject")
+            raise ValidationError("review references a memory outside the domain")
         if set(update_ids) & set(review.retirements):
             raise ValidationError("review cannot update and retire the same memory")
         for update in review.updates:
@@ -1405,11 +1401,11 @@ class FluxFold:
                         "replacement provenance contains an invalid episode"
                     )
 
-    async def _split_subject(
+    async def _split_domain(
         self,
         memory_space_id: str,
         add_operation_id: str,
-        snapshot: SubjectSnapshot,
+        snapshot: DomainSnapshot,
         signature_id: str,
         actor: str,
     ) -> MaintenanceResult:
@@ -1417,7 +1413,7 @@ class FluxFold:
             self._validate_split(memory_space_id, value, snapshot)
 
         output, _ = await self._structured_output(
-            stage="subject_split",
+            stage="domain_split",
             system_prompt=SPLIT_SYSTEM,
             user_prompt=split_input(snapshot),
             adapter=TypeAdapter(SplitStageOutput),
@@ -1429,57 +1425,55 @@ class FluxFold:
         if isinstance(output, DeferSplitOutput):
             operation_id = self._store.record_deferred_split(
                 memory_space_id=memory_space_id,
-                subject_id=snapshot.subject_id,
+                domain_id=snapshot.domain_id,
                 expected_revision=snapshot.summary_revision,
                 reason=output.reason,
                 actor=actor,
                 config_signature=self.config.signature,
             )
             return MaintenanceResult(
-                snapshot.subject_id, "defer_split", operation_id, output.reason
+                snapshot.domain_id, "defer_split", operation_id, output.reason
             )
-        subjects = (
-            output.subjects
+        domains = (
+            output.domains
             if isinstance(output, FullSplitOutput)
-            else output.new_subjects
+            else output.new_domains
         )
         catalog = {
             normalized_name(entry.name): entry
-            for entry in self._store.subject_names(memory_space_id)
+            for entry in self._store.domain_names(memory_space_id)
         }
         fresh_names = [
-            subject.name
-            for subject in subjects
-            if normalized_name(subject.name) not in catalog
+            domain.name
+            for domain in domains
+            if normalized_name(domain.name) not in catalog
         ]
         vectors = dict(
             zip(fresh_names, await self._embed_documents(fresh_names), strict=True)
         )
-        prepared: list[PreparedSplitSubject] = []
-        for subject in subjects:
-            existing = catalog.get(normalized_name(subject.name))
-            subject_id = existing.object_id if existing is not None else str(uuid4())
+        prepared: list[PreparedSplitDomain] = []
+        for domain in domains:
+            existing = catalog.get(normalized_name(domain.name))
+            domain_id = existing.object_id if existing is not None else str(uuid4())
             revision = (
-                self._store.subject_snapshot(
-                    memory_space_id, subject_id
-                ).summary_revision
+                self._store.domain_snapshot(memory_space_id, domain_id).summary_revision
                 if existing is not None
                 else None
             )
             prepared.append(
-                PreparedSplitSubject(
-                    PreparedSubject(
-                        subject_id,
-                        existing.name if existing is not None else subject.name,
+                PreparedSplitDomain(
+                    PreparedDomain(
+                        domain_id,
+                        existing.name if existing is not None else domain.name,
                         None,
                         existing.vector
                         if existing is not None
-                        else vectors[subject.name],
+                        else vectors[domain.name],
                         None,
                     ),
                     tuple(
-                        PreparedLink(link.memory_id, subject_id, link.basis)
-                        for link in subject.links
+                        PreparedLink(link.memory_id, domain_id, link.basis)
+                        for link in domain.links
                     ),
                     revision,
                 )
@@ -1492,70 +1486,70 @@ class FluxFold:
             memory_space_id=memory_space_id,
             original=snapshot,
             result=result,
-            new_subjects=prepared,
+            new_domains=prepared,
             signature_id=signature_id,
             actor=actor,
             config_signature=self.config.signature,
         )
-        return MaintenanceResult(snapshot.subject_id, result, operation_id)
+        return MaintenanceResult(snapshot.domain_id, result, operation_id)
 
     def _validate_split(
         self,
         memory_space_id: str,
         output: SplitStageOutput,
-        snapshot: SubjectSnapshot,
+        snapshot: DomainSnapshot,
     ) -> None:
         if isinstance(output, DeferSplitOutput):
             if not output.reason.strip():
                 raise ValidationError("defer_split requires a reason")
             return
-        subjects = (
-            output.subjects
+        domains = (
+            output.domains
             if isinstance(output, FullSplitOutput)
-            else output.new_subjects
+            else output.new_domains
         )
         if isinstance(output, FullSplitOutput):
             if (
-                not self.config.subject_split_result_subject_min
-                <= len(subjects)
-                <= self.config.subject_split_result_subject_max
+                not self.config.domain_split_result_domain_min
+                <= len(domains)
+                <= self.config.domain_split_result_domain_max
             ):
-                raise ValidationError("full split result subject count is invalid")
-        elif not 1 <= len(subjects) <= self.config.subject_split_result_subject_max - 1:
-            raise ValidationError("partial split new subject count is invalid")
-        normalized = [normalized_name(subject.name) for subject in subjects]
+                raise ValidationError("full split result domain count is invalid")
+        elif not 1 <= len(domains) <= self.config.domain_split_result_domain_max - 1:
+            raise ValidationError("partial split new domain count is invalid")
+        normalized = [normalized_name(domain.name) for domain in domains]
         if len(normalized) != len(set(normalized)):
-            raise ValidationError("split subject names must be unique within the batch")
+            raise ValidationError("split domain names must be unique within the batch")
         if normalized_name(snapshot.name) in normalized:
-            raise ValidationError("split targets must differ from the original subject")
+            raise ValidationError("split targets must differ from the original domain")
         input_ids = {memory.memory_id for memory in snapshot.memories}
         membership: Counter[str] = Counter()
-        for subject in subjects:
-            self._validate_subject_name(subject.name)
-            if subject.name.strip().lower() in {
+        for domain in domains:
+            self._validate_domain_name(domain.name)
+            if domain.name.strip().lower() in {
                 "other",
                 "misc",
                 "general",
                 "others",
                 "miscellaneous",
             }:
-                raise ValidationError("split subject name has no semantic boundary")
-            ids = [link.memory_id for link in subject.links]
+                raise ValidationError("split domain name has no semantic boundary")
+            ids = [link.memory_id for link in domain.links]
             if len(ids) != len(set(ids)):
-                raise ValidationError("a split subject contains duplicate memories")
-            if len(ids) < self.config.subject_split_result_min_memories:
-                raise ValidationError("a split subject has too few memories")
-            if len(ids) > self.config.subject_split_result_target_memory_max:
-                raise ValidationError("a split subject has too many memories")
+                raise ValidationError("a split domain contains duplicate memories")
+            if len(ids) < self.config.domain_split_result_min_memories:
+                raise ValidationError("a split domain has too few memories")
+            if len(ids) > self.config.domain_split_result_target_memory_max:
+                raise ValidationError("a split domain has too many memories")
             if not set(ids) <= input_ids:
                 raise ValidationError(
-                    "split references a memory outside the input subject"
+                    "split references a memory outside the input domain"
                 )
-            if not any(link.basis == "direct" for link in subject.links):
-                raise ValidationError("every split subject requires a direct link")
+            if not any(link.basis == "direct" for link in domain.links):
+                raise ValidationError("every split domain requires a direct link")
             membership.update(ids)
         if any(
-            count > self.config.subject_split_memory_membership_max
+            count > self.config.domain_split_memory_membership_max
             for count in membership.values()
         ):
             raise ValidationError("a memory exceeds split membership maximum")
@@ -1570,19 +1564,19 @@ class FluxFold:
                 )
         catalog = {
             normalized_name(entry.name): entry.object_id
-            for entry in self._store.subject_names(memory_space_id)
+            for entry in self._store.domain_names(memory_space_id)
         }
         existing_links = self._store.active_link_bases(memory_space_id)
         final_links = {
             pair: basis
             for pair, basis in existing_links.items()
-            if pair[1] != snapshot.subject_id
+            if pair[1] != snapshot.domain_id
         }
-        for subject in subjects:
+        for domain in domains:
             target = catalog.get(
-                normalized_name(subject.name), "new:" + normalized_name(subject.name)
+                normalized_name(domain.name), "new:" + normalized_name(domain.name)
             )
-            for link in subject.links:
+            for link in domain.links:
                 pair = (link.memory_id, target)
                 if pair not in final_links or link.basis == "direct":
                     final_links[pair] = link.basis
@@ -1795,8 +1789,8 @@ class FluxFold:
             return
         for memory in extraction.memories:
             self._validate_memory_content(memory.content)
-            for name in memory.anchors:
-                self._validate_subject_name(name)
+            for name in memory.entities:
+                self._validate_domain_name(name)
 
     def _validate_memory_content(
         self, content: str, *, max_chars: int | None = None
@@ -1811,17 +1805,17 @@ class FluxFold:
                 "memory content appears to contain an authentication secret"
             )
 
-    def _validate_subject_name(self, name: str) -> None:
-        if not name.strip() or len(name) > self.config.subject_name_max_chars:
-            raise ValidationError("subject name is blank or exceeds character limit")
+    def _validate_domain_name(self, name: str) -> None:
+        if not name.strip() or len(name) > self.config.domain_name_max_chars:
+            raise ValidationError("domain name is blank or exceeds character limit")
 
     def _validate_summary(self, summary: str) -> None:
         if (
             not summary.strip()
-            or len(summary) > self.config.generated_subject_summary_max_chars
+            or len(summary) > self.config.generated_domain_summary_max_chars
         ):
             raise ValidationError(
-                "generated subject summary is blank or exceeds character limit"
+                "generated domain summary is blank or exceeds character limit"
             )
 
     def _offer_llm_sample(self, kind: str, turn: _LlmTurn) -> None:
@@ -1864,7 +1858,7 @@ def _candidate_memory_ids(
 ) -> set[str]:
     memory_ids: set[str] = set()
     for value in candidates.values():
-        for group in cast(list[dict[str, object]], value["subjects"]):
+        for group in cast(list[dict[str, object]], value["domains"]):
             for memory in cast(list[dict[str, object]], group["memory_hits"]):
                 memory_ids.add(cast(str, memory["memory_id"]))
         for memory in cast(list[dict[str, object]], value["unattached_memories"]):

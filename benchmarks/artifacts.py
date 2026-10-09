@@ -222,10 +222,10 @@ def _search_summary(records: list[dict[str, object]]) -> dict[str, object]:
     summary_chars: list[int] = []
     memory_chars: list[int] = []
     context_chars: list[int] = []
-    subject_counts: list[int] = []
+    domain_counts: list[int] = []
     summary_counts: list[int] = []
     memory_counts: list[int] = []
-    subject_similarities: list[list[float]] = []
+    domain_similarities: list[list[float]] = []
     memory_similarities: list[list[float]] = []
 
     for record in records:
@@ -237,10 +237,10 @@ def _search_summary(records: list[dict[str, object]]) -> dict[str, object]:
         summary_chars.append(sum(len(summary) for summary in summaries))
         memory_chars.append(sum(len(str(memory["content"])) for memory in memories))
         context_chars.append(int(record["rendered_context_chars"]))
-        subject_counts.append(len(groups))
+        domain_counts.append(len(groups))
         summary_counts.append(len(summaries))
         memory_counts.append(len(memories))
-        subject_similarities.append([float(group["similarity"]) for group in groups])
+        domain_similarities.append([float(group["similarity"]) for group in groups])
         memory_similarities.append([float(memory["similarity"]) for memory in memories])
 
     return {
@@ -254,14 +254,14 @@ def _search_summary(records: list[dict[str, object]]) -> dict[str, object]:
         "summary_chars_per_query": _mean_min_max(summary_chars),
         "memory_content_chars_per_query": _mean_min_max(memory_chars),
         "rendered_context_chars_per_query": _mean_min_max(context_chars),
-        "subject_retrieval_similarity": _retrieval_similarity_summary(
-            subject_similarities
+        "domain_retrieval_similarity": _retrieval_similarity_summary(
+            domain_similarities
         ),
         "memory_retrieval_similarity": _retrieval_similarity_summary(
             memory_similarities
         ),
         "returned_per_query": {
-            "subjects_mean": _mean(subject_counts),
+            "domains_mean": _mean(domain_counts),
             "summaries_mean": _mean(summary_counts),
             "memories_mean": _mean(memory_counts),
         },
@@ -320,7 +320,7 @@ def _render_search_audit(records: list[dict[str, object]]) -> str:
                 *_blockquote(str(record["query"])),
                 "",
                 (
-                    f"- Displayed: {len(groups)} subjects · {summary_count} "
+                    f"- Displayed: {len(groups)} domains · {summary_count} "
                     f"summaries · {memory_count} memories"
                 ),
                 "",
@@ -331,7 +331,7 @@ def _render_search_audit(records: list[dict[str, object]]) -> str:
                 [
                     f"### {index}. {_heading_text(str(group['name']))}",
                     "",
-                    f"- Subject name similarity: `{float(group['similarity']):.4f}`",
+                    f"- Domain name similarity: `{float(group['similarity']):.4f}`",
                     f"- Retrieval route: `{group['route']}`",
                 ]
             )
@@ -401,7 +401,7 @@ def _render_memory_bank(
     lines = [
         "# Memory bank",
         "",
-        f"Active subjects and memories after {updated_after}.",
+        f"Active domains and memories after {updated_after}.",
         "",
     ]
     if not spaces:
@@ -409,17 +409,17 @@ def _render_memory_bank(
         return "\n".join(lines)
     for space in spaces:
         lines.extend([f"## `{space.space_key}`", ""])
-        if not space.subjects:
-            lines.extend(["_(no active subjects)_", ""])
+        if not space.domains:
+            lines.extend(["_(no active domains)_", ""])
             continue
-        for subject in space.subjects:
-            lines.extend([f"### {_heading_text(subject.name)}", ""])
-            if subject.summary:
-                lines.extend([subject.summary, ""])
-            if not subject.memory_contents:
+        for domain in space.domains:
+            lines.extend([f"### {_heading_text(domain.name)}", ""])
+            if domain.summary:
+                lines.extend([domain.summary, ""])
+            if not domain.memory_contents:
                 lines.extend(["_(no active memories)_", ""])
                 continue
-            for content in subject.memory_contents:
+            for content in domain.memory_contents:
                 lines.append(_bullet(content))
             lines.append("")
     return "\n".join(lines)

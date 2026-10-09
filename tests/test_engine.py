@@ -15,6 +15,7 @@ from fluxfold.errors import (
     ValidationError,
 )
 from fluxfold.models import (
+    DomainSnapshot,
     KeepContent,
     KeepProvenance,
     MemorySnapshot,
@@ -22,7 +23,6 @@ from fluxfold.models import (
     ReplaceContent,
     ReplaceProvenance,
     ReviewOutput,
-    SubjectSnapshot,
 )
 from fluxfold.providers import GenerationRequest, GenerationResponse
 from tests.fakes import FakeEmbeddingProvider, FakeGenerationProvider
@@ -43,8 +43,8 @@ def test_split_result_memory_minimum_cannot_exceed_maximum() -> None:
         match="split result minimum exceeds the target memory maximum",
     ):
         FluxFoldConfig().with_overrides(
-            subject_split_result_min_memories=4,
-            subject_split_result_target_memory_max=3,
+            domain_split_result_min_memories=4,
+            domain_split_result_target_memory_max=3,
         )
 
 
@@ -56,8 +56,8 @@ def test_review_replacement_content_character_limit(tmp_path) -> None:
             embedding_provider=FakeEmbeddingProvider(),
         )
         assert engine.config.review_memory_content_max_chars == 800
-        snapshot = SubjectSnapshot(
-            "subject-id",
+        snapshot = DomainSnapshot(
+            "domain-id",
             "Alice",
             None,
             0,
@@ -111,7 +111,7 @@ def test_review_replacement_provenance_requires_existing_episode(tmp_path) -> No
             generation_provider=FakeGenerationProvider(),
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                subject_candidate_min_similarity=-1.0,
+                domain_candidate_min_similarity=-1.0,
                 memory_candidate_min_similarity=-1.0,
             ),
         )
@@ -126,13 +126,13 @@ def test_review_replacement_provenance_requires_existing_episode(tmp_path) -> No
         await engine.add_episode(
             other.memory_space_id, _episode("bob", "Bob swims.", 0)
         )
-        snapshot = engine._store.subject_snapshot(
+        snapshot = engine._store.domain_snapshot(
             space.memory_space_id,
-            engine._store.active_subject_ids(space.memory_space_id)[0],
+            engine._store.active_domain_ids(space.memory_space_id)[0],
         )
-        other_snapshot = engine._store.subject_snapshot(
+        other_snapshot = engine._store.domain_snapshot(
             other.memory_space_id,
-            engine._store.active_subject_ids(other.memory_space_id)[0],
+            engine._store.active_domain_ids(other.memory_space_id)[0],
         )
         first, second = snapshot.memories
         other_episode = other_snapshot.memories[0].provenance_episode_ids[0]
@@ -186,9 +186,9 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
             generation_provider=generation,
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                subject_candidate_min_similarity=-1.0,
+                domain_candidate_min_similarity=-1.0,
                 memory_candidate_min_similarity=-1.0,
-                search_subject_min_similarity=-1.0,
+                search_domain_min_similarity=-1.0,
                 search_memory_min_similarity=-1.0,
             ),
             event_sink=events.append,
@@ -198,31 +198,31 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
             space.memory_space_id, _episode("session-1", "Alice likes hiking.")
         )
         assert first.memories_created == 1
-        assert first.subjects_created == 1
+        assert first.domains_created == 1
         assert first.links_created == 1
         bank = engine.memory_bank()
         assert len(bank) == 1
         assert bank[0].space_key == "test:alice"
-        assert [(subject.name, subject.summary) for subject in bank[0].subjects] == [
+        assert [(domain.name, domain.summary) for domain in bank[0].domains] == [
             ("Alice", " ")
         ]
-        assert bank[0].subjects[0].memory_contents == ("Alice likes hiking.",)
+        assert bank[0].domains[0].memory_contents == ("Alice likes hiking.",)
         statistics = engine.space_statistics(space.memory_space_id)
-        assert statistics["active_subjects"] == 1
+        assert statistics["active_domains"] == 1
         assert statistics["episode_count"] == 1
         assert statistics["direct_links"] == 1
         assert statistics["contextual_links"] == 0
         assert statistics["max_links_per_memory"] == 1
         assert statistics["max_direct_links_per_memory"] == 1
         assert statistics["max_contextual_links_per_memory"] == 0
-        assert statistics["max_memories_per_subject"] == 1
+        assert statistics["max_memories_per_domain"] == 1
         assert statistics["max_provenance_per_memory"] == 1
         assert statistics["mean_links_per_memory"] == 1.0
-        assert statistics["mean_memories_per_subject"] == 1.0
+        assert statistics["mean_memories_per_domain"] == 1.0
         assert statistics["retired_memories"] == 0
-        assert statistics["retired_subjects"] == 0
+        assert statistics["retired_domains"] == 0
         assert statistics["rewritten_memories"] == 0
-        assert statistics["subjects"] == [
+        assert statistics["domains"] == [
             {
                 "name": "Alice",
                 "direct_links": 1,
@@ -247,7 +247,7 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
 
         result = await engine.search(space.memory_space_id, "What does Alice enjoy?")
         assert [memory.content for memory in result.memories] == ["Alice likes hiking."]
-        assert result.subjects[0].name == "Alice"
+        assert result.domains[0].name == "Alice"
         assert "Alice likes hiking." in result.render()
 
         with pytest.raises(SourceConflictError):
@@ -275,7 +275,7 @@ def test_add_episode_serializes_episodes_within_a_space(tmp_path) -> None:
                 response = await super().generate(request)
                 self.events.append(("extract_completed", content))
                 return response
-            if request.stage == "subject_linking":
+            if request.stage == "domain_linking":
                 content = str(payload["new_memories"][0]["content"])
                 self.events.append(("link_started", content))
                 response = await super().generate(request)
@@ -290,7 +290,7 @@ def test_add_episode_serializes_episodes_within_a_space(tmp_path) -> None:
             generation_provider=generation,
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                subject_candidate_min_similarity=-1.0,
+                domain_candidate_min_similarity=-1.0,
                 memory_candidate_min_similarity=-1.0,
             ),
         )
@@ -364,11 +364,11 @@ def test_episode_links_all_new_memories_in_one_batch(tmp_path) -> None:
                             "memories": [
                                 {
                                     "content": "Alice likes hiking.",
-                                    "anchors": ["Alice"],
+                                    "entities": ["Alice"],
                                 },
                                 {
                                     "content": "Alice bought hiking boots.",
-                                    "anchors": ["Alice"],
+                                    "entities": ["Alice"],
                                 },
                             ],
                         }
@@ -396,7 +396,7 @@ def test_episode_links_all_new_memories_in_one_batch(tmp_path) -> None:
         linking_requests = [
             request
             for request in generation.requests
-            if request.stage == "subject_linking"
+            if request.stage == "domain_linking"
         ]
         assert len(linking_requests) == 1
         payload = json.loads(linking_requests[0].user_prompt)
@@ -404,23 +404,23 @@ def test_episode_links_all_new_memories_in_one_batch(tmp_path) -> None:
         assert len(set(ids)) == 2
         assert set(ids) == {
             memory.memory_id
-            for memory in engine._store.subject_snapshot(
+            for memory in engine._store.domain_snapshot(
                 space.memory_space_id,
-                engine._store.active_subject_ids(space.memory_space_id)[0],
+                engine._store.active_domain_ids(space.memory_space_id)[0],
             ).memories
         }
-        assert payload["candidates"] == [{"name": "Alice", "anchors": ["Alice"]}]
+        assert payload["candidates"] == [{"name": "Alice", "entities": ["Alice"]}]
         assert payload["association_search_results"] == []
         assert payload["association_searches_remaining"] == 5
         assert result.memories_created == 2
-        assert result.subjects_created == 1
+        assert result.domains_created == 1
         assert result.links_created == 2
         await engine.close()
 
     asyncio.run(scenario())
 
 
-def test_initial_subject_candidates_rank_within_each_anchor(
+def test_initial_domain_candidates_rank_within_each_entity(
     tmp_path, monkeypatch
 ) -> None:
     from fluxfold.names import NameEntry
@@ -433,7 +433,7 @@ def test_initial_subject_candidates_rank_within_each_anchor(
         )
         space = await engine.create_or_open_space("test:pool")
         entries = tuple(
-            NameEntry(str(index), f"Subject {index}", np.array([1.0, index / 10]))
+            NameEntry(str(index), f"Domain {index}", np.array([1.0, index / 10]))
             for index in range(8)
         )
         memberships = {
@@ -442,22 +442,20 @@ def test_initial_subject_candidates_rank_within_each_anchor(
         # Even a highest-scoring root must leave all three ordinary slots available.
         entries += (NameEntry("alice-root", "Alice", np.array([0.0, 100.0])),)
         memberships["alice-root"] = {"Alice"}
-        monkeypatch.setattr(engine._store, "subject_names", lambda _: entries)
-        monkeypatch.setattr(
-            engine._store, "subject_anchor_names", lambda _: memberships
-        )
-        candidates, legal = engine._recall_initial_subject_candidates(
+        monkeypatch.setattr(engine._store, "domain_names", lambda _: entries)
+        monkeypatch.setattr(engine._store, "domain_entity_names", lambda _: memberships)
+        candidates, legal = engine._recall_initial_domain_candidates(
             space.memory_space_id,
             [np.array([0.0, 1.0])] * 3,
             [["Alice"], ["Bob"], ["Alice"]],
         )
         assert [candidate["name"] for candidate in candidates] == [
-            "Subject 3",
-            "Subject 2",
-            "Subject 1",
-            "Subject 7",
-            "Subject 6",
-            "Subject 5",
+            "Domain 3",
+            "Domain 2",
+            "Domain 1",
+            "Domain 7",
+            "Domain 6",
+            "Domain 5",
             "Alice",
             "Bob",
         ]
@@ -472,7 +470,7 @@ def test_link_agent_allows_five_association_search_calls(tmp_path) -> None:
         async def generate(self, request: GenerationRequest):
             if '"name_resolution"' in request.user_prompt:
                 return await super().generate(request)
-            if request.stage == "subject_linking":
+            if request.stage == "domain_linking":
                 payload = json.loads(request.user_prompt)
                 if payload["association_searches_remaining"] > 0:
                     self.requests.append(request)
@@ -507,7 +505,7 @@ def test_link_agent_allows_five_association_search_calls(tmp_path) -> None:
         linking_requests = [
             request
             for request in generation.requests
-            if request.stage == "subject_linking"
+            if request.stage == "domain_linking"
         ]
         assert len(linking_requests) == 6
         payloads = [json.loads(request.user_prompt) for request in linking_requests]
@@ -553,7 +551,7 @@ def test_episode_summary_refresh_concurrency_is_capped_at_five(tmp_path) -> None
                             "memories": [
                                 {
                                     "content": f"Alice fact {index}.",
-                                    "anchors": [f"Alice group {index // 3}"],
+                                    "entities": [f"Alice group {index // 3}"],
                                 }
                                 for index in range(21)
                             ],
@@ -564,7 +562,7 @@ def test_episode_summary_refresh_concurrency_is_capped_at_five(tmp_path) -> None
                     total_tokens=10,
                     request_id="twenty-one-memory-request",
                 )
-            if request.stage == "subject_linking":
+            if request.stage == "domain_linking":
                 self.requests.append(request)
                 memories = json.loads(request.user_prompt)["new_memories"]
                 return GenerationResponse(
@@ -576,11 +574,11 @@ def test_episode_summary_refresh_concurrency_is_capped_at_five(tmp_path) -> None
                                     "memory_id": memory["memory_id"],
                                     "direct_assignments": [
                                         {
-                                            "anchor": memory["anchors"][0],
-                                            "subject": f"Alice group {index // 3}",
+                                            "entity": memory["entities"][0],
+                                            "domain": f"Alice group {index // 3}",
                                         }
                                     ],
-                                    "contextual_subjects": [],
+                                    "contextual_domains": [],
                                 }
                                 for index, memory in enumerate(memories)
                             ],
@@ -589,9 +587,9 @@ def test_episode_summary_refresh_concurrency_is_capped_at_five(tmp_path) -> None
                     input_tokens=6,
                     output_tokens=4,
                     total_tokens=10,
-                    request_id="seven-subject-request",
+                    request_id="seven-domain-request",
                 )
-            if request.stage == "subject_summary_refresh":
+            if request.stage == "domain_summary_refresh":
                 self.active_summaries += 1
                 self.max_active_summaries = max(
                     self.max_active_summaries, self.active_summaries
@@ -616,7 +614,7 @@ def test_episode_summary_refresh_concurrency_is_capped_at_five(tmp_path) -> None
             space.memory_space_id, _episode("one", "Seven Alice facts.")
         )
 
-        assert result.subjects_created == 7
+        assert result.domains_created == 7
         assert [item.operation for item in result.maintenance] == [
             "summary_refresh"
         ] * 7
@@ -680,7 +678,7 @@ def test_add_episode_persists_terminal_failure_and_replays_it(tmp_path) -> None:
     asyncio.run(scenario())
 
 
-def test_existing_subject_link_triggers_review(tmp_path) -> None:
+def test_existing_domain_link_triggers_review(tmp_path) -> None:
     async def scenario() -> None:
         generation = FakeGenerationProvider()
         events: list[dict[str, object]] = []
@@ -689,9 +687,9 @@ def test_existing_subject_link_triggers_review(tmp_path) -> None:
             generation_provider=generation,
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                subject_candidate_min_similarity=-1.0,
+                domain_candidate_min_similarity=-1.0,
                 memory_candidate_min_similarity=-1.0,
-                subject_review_new_memory_threshold=1,
+                domain_review_new_memory_threshold=1,
             ),
             event_sink=events.append,
         )
@@ -702,15 +700,15 @@ def test_existing_subject_link_triggers_review(tmp_path) -> None:
         second = await engine.add_episode(
             space.memory_space_id, _episode("two", "Alice bought boots.", 1)
         )
-        assert second.subjects_created == 0
+        assert second.domains_created == 0
         assert second.maintenance[0].operation == "review"
         assert (
-            engine.space_statistics(space.memory_space_id)["subject_review_count"] == 1
+            engine.space_statistics(space.memory_space_id)["domain_review_count"] == 1
         )
         linking_events = [
             event
             for event in events
-            if event["event_type"] == "subject_linking_completed"
+            if event["event_type"] == "domain_linking_completed"
         ]
         assert linking_events[0]["candidate_memory_count"] == 0
         assert linking_events[1]["candidate_memory_count"] == 0
@@ -721,7 +719,7 @@ def test_existing_subject_link_triggers_review(tmp_path) -> None:
     asyncio.run(scenario())
 
 
-def test_small_subject_skips_summary_llm_until_it_has_three_links(
+def test_small_domain_skips_summary_llm_until_it_has_three_links(
     tmp_path,
 ) -> None:
     async def scenario() -> None:
@@ -731,7 +729,7 @@ def test_small_subject_skips_summary_llm_until_it_has_three_links(
             generation_provider=generation,
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                subject_candidate_min_similarity=-1.0,
+                domain_candidate_min_similarity=-1.0,
                 memory_candidate_min_similarity=-1.0,
             ),
         )
@@ -745,11 +743,11 @@ def test_small_subject_skips_summary_llm_until_it_has_three_links(
 
         assert [item.operation for item in second.maintenance] == ["summary_refresh"]
         assert not any(
-            item.stage == "subject_summary_refresh" for item in generation.requests
+            item.stage == "domain_summary_refresh" for item in generation.requests
         )
-        snapshot = engine._store.subject_snapshot(
+        snapshot = engine._store.domain_snapshot(
             space.memory_space_id,
-            engine._store.active_subject_ids(space.memory_space_id)[0],
+            engine._store.active_domain_ids(space.memory_space_id)[0],
         )
         assert snapshot.summary == " "
         assert snapshot.new_memory_count == 1
@@ -762,18 +760,18 @@ def test_small_subject_skips_summary_llm_until_it_has_three_links(
         request = [
             item
             for item in generation.requests
-            if item.stage == "subject_summary_refresh"
+            if item.stage == "domain_summary_refresh"
         ][-1]
         payload = json.loads(request.user_prompt)
-        assert "summary" not in payload["subject"]
-        assert {item["content"] for item in payload["subject"]["memories"]} == {
+        assert "summary" not in payload["domain"]
+        assert {item["content"] for item in payload["domain"]["memories"]} == {
             "Alice likes hiking.",
             "Alice bought boots.",
             "Alice hikes on weekends.",
         }
-        snapshot = engine._store.subject_snapshot(
+        snapshot = engine._store.domain_snapshot(
             space.memory_space_id,
-            engine._store.active_subject_ids(space.memory_space_id)[0],
+            engine._store.active_domain_ids(space.memory_space_id)[0],
         )
         assert "Alice likes hiking." in snapshot.summary
         assert "Alice bought boots." in snapshot.summary
@@ -784,17 +782,17 @@ def test_small_subject_skips_summary_llm_until_it_has_three_links(
     asyncio.run(scenario())
 
 
-def test_search_groups_subjects_and_only_exposes_five_summaries(tmp_path) -> None:
+def test_search_groups_domains_and_only_exposes_five_summaries(tmp_path) -> None:
     async def scenario() -> None:
-        generation = FakeGenerationProvider(always_new_subject=True)
+        generation = FakeGenerationProvider(always_new_domain=True)
         engine = await FluxFold.open(
             db_path=str(tmp_path / "search-groups.sqlite3"),
             generation_provider=generation,
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                subject_candidate_min_similarity=-1.0,
+                domain_candidate_min_similarity=-1.0,
                 memory_candidate_min_similarity=-1.0,
-                search_subject_min_similarity=-1.0,
+                search_domain_min_similarity=-1.0,
                 search_memory_min_similarity=-1.0,
             ),
         )
@@ -808,16 +806,16 @@ def test_search_groups_subjects_and_only_exposes_five_summaries(tmp_path) -> Non
             )
 
         result = await engine.search(space.memory_space_id, "all unique facts")
-        assert len(result.subjects) == 9
-        assert sum(subject.summary is not None for subject in result.subjects) == 5
+        assert len(result.domains) == 9
+        assert sum(domain.summary is not None for domain in result.domains) == 5
         rendered = result.render()
-        assert rendered.count("- Subject:") == 9
+        assert rendered.count("- Domain:") == 9
         assert rendered.count("  Summary:") == 5
         linking_payload = json.loads(
             [
                 request.user_prompt
                 for request in generation.requests
-                if request.stage == "subject_linking"
+                if request.stage == "domain_linking"
                 and "name_resolution" not in request.user_prompt
             ][-1]
         )
@@ -825,7 +823,7 @@ def test_search_groups_subjects_and_only_exposes_five_summaries(tmp_path) -> Non
         assert candidates == [
             {
                 "name": "Unique fact number 8 token 136.",
-                "anchors": ["Unique fact number 8 token 136."],
+                "entities": ["Unique fact number 8 token 136."],
             }
         ]
         await engine.close()
@@ -842,7 +840,7 @@ def test_failed_summary_refresh_is_recovered_by_episode_replay(tmp_path) -> None
         async def generate(self, request: GenerationRequest):
             if '"name_resolution"' in request.user_prompt:
                 return await super().generate(request)
-            if request.stage == "subject_summary_refresh" and not self.failed:
+            if request.stage == "domain_summary_refresh" and not self.failed:
                 self.failed = True
                 raise ProviderError(
                     ErrorClass.TRANSIENT_TRANSPORT, "temporary refresh failure"
@@ -858,7 +856,7 @@ def test_failed_summary_refresh_is_recovered_by_episode_replay(tmp_path) -> None
             generation_provider=generation,
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                subject_candidate_min_similarity=-1.0,
+                domain_candidate_min_similarity=-1.0,
                 memory_candidate_min_similarity=-1.0,
             ),
             event_sink=events.append,
@@ -875,20 +873,20 @@ def test_failed_summary_refresh_is_recovered_by_episode_replay(tmp_path) -> None
             await engine.add_episode(space.memory_space_id, episode)
         assert raised.value.error_class == ErrorClass.TRANSIENT_TRANSPORT
         assert any(
-            event["event_type"] == "subject_summary_refresh_failed"
+            event["event_type"] == "domain_summary_refresh_failed"
             and event["error_class"] == ErrorClass.TRANSIENT_TRANSPORT.value
             for event in events
         )
         assert any(
             event["event_type"] == "llm_call"
-            and event["stage"] == "subject_summary_refresh"
+            and event["stage"] == "domain_summary_refresh"
             and event["result"] == "failed"
             for event in events
         )
 
-        subject_id = engine._store.active_subject_ids(space.memory_space_id)[0]
+        domain_id = engine._store.active_domain_ids(space.memory_space_id)[0]
         assert (
-            engine._store.subject_snapshot(space.memory_space_id, subject_id).summary
+            engine._store.domain_snapshot(space.memory_space_id, domain_id).summary
             == " "
         )
         await engine.close()
@@ -903,9 +901,9 @@ def test_failed_summary_refresh_is_recovered_by_episode_replay(tmp_path) -> None
         assert replay.replayed is True
         assert [item.operation for item in replay.maintenance] == ["summary_refresh"]
         assert {request.stage for request in resumed_generation.requests} == {
-            "subject_summary_refresh"
+            "domain_summary_refresh"
         }
-        refreshed = resumed._store.subject_snapshot(space.memory_space_id, subject_id)
+        refreshed = resumed._store.domain_snapshot(space.memory_space_id, domain_id)
         assert "Alice likes hiking." in refreshed.summary
         assert "Alice bought boots." in refreshed.summary
         assert "Alice hikes on weekends." in refreshed.summary
@@ -915,7 +913,7 @@ def test_failed_summary_refresh_is_recovered_by_episode_replay(tmp_path) -> None
 
 
 def test_replay_only_retries_unfinished_summary_refresh_targets(tmp_path) -> None:
-    class ThreeSubjectsWithOneRefreshFailure(FakeGenerationProvider):
+    class ThreeDomainsWithOneRefreshFailure(FakeGenerationProvider):
         def __init__(self) -> None:
             super().__init__()
 
@@ -931,7 +929,7 @@ def test_replay_only_retries_unfinished_summary_refresh_targets(tmp_path) -> Non
                             "memories": [
                                 {
                                     "content": f"Alice fact {index}.",
-                                    "anchors": [f"Alice group {index // 3}"],
+                                    "entities": [f"Alice group {index // 3}"],
                                 }
                                 for index in range(9)
                             ],
@@ -942,7 +940,7 @@ def test_replay_only_retries_unfinished_summary_refresh_targets(tmp_path) -> Non
                     total_tokens=10,
                     request_id="nine-memory-request",
                 )
-            if request.stage == "subject_linking":
+            if request.stage == "domain_linking":
                 self.requests.append(request)
                 memories = json.loads(request.user_prompt)["new_memories"]
                 return GenerationResponse(
@@ -954,11 +952,11 @@ def test_replay_only_retries_unfinished_summary_refresh_targets(tmp_path) -> Non
                                     "memory_id": memory["memory_id"],
                                     "direct_assignments": [
                                         {
-                                            "anchor": memory["anchors"][0],
-                                            "subject": f"Alice group {index // 3}",
+                                            "entity": memory["entities"][0],
+                                            "domain": f"Alice group {index // 3}",
                                         }
                                     ],
-                                    "contextual_subjects": [],
+                                    "contextual_domains": [],
                                 }
                                 for index, memory in enumerate(memories)
                             ],
@@ -967,12 +965,12 @@ def test_replay_only_retries_unfinished_summary_refresh_targets(tmp_path) -> Non
                     input_tokens=6,
                     output_tokens=4,
                     total_tokens=10,
-                    request_id="three-subject-request",
+                    request_id="three-domain-request",
                 )
-            if request.stage == "subject_summary_refresh":
+            if request.stage == "domain_summary_refresh":
                 payload = json.loads(request.user_prompt)
                 contents = {
-                    memory["content"] for memory in payload["subject"]["memories"]
+                    memory["content"] for memory in payload["domain"]["memories"]
                 }
                 if "Alice fact 3." in contents:
                     self.requests.append(request)
@@ -984,7 +982,7 @@ def test_replay_only_retries_unfinished_summary_refresh_targets(tmp_path) -> Non
 
     async def scenario() -> None:
         database = tmp_path / "partial-refresh-replay.sqlite3"
-        generation = ThreeSubjectsWithOneRefreshFailure()
+        generation = ThreeDomainsWithOneRefreshFailure()
         engine = await FluxFold.open(
             db_path=str(database),
             generation_provider=generation,
@@ -996,10 +994,10 @@ def test_replay_only_retries_unfinished_summary_refresh_targets(tmp_path) -> Non
         with pytest.raises(StageFailure):
             await engine.add_episode(space.memory_space_id, episode)
 
-        subject_ids = engine._store.active_subject_ids(space.memory_space_id)
+        domain_ids = engine._store.active_domain_ids(space.memory_space_id)
         summaries = [
-            engine._store.subject_snapshot(space.memory_space_id, subject_id).summary
-            for subject_id in subject_ids
+            engine._store.domain_snapshot(space.memory_space_id, domain_id).summary
+            for domain_id in domain_ids
         ]
         assert sum(summary is None for summary in summaries) == 1
         assert sum(summary is not None for summary in summaries) == 2
@@ -1016,12 +1014,12 @@ def test_replay_only_retries_unfinished_summary_refresh_targets(tmp_path) -> Non
         assert replay.replayed is True
         assert [item.operation for item in replay.maintenance] == ["summary_refresh"]
         assert [request.stage for request in resumed_generation.requests] == [
-            "subject_summary_refresh"
+            "domain_summary_refresh"
         ]
         assert all(
-            resumed._store.subject_snapshot(space.memory_space_id, subject_id).summary
+            resumed._store.domain_snapshot(space.memory_space_id, domain_id).summary
             is not None
-            for subject_id in subject_ids
+            for domain_id in domain_ids
         )
         await resumed.close()
 
@@ -1049,7 +1047,7 @@ def test_rebuild_retrieval_embeddings_switches_model_atomically(tmp_path) -> Non
         )
         rebuilt = await second.rebuild_retrieval_embeddings(space.memory_space_id)
         assert rebuilt.memories_embedded == 1
-        assert rebuilt.subjects_embedded == 1
+        assert rebuilt.domains_embedded == 1
         result = await second.search(space.memory_space_id, "Alice hiking")
         assert result.memories[0].content == "Alice likes hiking."
         await second.close()
@@ -1058,18 +1056,18 @@ def test_rebuild_retrieval_embeddings_switches_model_atomically(tmp_path) -> Non
 
 
 @pytest.mark.parametrize(
-    ("split_result", "episode_count", "expected_active_subjects", "expected_operation"),
+    ("split_result", "episode_count", "expected_active_domains", "expected_operation"),
     [
         ("full_split", 3, 2, "full_split"),
         ("partial_split", 4, 2, "partial_split"),
         ("defer_split", 3, 1, "defer_split"),
     ],
 )
-def test_subject_split_outcomes(
+def test_domain_split_outcomes(
     tmp_path,
     split_result: str,
     episode_count: int,
-    expected_active_subjects: int,
+    expected_active_domains: int,
     expected_operation: str,
 ) -> None:
     async def scenario() -> None:
@@ -1079,10 +1077,10 @@ def test_subject_split_outcomes(
             generation_provider=generation,
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                subject_candidate_min_similarity=-1.0,
+                domain_candidate_min_similarity=-1.0,
                 memory_candidate_min_similarity=-1.0,
-                subject_split_memory_count_threshold=episode_count,
-                subject_review_new_memory_threshold=10,
+                domain_split_memory_count_threshold=episode_count,
+                domain_review_new_memory_threshold=10,
             ),
         )
         space = await engine.create_or_open_space(f"test:{split_result}")
@@ -1097,12 +1095,12 @@ def test_subject_split_outcomes(
         split_request = next(
             request
             for request in generation.requests
-            if request.stage == "subject_split"
+            if request.stage == "domain_split"
         )
-        assert "summary" not in json.loads(split_request.user_prompt)["subject"]
+        assert "summary" not in json.loads(split_request.user_prompt)["domain"]
         statistics = engine.space_statistics(space.memory_space_id)
-        assert statistics["active_subjects"] == expected_active_subjects
-        assert statistics["subject_split_count"] == 1
+        assert statistics["active_domains"] == expected_active_domains
+        assert statistics["domain_split_count"] == 1
         await engine.close()
 
     asyncio.run(scenario())
@@ -1119,10 +1117,10 @@ def test_split_retries_when_a_moved_memory_would_lose_its_direct_link(tmp_path) 
             generation_provider=generation,
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                subject_candidate_min_similarity=-1.0,
+                domain_candidate_min_similarity=-1.0,
                 memory_candidate_min_similarity=-1.0,
-                subject_split_memory_count_threshold=3,
-                subject_review_new_memory_threshold=10,
+                domain_split_memory_count_threshold=3,
+                domain_review_new_memory_threshold=10,
             ),
             event_sink=events.append,
         )
@@ -1138,16 +1136,16 @@ def test_split_retries_when_a_moved_memory_would_lose_its_direct_link(tmp_path) 
         split_calls = [
             event
             for event in events
-            if event["event_type"] == "llm_call" and event["stage"] == "subject_split"
+            if event["event_type"] == "llm_call" and event["stage"] == "domain_split"
         ]
         assert [event["result"] for event in split_calls] == ["failed", "success"]
-        assert engine.space_statistics(space.memory_space_id)["active_subjects"] == 2
+        assert engine.space_statistics(space.memory_space_id)["active_domains"] == 2
         await engine.close()
 
     asyncio.run(scenario())
 
 
-def test_split_retries_when_a_result_subject_exceeds_memory_max(tmp_path) -> None:
+def test_split_retries_when_a_result_domain_exceeds_memory_max(tmp_path) -> None:
     async def scenario() -> None:
         generation = FakeGenerationProvider(
             split_result="full_split", split_oversized_first=True
@@ -1157,11 +1155,11 @@ def test_split_retries_when_a_result_subject_exceeds_memory_max(tmp_path) -> Non
             generation_provider=generation,
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                subject_candidate_min_similarity=-1.0,
+                domain_candidate_min_similarity=-1.0,
                 memory_candidate_min_similarity=-1.0,
-                subject_split_memory_count_threshold=4,
-                subject_split_result_target_memory_max=3,
-                subject_review_new_memory_threshold=10,
+                domain_split_memory_count_threshold=4,
+                domain_split_result_target_memory_max=3,
+                domain_review_new_memory_threshold=10,
             ),
         )
         space = await engine.create_or_open_space("test:split-memory-max")
@@ -1176,10 +1174,10 @@ def test_split_retries_when_a_result_subject_exceeds_memory_max(tmp_path) -> Non
         split_requests = [
             request
             for request in generation.requests
-            if request.stage == "subject_split"
+            if request.stage == "domain_split"
         ]
         assert len(split_requests) == 2
-        assert "a split subject has too many memories" in split_requests[1].user_prompt
+        assert "a split domain has too many memories" in split_requests[1].user_prompt
         await engine.close()
 
     asyncio.run(scenario())
@@ -1194,7 +1192,7 @@ def test_association_search_results_keep_the_detailed_candidate_view(tmp_path) -
             generation_provider=generation,
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                subject_candidate_min_similarity=-1.0,
+                domain_candidate_min_similarity=-1.0,
                 memory_candidate_min_similarity=-1.0,
             ),
             event_sink=events.append,
@@ -1207,11 +1205,11 @@ def test_association_search_results_keep_the_detailed_candidate_view(tmp_path) -
         result = await engine.add_episode(
             space.memory_space_id, _episode("two", "Alice bought boots.", 1)
         )
-        assert result.subjects_created == 0
+        assert result.domains_created == 0
         linking_calls = [
             request
             for request in generation.requests
-            if request.stage == "subject_linking"
+            if request.stage == "domain_linking"
         ]
         assert len(linking_calls) == 3
         final_payload = json.loads(linking_calls[-1].user_prompt)
@@ -1221,7 +1219,7 @@ def test_association_search_results_keep_the_detailed_candidate_view(tmp_path) -
         linking_events = [
             event
             for event in events
-            if event["event_type"] == "subject_linking_completed"
+            if event["event_type"] == "domain_linking_completed"
         ]
         assert linking_events[1]["candidate_memory_count"] == 1
         assert linking_events[1]["association_search_called"] is True
@@ -1265,11 +1263,11 @@ def test_review_provenance_and_memory_changes(tmp_path, review_mode: str) -> Non
             generation_provider=generation,
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                subject_candidate_min_similarity=-1.0,
+                domain_candidate_min_similarity=-1.0,
                 memory_candidate_min_similarity=-1.0,
-                search_subject_min_similarity=-1.0,
+                search_domain_min_similarity=-1.0,
                 search_memory_min_similarity=-1.0,
-                subject_review_new_memory_threshold=1,
+                domain_review_new_memory_threshold=1,
             ),
             event_sink=events.append,
         )
@@ -1284,17 +1282,17 @@ def test_review_provenance_and_memory_changes(tmp_path, review_mode: str) -> Non
         review_calls = [
             request
             for request in generation.requests
-            if request.stage == "subject_review"
+            if request.stage == "domain_review"
         ]
         assert len(review_calls) == (2 if review_mode == "provenance_request" else 1)
         assert all(
-            "summary" not in json.loads(request.user_prompt)["subject"]
+            "summary" not in json.loads(request.user_prompt)["domain"]
             for request in review_calls
         )
         review_completed = next(
             event
             for event in events
-            if event["event_type"] == "subject_review_completed"
+            if event["event_type"] == "domain_review_completed"
         )
         assert review_completed["provenance_viewed"] is (
             review_mode == "provenance_request"
@@ -1321,9 +1319,9 @@ def test_review_retries_when_replacement_provenance_is_invalid(tmp_path) -> None
             generation_provider=generation,
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                subject_candidate_min_similarity=-1.0,
+                domain_candidate_min_similarity=-1.0,
                 memory_candidate_min_similarity=-1.0,
-                subject_review_new_memory_threshold=1,
+                domain_review_new_memory_threshold=1,
             ),
             event_sink=events.append,
         )
@@ -1338,7 +1336,7 @@ def test_review_retries_when_replacement_provenance_is_invalid(tmp_path) -> None
         review_calls = [
             event
             for event in events
-            if event["event_type"] == "llm_call" and event["stage"] == "subject_review"
+            if event["event_type"] == "llm_call" and event["stage"] == "domain_review"
         ]
         assert [event["result"] for event in review_calls] == ["failed", "success"]
         await engine.close()

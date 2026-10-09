@@ -7,7 +7,7 @@ from pydantic import TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
 from fluxfold import EpisodeBlock, FluxFold, NormalizedEpisode, Role
-from fluxfold.models import LinkingStageOutput, MemorySnapshot, SubjectSnapshot
+from fluxfold.models import DomainSnapshot, LinkingStageOutput, MemorySnapshot
 from fluxfold.prompts import (
     extraction_input,
     repair_input,
@@ -31,7 +31,7 @@ class RepairingGenerationProvider(FakeGenerationProvider):
         )
 
     async def generate(self, request: GenerationRequest) -> GenerationResponse:
-        if request.stage == "subject_linking":
+        if request.stage == "domain_linking":
             try:
                 text = next(self._invalid_linking_outputs)
             except StopIteration:
@@ -99,8 +99,8 @@ def test_llm_inputs_project_only_task_relevant_fields() -> None:
         }
     }
 
-    snapshot = SubjectSnapshot(
-        "subject-id",
+    snapshot = DomainSnapshot(
+        "domain-id",
         "Alice",
         "stale summary",
         4,
@@ -116,22 +116,22 @@ def test_llm_inputs_project_only_task_relevant_fields() -> None:
         ),
     )
     review = json.loads(review_input(snapshot))
-    assert set(review["subject"]) == {"name", "memories"}
-    assert set(review["subject"]["memories"][0]) == {
+    assert set(review["domain"]) == {"name", "memories"}
+    assert set(review["domain"]["memories"][0]) == {
         "memory_id",
         "content",
         "link_basis",
         "provenance_episode_ids",
     }
     split = json.loads(split_input(snapshot))
-    assert set(split["subject"]) == {"name", "memories"}
-    assert set(split["subject"]["memories"][0]) == {
+    assert set(split["domain"]) == {"name", "memories"}
+    assert set(split["domain"]["memories"][0]) == {
         "memory_id",
         "content",
         "link_basis",
     }
     assert json.loads(summary_refresh_input(snapshot)) == {
-        "subject": {
+        "domain": {
             "name": "Alice",
             "memories": [{"content": "Alice likes hiking."}],
         }
@@ -139,8 +139,8 @@ def test_llm_inputs_project_only_task_relevant_fields() -> None:
 
 
 def test_review_provenance_input_uses_only_source_identity_time_and_content() -> None:
-    snapshot = SubjectSnapshot(
-        "subject-id",
+    snapshot = DomainSnapshot(
+        "domain-id",
         "Alice",
         None,
         0,
@@ -192,7 +192,7 @@ def test_validation_feedback_collapses_repeated_array_errors() -> None:
         "memories": [
             {
                 "memory_id": f"id-{index}",
-                "subject_ref": "subject-id",
+                "domain_ref": "domain-id",
                 "type": "direct",
             }
             for index in range(20)
@@ -247,7 +247,7 @@ def test_structured_retry_does_not_accumulate_older_outputs(tmp_path) -> None:
         linking_requests = [
             request
             for request in generation.requests
-            if request.stage == "subject_linking"
+            if request.stage == "domain_linking"
         ]
         assert len(linking_requests) == 3
         assert "first_marker" in linking_requests[1].user_prompt
@@ -257,7 +257,7 @@ def test_structured_retry_does_not_accumulate_older_outputs(tmp_path) -> None:
         linking_call_events = [
             event
             for event in events
-            if event["event_type"] == "llm_call" and event["stage"] == "subject_linking"
+            if event["event_type"] == "llm_call" and event["stage"] == "domain_linking"
         ]
         assert [event["result"] for event in linking_call_events] == [
             "failed",

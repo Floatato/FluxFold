@@ -278,7 +278,7 @@ async def answer_run(
                     "predicted_answer": response.text,
                 }
             )
-            direct_subject_ids = {hit.subject_id for hit in result.subject_channel}
+            direct_domain_ids = {hit.domain_id for hit in result.domain_channel}
             direct_memory_ids = {hit.memory_id for hit in result.memory_channel}
             query_number = query_numbers[question.question_id]
             search_record: dict[str, object] = {
@@ -290,12 +290,12 @@ async def answer_run(
                 "rendered_context_chars": len(search_text),
                 "groups": [
                     {
-                        "name": group.subject.name,
-                        "summary": group.subject.summary,
-                        "similarity": group.subject.similarity,
+                        "name": group.domain.name,
+                        "summary": group.domain.summary,
+                        "similarity": group.domain.similarity,
                         "route": (
-                            "direct subject hit"
-                            if group.subject.subject_id in direct_subject_ids
+                            "direct domain hit"
+                            if group.domain.domain_id in direct_domain_ids
                             else "attached through memory"
                         ),
                         "memories": [
@@ -305,7 +305,7 @@ async def answer_run(
                                 "route": (
                                     "direct memory hit"
                                     if memory.memory_id in direct_memory_ids
-                                    else "attached through subject"
+                                    else "attached through domain"
                                 ),
                             }
                             for memory in group.memories

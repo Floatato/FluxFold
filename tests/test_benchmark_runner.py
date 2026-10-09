@@ -36,9 +36,9 @@ def _alice_record(question_id: str) -> dict[str, object]:
 
 def _search_config() -> FluxFoldConfig:
     return FluxFoldConfig().with_overrides(
-        subject_candidate_min_similarity=-1.0,
+        domain_candidate_min_similarity=-1.0,
         memory_candidate_min_similarity=-1.0,
-        search_subject_min_similarity=-1.0,
+        search_domain_min_similarity=-1.0,
         search_memory_min_similarity=-1.0,
     )
 
@@ -131,7 +131,7 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
             mode="sample",
             config=config,
         )
-        later_config = config.with_overrides(subject_split_memory_count_threshold=12)
+        later_config = config.with_overrides(domain_split_memory_count_threshold=12)
         assert later_config.signature != config.signature
         await answer_run(
             dataset="longmemeval",
@@ -157,7 +157,7 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
     assert "search_result" not in search_record
     assert search_record["answer_llm_input_tokens"] == 6
     assert len(search_record["groups"]) == 1
-    assert search_record["groups"][0]["route"] == "direct subject hit"
+    assert search_record["groups"][0]["route"] == "direct domain hit"
     assert all(
         memory["route"] == "direct memory hit"
         for memory in search_record["groups"][0]["memories"]
@@ -170,14 +170,14 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
     }
     assert search_summary["returned_per_query"] == {
         "memories_mean": 3.0,
-        "subjects_mean": 1.0,
+        "domains_mean": 1.0,
         "summaries_mean": 1.0,
     }
     search_audit = paths.search_audit.read_text(encoding="utf-8")
     assert "## Query 1" in search_audit
-    assert "- Displayed: 1 subjects · 1 summaries · 3 memories" in search_audit
-    assert "- Retrieval route: `direct subject hit`" in search_audit
-    assert "subject_id" not in search_audit
+    assert "- Displayed: 1 domains · 1 summaries · 3 memories" in search_audit
+    assert "- Retrieval route: `direct domain hit`" in search_audit
+    assert "domain_id" not in search_audit
     answer_samples = paths.answer_llm_input_samples.read_text(encoding="utf-8")
     assert answer_samples.count("## Sample") == 1
     assert "### System prompt\n\n_(none)_" in answer_samples
@@ -211,21 +211,21 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
     assert "write_llm_total_tokens" not in build_summary
     assert "write_llm_calls" not in build_summary
     space_summary = build_summary["spaces"][spaces[0].source_id]
-    assert space_summary["active_subjects"] == 1
+    assert space_summary["active_domains"] == 1
     assert space_summary["episode_count"] == 3
     assert space_summary["direct_links"] == 3
     assert space_summary["contextual_links"] == 0
     assert space_summary["max_links_per_memory"] == 1
     assert space_summary["max_direct_links_per_memory"] == 1
     assert space_summary["max_contextual_links_per_memory"] == 0
-    assert space_summary["max_memories_per_subject"] == 3
+    assert space_summary["max_memories_per_domain"] == 3
     assert space_summary["max_provenance_per_memory"] == 1
     assert space_summary["mean_links_per_memory"] == 1.0
-    assert space_summary["mean_memories_per_subject"] == 3.0
+    assert space_summary["mean_memories_per_domain"] == 3.0
     assert space_summary["retired_memories"] == 0
-    assert space_summary["retired_subjects"] == 0
+    assert space_summary["retired_domains"] == 0
     assert space_summary["rewritten_memories"] == 0
-    assert space_summary["subjects"] == [
+    assert space_summary["domains"] == [
         {
             "contextual_links": 0,
             "direct_links": 3,
@@ -441,7 +441,7 @@ def test_search_summary_uses_only_the_requested_aggregates(tmp_path) -> None:
                     "name": "Higher",
                     "summary": "abc",
                     "similarity": 0.8,
-                    "route": "direct subject hit",
+                    "route": "direct domain hit",
                     "memories": [
                         {
                             "content": "1234",
@@ -459,7 +459,7 @@ def test_search_summary_uses_only_the_requested_aggregates(tmp_path) -> None:
                         {
                             "content": "12",
                             "similarity": 0.4,
-                            "route": "attached through subject",
+                            "route": "attached through domain",
                         }
                     ],
                 },
@@ -490,7 +490,7 @@ def test_search_summary_uses_only_the_requested_aggregates(tmp_path) -> None:
         "rendered_context_chars_per_query",
         "returned_per_query",
         "search_latency_seconds",
-        "subject_retrieval_similarity",
+        "domain_retrieval_similarity",
         "summary_chars_per_query",
     }
     assert summary["search_latency_seconds"] == {
@@ -516,10 +516,10 @@ def test_search_summary_uses_only_the_requested_aggregates(tmp_path) -> None:
     }
     assert summary["returned_per_query"] == {
         "memories_mean": 1.0,
-        "subjects_mean": 1.0,
+        "domains_mean": 1.0,
         "summaries_mean": 0.5,
     }
-    assert summary["subject_retrieval_similarity"] == {
+    assert summary["domain_retrieval_similarity"] == {
         "per_query_top1": {"max": 0.8, "mean": 0.8, "min": 0.8},
         "per_query_mean": {"max": 0.65, "mean": 0.65, "min": 0.65},
         "per_query_min": {"max": 0.5, "mean": 0.5, "min": 0.5},

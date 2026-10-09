@@ -23,7 +23,7 @@ class NotFoundError(FluxFoldError):
 
 
 class ConcurrentUpdateError(FluxFoldError):
-    """A state change was based on a stale subject revision."""
+    """A state change was based on a stale domain revision."""
 
 
 class ErrorClass(StrEnum):

@@ -115,12 +115,12 @@ class EmbeddingRebuildResult:
     memory_space_id: str
     model_signature_id: str
     memories_embedded: int
-    subjects_embedded: int
+    domains_embedded: int
 
 
 @dataclass(frozen=True, slots=True)
 class MaintenanceResult:
-    subject_id: str
+    domain_id: str
     operation: Literal[
         "review", "full_split", "partial_split", "defer_split", "summary_refresh"
     ]
@@ -134,14 +134,14 @@ class AddResult:
     operation_id: str | None
     replayed: bool
     memories_created: int
-    subjects_created: int
+    domains_created: int
     links_created: int
     maintenance: tuple[MaintenanceResult, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
-class SearchSubject:
-    subject_id: str
+class SearchDomain:
+    domain_id: str
     name: str
     summary: str | None
     similarity: float
@@ -157,14 +157,14 @@ class SearchMemory:
 
 @dataclass(frozen=True, slots=True)
 class SearchLink:
-    subject_id: str
+    domain_id: str
     memory_id: str
     basis: Literal["direct", "contextual"]
 
 
 @dataclass(frozen=True, slots=True)
-class RankedSubjectRef:
-    subject_id: str
+class RankedDomainRef:
+    domain_id: str
     similarity: float
     attached_memory_ids: tuple[str, ...]
 
@@ -173,82 +173,80 @@ class RankedSubjectRef:
 class RankedMemoryRef:
     memory_id: str
     similarity: float
-    attached_subject_ids: tuple[str, ...]
+    attached_domain_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class SearchSubjectGroup:
-    subject: SearchSubject
+class SearchDomainGroup:
+    domain: SearchDomain
     memories: tuple[SearchMemory, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class SearchResult:
     query: str
-    subjects: tuple[SearchSubject, ...]
+    domains: tuple[SearchDomain, ...]
     memories: tuple[SearchMemory, ...]
     links: tuple[SearchLink, ...]
-    subject_channel: tuple[RankedSubjectRef, ...]
+    domain_channel: tuple[RankedDomainRef, ...]
     memory_channel: tuple[RankedMemoryRef, ...]
 
-    def displayed_groups(self) -> tuple[SearchSubjectGroup, ...]:
+    def displayed_groups(self) -> tuple[SearchDomainGroup, ...]:
         """Merge both retrieval channels into globally deduplicated groups."""
 
-        subjects = {item.subject_id: item for item in self.subjects}
+        domains = {item.domain_id: item for item in self.domains}
         memories = {item.memory_id: item for item in self.memories}
-        direct_subject_ids = {item.subject_id for item in self.subject_channel}
-        candidate_subject_ids: dict[str, set[str]] = {}
+        direct_domain_ids = {item.domain_id for item in self.domain_channel}
+        candidate_domain_ids: dict[str, set[str]] = {}
 
-        for hit in self.subject_channel:
+        for hit in self.domain_channel:
             for memory_id in hit.attached_memory_ids:
-                candidate_subject_ids.setdefault(memory_id, set()).add(hit.subject_id)
+                candidate_domain_ids.setdefault(memory_id, set()).add(hit.domain_id)
         for memory_hit in self.memory_channel:
-            for subject_id in memory_hit.attached_subject_ids:
-                candidate_subject_ids.setdefault(memory_hit.memory_id, set()).add(
-                    subject_id
+            for domain_id in memory_hit.attached_domain_ids:
+                candidate_domain_ids.setdefault(memory_hit.memory_id, set()).add(
+                    domain_id
                 )
 
         grouped_memory_ids: dict[str, list[str]] = {
-            subject_id: [] for subject_id in direct_subject_ids
+            domain_id: [] for domain_id in direct_domain_ids
         }
-        for memory_id, candidates in candidate_subject_ids.items():
+        for memory_id, candidates in candidate_domain_ids.items():
             if memory_id not in memories:
                 continue
-            eligible = [
-                subject_id for subject_id in candidates if subject_id in subjects
-            ]
+            eligible = [domain_id for domain_id in candidates if domain_id in domains]
             if not eligible:
                 continue
             winner = min(
                 eligible,
-                key=lambda subject_id: (
-                    -subjects[subject_id].similarity,
-                    subject_id,
+                key=lambda domain_id: (
+                    -domains[domain_id].similarity,
+                    domain_id,
                 ),
             )
             grouped_memory_ids.setdefault(winner, []).append(memory_id)
 
-        ordered_subject_ids = sorted(
+        ordered_domain_ids = sorted(
             grouped_memory_ids,
-            key=lambda subject_id: (-subjects[subject_id].similarity, subject_id),
+            key=lambda domain_id: (-domains[domain_id].similarity, domain_id),
         )
         return tuple(
-            SearchSubjectGroup(
+            SearchDomainGroup(
                 (
-                    subjects[subject_id]
-                    if subject_id in direct_subject_ids
-                    or subjects[subject_id].summary is None
-                    else SearchSubject(
-                        subject_id,
-                        subjects[subject_id].name,
+                    domains[domain_id]
+                    if domain_id in direct_domain_ids
+                    or domains[domain_id].summary is None
+                    else SearchDomain(
+                        domain_id,
+                        domains[domain_id].name,
                         None,
-                        subjects[subject_id].similarity,
+                        domains[domain_id].similarity,
                     )
                 ),
                 tuple(
                     memories[memory_id]
                     for memory_id in sorted(
-                        grouped_memory_ids[subject_id],
+                        grouped_memory_ids[domain_id],
                         key=lambda memory_id: (
                             -memories[memory_id].similarity,
                             memory_id,
@@ -256,18 +254,18 @@ class SearchResult:
                     )
                 ),
             )
-            for subject_id in ordered_subject_ids
+            for domain_id in ordered_domain_ids
         )
 
     def render(self) -> str:
-        """Render the globally deduplicated subject groups shown to the LLM."""
+        """Render the globally deduplicated domain groups shown to the LLM."""
 
-        lines = ["Subject groups:"]
+        lines = ["Domain groups:"]
         for group in self.displayed_groups():
-            subject = group.subject
-            lines.append(f"- Subject: {subject.name}")
-            if subject.summary is not None:
-                lines.append(f"  Summary: {subject.summary}")
+            domain = group.domain
+            lines.append(f"- Domain: {domain.name}")
+            if domain.summary is not None:
+                lines.append(f"  Summary: {domain.summary}")
             for memory in group.memories:
                 lines.append(f"  Memory: {memory.content}")
         return "\n".join(lines)
@@ -279,7 +277,7 @@ class StrictModel(BaseModel):
 
 class ExtractedMemory(StrictModel):
     content: str
-    anchors: list[str] = Field(min_length=1)
+    entities: list[str] = Field(min_length=1)
 
 
 class MemoriesExtraction(StrictModel):
@@ -298,14 +296,14 @@ ExtractionOutput = Annotated[
 
 
 class DirectAssignment(StrictModel):
-    anchor: str
-    subject: str
+    entity: str
+    domain: str
 
 
 class MemoryLinkingOutput(StrictModel):
     memory_id: str
     direct_assignments: list[DirectAssignment]
-    contextual_subjects: list[str]
+    contextual_domains: list[str]
 
 
 class LinkingOutput(StrictModel):
@@ -390,19 +388,19 @@ class SplitLinkOutput(StrictModel):
     basis: Literal["direct", "contextual"]
 
 
-class SplitSubjectOutput(StrictModel):
+class SplitDomainOutput(StrictModel):
     name: str
     links: list[SplitLinkOutput]
 
 
 class FullSplitOutput(StrictModel):
     result: Literal["full_split"]
-    subjects: list[SplitSubjectOutput]
+    domains: list[SplitDomainOutput]
 
 
 class PartialSplitOutput(StrictModel):
     result: Literal["partial_split"]
-    new_subjects: list[SplitSubjectOutput]
+    new_domains: list[SplitDomainOutput]
 
 
 class DeferSplitOutput(StrictModel):
@@ -422,13 +420,13 @@ class CandidateMemory:
     content: str
     latest_source_at: int | None
     similarity: float
-    attached_subject_id: str | None = None
-    attached_subject_name: str | None = None
+    attached_domain_id: str | None = None
+    attached_domain_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
-class CandidateSubject:
-    subject_id: str
+class CandidateDomain:
+    domain_id: str
     name: str
     similarity: float
     attached_memory_id: str | None = None
@@ -445,8 +443,8 @@ class MemorySnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class SubjectSnapshot:
-    subject_id: str
+class DomainSnapshot:
+    domain_id: str
     name: str
     summary: str | None
     new_memory_count: int
@@ -455,7 +453,7 @@ class SubjectSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class MemoryBankSubject:
+class MemoryBankDomain:
     name: str
     summary: str | None
     memory_contents: tuple[str, ...]
@@ -464,4 +462,4 @@ class MemoryBankSubject:
 @dataclass(frozen=True, slots=True)
 class MemoryBankSpace:
     space_key: str
-    subjects: tuple[MemoryBankSubject, ...]
+    domains: tuple[MemoryBankDomain, ...]

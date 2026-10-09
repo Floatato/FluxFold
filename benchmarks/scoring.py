@@ -35,7 +35,7 @@ TIME (strict granularity; relative form equivalence; no calendar math)
   Do not answer a gold at a different time unit — even if the numeric value overlaps. Do not answer a month-level gold with a specific day, nor a year with a specific month/day/hour, etc.
   (e.g., gold = "July 26, 2019" [DAY]; generated = "2019-07-26 08:09:17" [includes Second] → WRONG)
 - Do NOT convert relative ↔ absolute. If the gold uses a relative time expression, the generated answer must also use a relative form (or a clear paraphrase of that same form), not a computed date/range.
-- Treat harmless modifiers in relative forms (e.g., “the/last/previous/just prior”) as equivalent when both the anchor date and the time unit are the same.
+- Treat harmless modifiers in relative forms (e.g., “the/last/previous/just prior”) as equivalent when both the reference date and the time unit are the same.
 
 - Lists of DISTINCT facts:
 - If the gold answer lists multiple distinct facts (joined by "and", commas, or slashes), the generated answer must cover **all** of them.

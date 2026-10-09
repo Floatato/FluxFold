@@ -22,19 +22,19 @@ from fluxfold.errors import (
     ValidationError,
 )
 from fluxfold.models import (
+    CandidateDomain,
     CandidateMemory,
-    CandidateSubject,
+    DomainSnapshot,
     EpisodeBlock,
+    MemoryBankDomain,
     MemoryBankSpace,
-    MemoryBankSubject,
     MemorySnapshot,
     MemorySpace,
     NormalizedEpisode,
+    SearchDomain,
     SearchLink,
     SearchMemory,
     SearchResult,
-    SearchSubject,
-    SubjectSnapshot,
     canonical_json,
     text_hash,
     utc_milliseconds,
@@ -42,7 +42,7 @@ from fluxfold.models import (
 from fluxfold.names import NameEntry, normalized_name
 from fluxfold.providers import EmbeddingModelInfo
 
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "7"
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,8 +64,8 @@ class PreparedMemory:
 
 
 @dataclass(frozen=True, slots=True)
-class PreparedSubject:
-    subject_id: str
+class PreparedDomain:
+    domain_id: str
     name: str
     summary: str | None
     name_embedding: np.ndarray
@@ -75,13 +75,13 @@ class PreparedSubject:
 @dataclass(frozen=True, slots=True)
 class PreparedLink:
     memory_id: str
-    subject_id: str
+    domain_id: str
     basis: Literal["direct", "contextual"]
 
 
 @dataclass(frozen=True, slots=True)
-class ExistingSubjectTouch:
-    subject_id: str
+class ExistingDomainTouch:
+    domain_id: str
     expected_revision: int
     new_memory_increment: int
 
@@ -96,8 +96,8 @@ class PreparedMemoryUpdate:
 
 
 @dataclass(frozen=True, slots=True)
-class PreparedSplitSubject:
-    subject: PreparedSubject
+class PreparedSplitDomain:
+    domain: PreparedDomain
     links: tuple[PreparedLink, ...]
     expected_revision: int | None = None
 
@@ -109,8 +109,8 @@ class RetrievalMemorySource:
 
 
 @dataclass(frozen=True, slots=True)
-class RetrievalSubjectSource:
-    subject_id: str
+class RetrievalDomainSource:
+    domain_id: str
     name: str
     summary: str | None
 
@@ -255,17 +255,15 @@ class Store:
     def _delete_space_rows(
         self, connection: sqlite3.Connection, memory_space_id: str
     ) -> None:
-        memory_versions = "SELECT memory_version_id FROM memory_versions WHERE memory_id IN (SELECT memory_id FROM memory_units WHERE memory_space_id = ?)"
-        subjects = "SELECT subject_id FROM subjects WHERE memory_space_id = ?"
-        memories = "SELECT memory_id FROM memory_units WHERE memory_space_id = ?"
-        episodes = (
-            "SELECT episode_id FROM situational_episodes WHERE memory_space_id = ?"
-        )
+        memory_versions = "SELECT memory_version_id FROM memory_versions WHERE memory_id IN (SELECT memory_id FROM memories WHERE memory_space_id = ?)"
+        domains = "SELECT domain_id FROM domains WHERE memory_space_id = ?"
+        memories = "SELECT memory_id FROM memories WHERE memory_space_id = ?"
+        episodes = "SELECT episode_id FROM episodes WHERE memory_space_id = ?"
         operations = (
-            "SELECT operation_id FROM domain_operations WHERE memory_space_id = ?"
+            "SELECT operation_id FROM memory_operations WHERE memory_space_id = ?"
         )
         connection.execute(
-            f"DELETE FROM domain_operation_effects WHERE operation_id IN ({operations})",
+            f"DELETE FROM memory_operation_effects WHERE operation_id IN ({operations})",
             (memory_space_id,),
         )
         connection.execute(
@@ -277,7 +275,7 @@ class Store:
             (memory_space_id,),
         )
         connection.execute(
-            f"DELETE FROM subject_embeddings WHERE subject_id IN ({subjects})",
+            f"DELETE FROM domain_embeddings WHERE domain_id IN ({domains})",
             (memory_space_id,),
         )
         connection.execute(
@@ -285,7 +283,7 @@ class Store:
             (memory_space_id,),
         )
         connection.execute(
-            f"DELETE FROM subject_memory_links WHERE subject_id IN ({subjects}) OR memory_id IN ({memories})",
+            f"DELETE FROM domain_memory_links WHERE domain_id IN ({domains}) OR memory_id IN ({memories})",
             (memory_space_id, memory_space_id),
         )
         connection.execute(
@@ -297,28 +295,28 @@ class Store:
             (memory_space_id,),
         )
         connection.execute(
-            f"DELETE FROM memory_anchors WHERE memory_id IN ({memories})",
+            f"DELETE FROM memory_entities WHERE memory_id IN ({memories})",
             (memory_space_id,),
         )
         connection.execute(
-            f"DELETE FROM anchor_subjects WHERE subject_id IN ({subjects})",
+            f"DELETE FROM entity_domains WHERE domain_id IN ({domains})",
             (memory_space_id,),
         )
         connection.execute(
-            "DELETE FROM anchors WHERE memory_space_id=?", (memory_space_id,)
+            "DELETE FROM entities WHERE memory_space_id=?", (memory_space_id,)
         )
         connection.execute(
-            "DELETE FROM subjects WHERE memory_space_id = ?", (memory_space_id,)
+            "DELETE FROM domains WHERE memory_space_id = ?", (memory_space_id,)
         )
         connection.execute(
-            "DELETE FROM memory_units WHERE memory_space_id = ?", (memory_space_id,)
+            "DELETE FROM memories WHERE memory_space_id = ?", (memory_space_id,)
         )
         connection.execute(
             f"DELETE FROM episode_blocks WHERE episode_id IN ({episodes})",
             (memory_space_id,),
         )
         connection.execute(
-            "DELETE FROM situational_episodes WHERE memory_space_id = ?",
+            "DELETE FROM episodes WHERE memory_space_id = ?",
             (memory_space_id,),
         )
         connection.execute(
@@ -326,7 +324,7 @@ class Store:
             (memory_space_id,),
         )
         connection.execute(
-            "DELETE FROM domain_operations WHERE memory_space_id = ?",
+            "DELETE FROM memory_operations WHERE memory_space_id = ?",
             (memory_space_id,),
         )
         connection.execute(
@@ -440,14 +438,14 @@ class Store:
 
     def retrieval_embedding_sources(
         self, memory_space_id: str
-    ) -> tuple[tuple[RetrievalMemorySource, ...], tuple[RetrievalSubjectSource, ...]]:
+    ) -> tuple[tuple[RetrievalMemorySource, ...], tuple[RetrievalDomainSource, ...]]:
         with self._connect() as connection:
             self._require_space(connection, memory_space_id)
             memories = tuple(
                 RetrievalMemorySource(row["memory_version_id"], row["content"])
                 for row in connection.execute(
                     """
-                    SELECT v.memory_version_id, v.content FROM memory_units u
+                    SELECT v.memory_version_id, v.content FROM memories u
                     JOIN memory_versions v ON v.memory_id = u.memory_id AND v.is_latest = 1
                     WHERE u.memory_space_id = ? AND u.lifecycle_status = 'active'
                     ORDER BY u.memory_id
@@ -455,18 +453,18 @@ class Store:
                     (memory_space_id,),
                 )
             )
-            subjects = tuple(
-                RetrievalSubjectSource(row["subject_id"], row["name"], row["summary"])
+            domains = tuple(
+                RetrievalDomainSource(row["domain_id"], row["name"], row["summary"])
                 for row in connection.execute(
                     """
-                    SELECT subject_id, name, summary FROM subjects
+                    SELECT domain_id, name, summary FROM domains
                     WHERE memory_space_id = ?
-                    ORDER BY subject_id
+                    ORDER BY domain_id
                     """,
                     (memory_space_id,),
                 )
             )
-        return memories, subjects
+        return memories, domains
 
     def commit_retrieval_embedding_switch(
         self,
@@ -474,10 +472,8 @@ class Store:
         memory_space_id: str,
         signature_id: str,
         memories: Sequence[tuple[RetrievalMemorySource, np.ndarray]],
-        subjects: Sequence[
-            tuple[RetrievalSubjectSource, np.ndarray, np.ndarray | None]
-        ],
-        anchors: Sequence[NameEntry],
+        domains: Sequence[tuple[RetrievalDomainSource, np.ndarray, np.ndarray | None]],
+        entities: Sequence[NameEntry],
     ) -> None:
         now = utc_milliseconds()
         with self._transaction() as connection:
@@ -486,49 +482,51 @@ class Store:
                 row["memory_version_id"]: row["content"]
                 for row in connection.execute(
                     """
-                    SELECT v.memory_version_id, v.content FROM memory_units u
+                    SELECT v.memory_version_id, v.content FROM memories u
                     JOIN memory_versions v ON v.memory_id = u.memory_id AND v.is_latest = 1
                     WHERE u.memory_space_id = ? AND u.lifecycle_status = 'active'
                     """,
                     (memory_space_id,),
                 )
             }
-            current_subjects = {
-                row["subject_id"]: (row["name"], row["summary"])
+            current_domains = {
+                row["domain_id"]: (row["name"], row["summary"])
                 for row in connection.execute(
-                    "SELECT subject_id, name, summary FROM subjects WHERE memory_space_id = ?",
+                    "SELECT domain_id, name, summary FROM domains WHERE memory_space_id = ?",
                     (memory_space_id,),
                 )
             }
             supplied_memories = {
                 source.memory_version_id: source.content for source, _ in memories
             }
-            supplied_subjects = {
-                source.subject_id: (source.name, source.summary)
-                for source, _, _ in subjects
+            supplied_domains = {
+                source.domain_id: (source.name, source.summary)
+                for source, _, _ in domains
             }
             if (
                 supplied_memories != current_memories
-                or supplied_subjects != current_subjects
+                or supplied_domains != current_domains
             ):
                 raise ConcurrentUpdateError(
                     "retrieval sources changed while embeddings were being rebuilt"
                 )
-            current_anchors = {
-                row["anchor_id"]: row["name"]
+            current_entities = {
+                row["entity_id"]: row["name"]
                 for row in connection.execute(
-                    "SELECT anchor_id, name FROM anchors WHERE memory_space_id=?",
+                    "SELECT entity_id, name FROM entities WHERE memory_space_id=?",
                     (memory_space_id,),
                 )
             }
-            if current_anchors != {anchor.object_id: anchor.name for anchor in anchors}:
+            if current_entities != {
+                entity.object_id: entity.name for entity in entities
+            }:
                 raise ConcurrentUpdateError(
-                    "anchors changed while embeddings were being rebuilt"
+                    "entities changed while embeddings were being rebuilt"
                 )
-            for anchor in anchors:
+            for entity in entities:
                 connection.execute(
-                    "UPDATE anchors SET vector=?, model_signature_id=? WHERE anchor_id=?",
-                    (_vector_blob(anchor.vector), signature_id, anchor.object_id),
+                    "UPDATE entities SET vector=?, model_signature_id=? WHERE entity_id=?",
+                    (_vector_blob(entity.vector), signature_id, entity.object_id),
                 )
             for memory_source, vector in memories:
                 connection.execute(
@@ -550,25 +548,25 @@ class Store:
                         now,
                     ),
                 )
-            for subject_source, name_vector, summary_vector in subjects:
-                self._upsert_subject_embedding(
+            for domain_source, name_vector, summary_vector in domains:
+                self._upsert_domain_embedding(
                     connection,
-                    subject_source.subject_id,
+                    domain_source.domain_id,
                     "name",
-                    subject_source.name,
+                    domain_source.name,
                     name_vector,
                     signature_id,
                     now,
                 )
-                if subject_source.summary is not None:
+                if domain_source.summary is not None:
                     if summary_vector is None:
                         raise ValidationError("summary embedding is missing")
-                    self._upsert_subject_embedding(
+                    self._upsert_domain_embedding(
                         connection,
-                        subject_source.subject_id,
+                        domain_source.domain_id,
                         "name_summary",
-                        _subject_embedding_text(
-                            subject_source.name, subject_source.summary
+                        _domain_embedding_text(
+                            domain_source.name, domain_source.summary
                         ),
                         summary_vector,
                         signature_id,
@@ -594,26 +592,26 @@ class Store:
     ) -> None:
         active_memories = connection.execute(
             """
-            SELECT count(*) AS n FROM memory_units u
+            SELECT count(*) AS n FROM memories u
             JOIN memory_versions v ON v.memory_id = u.memory_id AND v.is_latest = 1
             LEFT JOIN memory_embeddings e ON e.memory_version_id = v.memory_version_id AND e.model_signature_id = ?
             WHERE u.memory_space_id = ? AND u.lifecycle_status = 'active' AND e.memory_version_id IS NULL
             """,
             (signature_id, memory_space_id),
         ).fetchone()["n"]
-        active_subject_embeddings = connection.execute(
+        active_domain_embeddings = connection.execute(
             """
-            SELECT count(*) AS n FROM subjects s
+            SELECT count(*) AS n FROM domains s
             CROSS JOIN (SELECT 'name' AS kind UNION ALL SELECT 'name_summary') kinds
-            LEFT JOIN subject_embeddings e ON e.subject_id = s.subject_id
+            LEFT JOIN domain_embeddings e ON e.domain_id = s.domain_id
                 AND e.embedding_kind = kinds.kind AND e.model_signature_id = ?
             WHERE s.memory_space_id = ?
                 AND (kinds.kind = 'name' OR s.summary IS NOT NULL)
-                AND e.subject_id IS NULL
+                AND e.domain_id IS NULL
             """,
             (signature_id, memory_space_id),
         ).fetchone()["n"]
-        if active_memories or active_subject_embeddings:
+        if active_memories or active_domain_embeddings:
             raise ValidationError(
                 "cannot switch retrieval signature before all embeddings exist"
             )
@@ -629,7 +627,7 @@ class Store:
             self._require_space(connection, memory_space_id)
             existing = connection.execute(
                 """
-                SELECT episode_id, content_hash FROM situational_episodes
+                SELECT episode_id, content_hash FROM episodes
                 WHERE memory_space_id = ? AND source_type = ? AND source_key = ?
                 """,
                 (memory_space_id, episode.source_type, episode.source_key),
@@ -657,7 +655,7 @@ class Store:
             created_at = utc_milliseconds()
             connection.execute(
                 """
-                INSERT INTO situational_episodes(
+                INSERT INTO episodes(
                     episode_id, memory_space_id, source_type, source_key, source_sequence,
                     payload_version, source_started_at, source_ended_at, source_timezone,
                     content_hash, source_chars, created_at
@@ -694,7 +692,7 @@ class Store:
     ) -> None:
         with self._transaction() as connection:
             episode = connection.execute(
-                "SELECT content_hash FROM situational_episodes WHERE episode_id = ? AND memory_space_id = ?",
+                "SELECT content_hash FROM episodes WHERE episode_id = ? AND memory_space_id = ?",
                 (episode_id, memory_space_id),
             ).fetchone()
             if episode is None:
@@ -758,12 +756,12 @@ class Store:
         episode_id: str,
         input_hash: str,
         memories: Sequence[PreparedMemory],
-        subjects: Sequence[PreparedSubject],
+        domains: Sequence[PreparedDomain],
         links: Sequence[PreparedLink],
-        subject_touches: Sequence[ExistingSubjectTouch],
-        anchors: Sequence[NameEntry],
-        anchor_subjects: Sequence[tuple[str, str]],
-        memory_anchors: Sequence[tuple[str, str]],
+        domain_touches: Sequence[ExistingDomainTouch],
+        entities: Sequence[NameEntry],
+        entity_domains: Sequence[tuple[str, str]],
+        memory_entities: Sequence[tuple[str, str]],
         signature_id: str,
         actor: str,
         config_signature: str,
@@ -773,7 +771,7 @@ class Store:
         with self._transaction() as connection:
             self._require_space(connection, memory_space_id)
             episode = connection.execute(
-                "SELECT source_started_at, source_ended_at, content_hash FROM situational_episodes WHERE episode_id = ? AND memory_space_id = ?",
+                "SELECT source_started_at, source_ended_at, content_hash FROM episodes WHERE episode_id = ? AND memory_space_id = ?",
                 (episode_id, memory_space_id),
             ).fetchone()
             if episode is None:
@@ -794,76 +792,74 @@ class Store:
                 "Add memories extracted from one dataset episode.",
                 now,
             )
-            source_anchor = episode["source_ended_at"] or episode["source_started_at"]
+            source_time = episode["source_ended_at"] or episode["source_started_at"]
             for memory in memories:
                 self._insert_memory(
                     connection,
                     memory_space_id,
                     memory,
                     (episode_id,),
-                    source_anchor,
+                    source_time,
                     operation_id,
                     signature_id,
                     now,
                 )
-            for subject in subjects:
-                self._insert_subject(
+            for domain in domains:
+                self._insert_domain(
                     connection,
                     memory_space_id,
-                    subject,
+                    domain,
                     operation_id,
                     signature_id,
                     now,
                 )
-            for anchor in anchors:
+            for entity in entities:
                 connection.execute(
-                    "INSERT INTO anchors(anchor_id, memory_space_id, name, normalized_name, model_signature_id, vector, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO entities(entity_id, memory_space_id, name, normalized_name, model_signature_id, vector, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
-                        anchor.object_id,
+                        entity.object_id,
                         memory_space_id,
-                        anchor.name,
-                        normalized_name(anchor.name),
+                        entity.name,
+                        normalized_name(entity.name),
                         signature_id,
-                        _vector_blob(anchor.vector),
+                        _vector_blob(entity.vector),
                         now,
                     ),
                 )
             connection.executemany(
-                "INSERT OR IGNORE INTO anchor_subjects(anchor_id, subject_id) VALUES (?, ?)",
-                anchor_subjects,
+                "INSERT OR IGNORE INTO entity_domains(entity_id, domain_id) VALUES (?, ?)",
+                entity_domains,
             )
             connection.executemany(
-                "INSERT INTO memory_anchors(memory_id, anchor_id) VALUES (?, ?)",
-                memory_anchors,
+                "INSERT INTO memory_entities(memory_id, entity_id) VALUES (?, ?)",
+                memory_entities,
             )
-            for touch in subject_touches:
-                self._reactivate_subject(
-                    connection, touch.subject_id, operation_id, now
-                )
+            for touch in domain_touches:
+                self._reactivate_domain(connection, touch.domain_id, operation_id, now)
                 cursor = connection.execute(
                     """
-                    UPDATE subjects SET new_memory_count = new_memory_count + ?,
+                    UPDATE domains SET new_memory_count = new_memory_count + ?,
                         updated_at = ?
-                    WHERE subject_id = ? AND memory_space_id = ? AND lifecycle_status = 'active'
+                    WHERE domain_id = ? AND memory_space_id = ? AND lifecycle_status = 'active'
                         AND summary_revision = ?
                     """,
                     (
                         touch.new_memory_increment,
                         now,
-                        touch.subject_id,
+                        touch.domain_id,
                         memory_space_id,
                         touch.expected_revision,
                     ),
                 )
                 if cursor.rowcount != 1:
-                    raise ConcurrentUpdateError(f"stale subject: {touch.subject_id}")
+                    raise ConcurrentUpdateError(f"stale domain: {touch.domain_id}")
             for link in links:
                 self._insert_link(connection, link, operation_id, now)
             self._insert_summary_refresh_targets(
                 connection,
                 operation_id,
-                {link.subject_id for link in links}
-                | {subject.subject_id for subject in subjects},
+                {link.domain_id for link in links}
+                | {domain.domain_id for domain in domains},
             )
             self._validate_active_memory_links(connection, memory_space_id)
             connection.execute(
@@ -890,7 +886,7 @@ class Store:
         now: int,
     ) -> None:
         connection.execute(
-            "INSERT INTO memory_units(memory_id, memory_space_id, lifecycle_status, latest_source_at, created_at, updated_at) VALUES (?, ?, 'active', ?, ?, ?)",
+            "INSERT INTO memories(memory_id, memory_space_id, lifecycle_status, latest_source_at, created_at, updated_at) VALUES (?, ?, 'active', ?, ?, ?)",
             (memory.memory_id, memory_space_id, latest_source_at, now, now),
         )
         connection.execute(
@@ -925,70 +921,70 @@ class Store:
             "created",
         )
 
-    def _reactivate_subject(
+    def _reactivate_domain(
         self,
         connection: sqlite3.Connection,
-        subject_id: str,
+        domain_id: str,
         operation_id: str,
         now: int,
     ) -> None:
         cursor = connection.execute(
-            """UPDATE subjects SET lifecycle_status='active', retired_at=NULL,
+            """UPDATE domains SET lifecycle_status='active', retired_at=NULL,
             retired_by_operation_id=NULL, updated_at=?
-            WHERE subject_id=? AND lifecycle_status='retired'""",
-            (now, subject_id),
+            WHERE domain_id=? AND lifecycle_status='retired'""",
+            (now, domain_id),
         )
         if cursor.rowcount:
-            self._effect(connection, operation_id, "subject", subject_id, "reactivated")
+            self._effect(connection, operation_id, "domain", domain_id, "reactivated")
 
-    def _insert_subject(
+    def _insert_domain(
         self,
         connection: sqlite3.Connection,
         memory_space_id: str,
-        subject: PreparedSubject,
+        domain: PreparedDomain,
         operation_id: str,
         signature_id: str,
         now: int,
     ) -> None:
         connection.execute(
             """
-            INSERT INTO subjects(
-                subject_id, memory_space_id, name, normalized_name, summary, lifecycle_status,
+            INSERT INTO domains(
+                domain_id, memory_space_id, name, normalized_name, summary, lifecycle_status,
                 new_memory_count, summary_revision, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, 'active', 0, 0, ?, ?)
             """,
             (
-                subject.subject_id,
+                domain.domain_id,
                 memory_space_id,
-                subject.name,
-                normalized_name(subject.name),
-                subject.summary,
+                domain.name,
+                normalized_name(domain.name),
+                domain.summary,
                 now,
                 now,
             ),
         )
-        self._upsert_subject_embedding(
+        self._upsert_domain_embedding(
             connection,
-            subject.subject_id,
+            domain.domain_id,
             "name",
-            subject.name,
-            subject.name_embedding,
+            domain.name,
+            domain.name_embedding,
             signature_id,
             now,
         )
-        if subject.summary is not None:
-            if subject.name_summary_embedding is None:
+        if domain.summary is not None:
+            if domain.name_summary_embedding is None:
                 raise ValidationError("summary embedding is missing")
-            self._upsert_subject_embedding(
+            self._upsert_domain_embedding(
                 connection,
-                subject.subject_id,
+                domain.domain_id,
                 "name_summary",
-                _subject_embedding_text(subject.name, subject.summary),
-                subject.name_summary_embedding,
+                _domain_embedding_text(domain.name, domain.summary),
+                domain.name_summary_embedding,
                 signature_id,
                 now,
             )
-        self._effect(connection, operation_id, "subject", subject.subject_id, "created")
+        self._effect(connection, operation_id, "domain", domain.domain_id, "created")
 
     def _insert_link(
         self,
@@ -1000,11 +996,11 @@ class Store:
         link_id = str(uuid4())
         connection.execute(
             """
-            INSERT INTO subject_memory_links(
-                link_id, subject_id, memory_id, link_basis, linked_at, opened_by_operation_id
+            INSERT INTO domain_memory_links(
+                link_id, domain_id, memory_id, link_basis, linked_at, opened_by_operation_id
             ) VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (link_id, link.subject_id, link.memory_id, link.basis, now, operation_id),
+            (link_id, link.domain_id, link.memory_id, link.basis, now, operation_id),
         )
         self._effect(connection, operation_id, "link", link_id, "opened")
         return link_id
@@ -1032,10 +1028,10 @@ class Store:
             ),
         )
 
-    def _upsert_subject_embedding(
+    def _upsert_domain_embedding(
         self,
         connection: sqlite3.Connection,
-        subject_id: str,
+        domain_id: str,
         kind: str,
         source_text: str,
         vector: np.ndarray,
@@ -1044,16 +1040,16 @@ class Store:
     ) -> None:
         connection.execute(
             """
-            INSERT INTO subject_embeddings(
-                subject_id, embedding_kind, model_signature_id, dimension,
+            INSERT INTO domain_embeddings(
+                domain_id, embedding_kind, model_signature_id, dimension,
                 source_hash, vector, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(subject_id, embedding_kind, model_signature_id) DO UPDATE SET
+            ON CONFLICT(domain_id, embedding_kind, model_signature_id) DO UPDATE SET
                 dimension = excluded.dimension, source_hash = excluded.source_hash,
                 vector = excluded.vector, created_at = excluded.created_at
             """,
             (
-                subject_id,
+                domain_id,
                 kind,
                 signature_id,
                 vector.shape[0],
@@ -1063,37 +1059,37 @@ class Store:
             ),
         )
 
-    def candidate_subjects(
+    def candidate_domains(
         self,
         memory_space_id: str,
         query_vector: np.ndarray,
         *,
         top_k: int,
         min_similarity: float,
-    ) -> tuple[CandidateSubject, ...]:
-        hits = self._scan_subjects(memory_space_id, query_vector, top_k, min_similarity)
-        output: list[CandidateSubject] = []
+    ) -> tuple[CandidateDomain, ...]:
+        hits = self._scan_domains(memory_space_id, query_vector, top_k, min_similarity)
+        output: list[CandidateDomain] = []
         with self._connect() as connection:
             signature_id = self._active_signature(connection, memory_space_id)
-            for subject_id, similarity in hits:
+            for domain_id, similarity in hits:
                 row = connection.execute(
-                    "SELECT name FROM subjects WHERE subject_id = ?",
-                    (subject_id,),
+                    "SELECT name FROM domains WHERE domain_id = ?",
+                    (domain_id,),
                 ).fetchone()
                 attached = connection.execute(
                     """
-                    SELECT u.memory_id, v.content, e.vector FROM subject_memory_links l
-                    JOIN memory_units u ON u.memory_id = l.memory_id AND u.lifecycle_status = 'active'
+                    SELECT u.memory_id, v.content, e.vector FROM domain_memory_links l
+                    JOIN memories u ON u.memory_id = l.memory_id AND u.lifecycle_status = 'active'
                     JOIN memory_versions v ON v.memory_id = u.memory_id AND v.is_latest = 1
                     JOIN memory_embeddings e ON e.memory_version_id = v.memory_version_id AND e.model_signature_id = ?
-                    WHERE l.subject_id = ? AND l.unlinked_at IS NULL
+                    WHERE l.domain_id = ? AND l.unlinked_at IS NULL
                     """,
-                    (signature_id, subject_id),
+                    (signature_id, domain_id),
                 ).fetchall()
                 best = _best_embedded_row(attached, query_vector, "memory_id")
                 output.append(
-                    CandidateSubject(
-                        subject_id,
+                    CandidateDomain(
+                        domain_id,
                         row["name"],
                         similarity,
                         best["memory_id"] if best is not None else None,
@@ -1102,56 +1098,56 @@ class Store:
                 )
         return tuple(output)
 
-    def anchor_names(self, memory_space_id: str) -> tuple[NameEntry, ...]:
+    def entity_names(self, memory_space_id: str) -> tuple[NameEntry, ...]:
         with self._connect() as connection:
             return tuple(
                 NameEntry(
-                    row["anchor_id"],
+                    row["entity_id"],
                     row["name"],
                     np.frombuffer(row["vector"], dtype="<f4"),
                 )
                 for row in connection.execute(
-                    "SELECT anchor_id, name, vector FROM anchors WHERE memory_space_id = ? ORDER BY normalized_name",
+                    "SELECT entity_id, name, vector FROM entities WHERE memory_space_id = ? ORDER BY normalized_name",
                     (memory_space_id,),
                 )
             )
 
-    def subject_names(self, memory_space_id: str) -> tuple[NameEntry, ...]:
+    def domain_names(self, memory_space_id: str) -> tuple[NameEntry, ...]:
         with self._connect() as connection:
             return tuple(
                 NameEntry(
-                    row["subject_id"],
+                    row["domain_id"],
                     row["name"],
                     np.frombuffer(row["vector"], dtype="<f4"),
                 )
                 for row in connection.execute(
-                    """SELECT s.subject_id, s.name, e.vector FROM subjects s
+                    """SELECT s.domain_id, s.name, e.vector FROM domains s
                 JOIN memory_space_model_signatures a ON a.memory_space_id=s.memory_space_id AND a.purpose='retrieval'
-                JOIN subject_embeddings e ON e.subject_id=s.subject_id AND e.embedding_kind='name' AND e.model_signature_id=a.model_signature_id
+                JOIN domain_embeddings e ON e.domain_id=s.domain_id AND e.embedding_kind='name' AND e.model_signature_id=a.model_signature_id
                 WHERE s.memory_space_id=? ORDER BY s.normalized_name""",
                     (memory_space_id,),
                 )
             )
 
-    def subject_anchor_names(self, memory_space_id: str) -> dict[str, set[str]]:
+    def domain_entity_names(self, memory_space_id: str) -> dict[str, set[str]]:
         with self._connect() as connection:
             result: dict[str, set[str]] = {}
             for row in connection.execute(
-                """SELECT r.subject_id, a.name FROM anchor_subjects r
-                JOIN anchors a USING(anchor_id) JOIN subjects s USING(subject_id)
+                """SELECT r.domain_id, a.name FROM entity_domains r
+                JOIN entities a USING(entity_id) JOIN domains s USING(domain_id)
                 WHERE a.memory_space_id=?""",
                 (memory_space_id,),
             ):
-                result.setdefault(row["subject_id"], set()).add(row["name"])
+                result.setdefault(row["domain_id"], set()).add(row["name"])
             return result
 
     def active_link_bases(self, memory_space_id: str) -> dict[tuple[str, str], str]:
         with self._connect() as connection:
             return {
-                (row["memory_id"], row["subject_id"]): row["link_basis"]
+                (row["memory_id"], row["domain_id"]): row["link_basis"]
                 for row in connection.execute(
-                    """SELECT l.memory_id, l.subject_id, l.link_basis FROM subject_memory_links l
-                JOIN subjects s USING(subject_id) WHERE s.memory_space_id=? AND l.unlinked_at IS NULL""",
+                    """SELECT l.memory_id, l.domain_id, l.link_basis FROM domain_memory_links l
+                JOIN domains s USING(domain_id) WHERE s.memory_space_id=? AND l.unlinked_at IS NULL""",
                     (memory_space_id,),
                 )
             }
@@ -1171,7 +1167,7 @@ class Store:
             for memory_id, similarity in hits:
                 row = connection.execute(
                     """
-                    SELECT u.latest_source_at, v.content FROM memory_units u
+                    SELECT u.latest_source_at, v.content FROM memories u
                     JOIN memory_versions v ON v.memory_id = u.memory_id AND v.is_latest = 1
                     WHERE u.memory_id = ?
                     """,
@@ -1179,28 +1175,28 @@ class Store:
                 ).fetchone()
                 attached = connection.execute(
                     """
-                    SELECT s.subject_id, s.name, e.vector FROM subject_memory_links l
-                    JOIN subjects s ON s.subject_id = l.subject_id AND s.lifecycle_status = 'active'
-                    JOIN subject_embeddings e ON e.subject_id = s.subject_id
+                    SELECT s.domain_id, s.name, e.vector FROM domain_memory_links l
+                    JOIN domains s ON s.domain_id = l.domain_id AND s.lifecycle_status = 'active'
+                    JOIN domain_embeddings e ON e.domain_id = s.domain_id
                         AND e.embedding_kind = 'name' AND e.model_signature_id = ?
                     WHERE l.memory_id = ? AND l.unlinked_at IS NULL
                     """,
                     (signature_id, memory_id),
                 ).fetchall()
-                best = _best_embedded_row(attached, query_vector, "subject_id")
+                best = _best_embedded_row(attached, query_vector, "domain_id")
                 output.append(
                     CandidateMemory(
                         memory_id,
                         row["content"],
                         row["latest_source_at"],
                         similarity,
-                        best["subject_id"] if best is not None else None,
+                        best["domain_id"] if best is not None else None,
                         best["name"] if best is not None else None,
                     )
                 )
         return tuple(output)
 
-    def _scan_subjects(
+    def _scan_domains(
         self,
         memory_space_id: str,
         query_vector: np.ndarray,
@@ -1213,21 +1209,21 @@ class Store:
             """
             AND s.lifecycle_status = 'active'
             AND EXISTS (
-                SELECT 1 FROM subject_memory_links l
-                JOIN memory_units u ON u.memory_id=l.memory_id AND u.lifecycle_status='active'
-                WHERE l.subject_id=s.subject_id AND l.unlinked_at IS NULL
+                SELECT 1 FROM domain_memory_links l
+                JOIN memories u ON u.memory_id=l.memory_id AND u.lifecycle_status='active'
+                WHERE l.domain_id=s.domain_id AND l.unlinked_at IS NULL
             )
         """
             if public
             else ""
         )
         sql = f"""
-            SELECT s.subject_id AS object_id, e.vector FROM subjects s
+            SELECT s.domain_id AS object_id, e.vector FROM domains s
             JOIN memory_space_model_signatures a ON a.memory_space_id = s.memory_space_id AND a.purpose = 'retrieval'
-            JOIN subject_embeddings e ON e.subject_id = s.subject_id
+            JOIN domain_embeddings e ON e.domain_id = s.domain_id
                 AND e.embedding_kind = 'name' AND e.model_signature_id = a.model_signature_id
             WHERE s.memory_space_id = ? {visibility}
-            ORDER BY s.subject_id
+            ORDER BY s.domain_id
         """
         return self._exact_scan(
             sql, memory_space_id, query_vector, top_k, min_similarity
@@ -1241,7 +1237,7 @@ class Store:
         min_similarity: float,
     ) -> list[tuple[str, float]]:
         sql = """
-            SELECT u.memory_id AS object_id, e.vector FROM memory_units u
+            SELECT u.memory_id AS object_id, e.vector FROM memories u
             JOIN memory_versions v ON v.memory_id = u.memory_id AND v.is_latest = 1
             JOIN memory_space_model_signatures a ON a.memory_space_id = u.memory_space_id AND a.purpose = 'retrieval'
             JOIN memory_embeddings e ON e.memory_version_id = v.memory_version_id AND e.model_signature_id = a.model_signature_id
@@ -1281,29 +1277,27 @@ class Store:
         candidates.sort(key=lambda item: (-item[1], item[0]))
         return candidates[:top_k]
 
-    def subject_snapshot(
-        self, memory_space_id: str, subject_id: str
-    ) -> SubjectSnapshot:
+    def domain_snapshot(self, memory_space_id: str, domain_id: str) -> DomainSnapshot:
         with self._connect() as connection:
-            subject = connection.execute(
+            domain = connection.execute(
                 """
-                SELECT name, summary, new_memory_count, summary_revision FROM subjects
-                WHERE subject_id = ? AND memory_space_id = ?
+                SELECT name, summary, new_memory_count, summary_revision FROM domains
+                WHERE domain_id = ? AND memory_space_id = ?
                 """,
-                (subject_id, memory_space_id),
+                (domain_id, memory_space_id),
             ).fetchone()
-            if subject is None:
-                raise NotFoundError(f"subject not found: {subject_id}")
+            if domain is None:
+                raise NotFoundError(f"domain not found: {domain_id}")
             rows = connection.execute(
                 """
                 SELECT u.memory_id, u.latest_source_at, v.content, l.link_basis
-                FROM subject_memory_links l
-                JOIN memory_units u ON u.memory_id = l.memory_id AND u.lifecycle_status = 'active'
+                FROM domain_memory_links l
+                JOIN memories u ON u.memory_id = l.memory_id AND u.lifecycle_status = 'active'
                 JOIN memory_versions v ON v.memory_id = u.memory_id AND v.is_latest = 1
-                WHERE l.subject_id = ? AND l.unlinked_at IS NULL
+                WHERE l.domain_id = ? AND l.unlinked_at IS NULL
                 ORDER BY u.memory_id
                 """,
-                (subject_id,),
+                (domain_id,),
             ).fetchall()
             memories = tuple(
                 MemorySnapshot(
@@ -1315,12 +1309,12 @@ class Store:
                 )
                 for row in rows
             )
-            return SubjectSnapshot(
-                subject_id,
-                subject["name"],
-                subject["summary"],
-                subject["new_memory_count"],
-                subject["summary_revision"],
+            return DomainSnapshot(
+                domain_id,
+                domain["name"],
+                domain["summary"],
+                domain["new_memory_count"],
+                domain["summary_revision"],
                 memories,
             )
 
@@ -1331,7 +1325,7 @@ class Store:
         with self._connect() as connection:
             for memory_id in memory_ids:
                 owner = connection.execute(
-                    "SELECT 1 FROM memory_units WHERE memory_id = ? AND memory_space_id = ?",
+                    "SELECT 1 FROM memories WHERE memory_id = ? AND memory_space_id = ?",
                     (memory_id, memory_space_id),
                 ).fetchone()
                 if owner is None:
@@ -1340,7 +1334,7 @@ class Store:
                     """
                     SELECT ep.* FROM memory_versions v
                     JOIN memory_version_provenance p ON p.memory_version_id = v.memory_version_id
-                    JOIN situational_episodes ep ON ep.episode_id = p.episode_id
+                    JOIN episodes ep ON ep.episode_id = p.episode_id
                     WHERE v.memory_id = ? AND v.is_latest = 1
                     ORDER BY ep.source_sequence
                     """,
@@ -1379,7 +1373,7 @@ class Store:
             return frozenset()
         with self._connect() as connection:
             rows = connection.execute(
-                f"SELECT episode_id FROM situational_episodes WHERE memory_space_id = ? AND episode_id IN ({_placeholders(unique)})",
+                f"SELECT episode_id FROM episodes WHERE memory_space_id = ? AND episode_id IN ({_placeholders(unique)})",
                 (memory_space_id, *unique),
             ).fetchall()
         return frozenset(row["episode_id"] for row in rows)
@@ -1389,7 +1383,7 @@ class Store:
         *,
         add_operation_id: str,
         memory_space_id: str,
-        subject_id: str,
+        domain_id: str,
         expected_revision: int,
         updates: Sequence[PreparedMemoryUpdate],
         retirements: Sequence[str],
@@ -1400,29 +1394,29 @@ class Store:
         operation_id = str(uuid4())
         now = utc_milliseconds()
         with self._transaction() as connection:
-            subject = connection.execute(
-                "SELECT summary_revision FROM subjects WHERE subject_id = ? AND memory_space_id = ? AND lifecycle_status = 'active'",
-                (subject_id, memory_space_id),
+            domain = connection.execute(
+                "SELECT summary_revision FROM domains WHERE domain_id = ? AND memory_space_id = ? AND lifecycle_status = 'active'",
+                (domain_id, memory_space_id),
             ).fetchone()
-            if subject is None:
-                raise NotFoundError(f"active subject not found: {subject_id}")
-            if subject["summary_revision"] != expected_revision:
-                raise ConcurrentUpdateError(f"stale subject: {subject_id}")
-            current_ids = self._subject_memory_ids(connection, subject_id)
+            if domain is None:
+                raise NotFoundError(f"active domain not found: {domain_id}")
+            if domain["summary_revision"] != expected_revision:
+                raise ConcurrentUpdateError(f"stale domain: {domain_id}")
+            current_ids = self._domain_memory_ids(connection, domain_id)
             changed_ids = {update.memory_id for update in updates}
             retired_ids = set(retirements)
             if not changed_ids | retired_ids <= current_ids:
-                raise ValidationError("review references a memory outside the subject")
+                raise ValidationError("review references a memory outside the domain")
             if changed_ids & retired_ids:
                 raise ValidationError("review cannot update and retire the same memory")
             self._insert_operation(
                 connection,
                 operation_id,
                 memory_space_id,
-                "review_subject",
+                "review_domain",
                 actor,
                 config_signature,
-                "Review all active memories in one subject.",
+                "Review all active memories in one domain.",
                 now,
             )
             for update in updates:
@@ -1435,16 +1429,16 @@ class Store:
                 )
             cursor = connection.execute(
                 """
-                UPDATE subjects SET new_memory_count = 0, updated_at = ?
-                WHERE subject_id = ? AND summary_revision = ?
+                UPDATE domains SET new_memory_count = 0, updated_at = ?
+                WHERE domain_id = ? AND summary_revision = ?
                 """,
-                (now, subject_id, expected_revision),
+                (now, domain_id, expected_revision),
             )
             if cursor.rowcount != 1:
-                raise ConcurrentUpdateError(f"stale subject: {subject_id}")
-            self._effect(connection, operation_id, "subject", subject_id, "reviewed")
+                raise ConcurrentUpdateError(f"stale domain: {domain_id}")
+            self._effect(connection, operation_id, "domain", domain_id, "reviewed")
             self._insert_summary_refresh_targets(
-                connection, add_operation_id, {subject_id}
+                connection, add_operation_id, {domain_id}
             )
             self._validate_active_memory_links(connection, memory_space_id)
         return operation_id
@@ -1454,7 +1448,7 @@ class Store:
         *,
         add_operation_id: str,
         memory_space_id: str,
-        snapshot: SubjectSnapshot,
+        snapshot: DomainSnapshot,
         summary: str,
         summary_embedding: np.ndarray,
         signature_id: str,
@@ -1464,29 +1458,29 @@ class Store:
         operation_id = str(uuid4())
         now = utc_milliseconds()
         with self._transaction() as connection:
-            subject = connection.execute(
+            domain = connection.execute(
                 """
-                SELECT name, summary_revision FROM subjects
-                WHERE subject_id = ? AND memory_space_id = ?
+                SELECT name, summary_revision FROM domains
+                WHERE domain_id = ? AND memory_space_id = ?
                     AND lifecycle_status = 'active'
                 """,
-                (snapshot.subject_id, memory_space_id),
+                (snapshot.domain_id, memory_space_id),
             ).fetchone()
-            if subject is None:
-                raise NotFoundError(f"active subject not found: {snapshot.subject_id}")
-            if subject["summary_revision"] != snapshot.summary_revision:
-                raise ConcurrentUpdateError(f"stale subject: {snapshot.subject_id}")
+            if domain is None:
+                raise NotFoundError(f"active domain not found: {snapshot.domain_id}")
+            if domain["summary_revision"] != snapshot.summary_revision:
+                raise ConcurrentUpdateError(f"stale domain: {snapshot.domain_id}")
             rows = connection.execute(
                 """
                 SELECT u.memory_id, u.latest_source_at, v.content, l.link_basis
-                FROM subject_memory_links l
-                JOIN memory_units u ON u.memory_id = l.memory_id
+                FROM domain_memory_links l
+                JOIN memories u ON u.memory_id = l.memory_id
                     AND u.lifecycle_status = 'active'
                 JOIN memory_versions v ON v.memory_id = u.memory_id AND v.is_latest = 1
-                WHERE l.subject_id = ? AND l.unlinked_at IS NULL
+                WHERE l.domain_id = ? AND l.unlinked_at IS NULL
                 ORDER BY u.memory_id
                 """,
-                (snapshot.subject_id,),
+                (snapshot.domain_id,),
             ).fetchall()
             current_memories = tuple(
                 (
@@ -1506,35 +1500,32 @@ class Store:
                 )
                 for memory in snapshot.memories
             )
-            if (
-                subject["name"] != snapshot.name
-                or current_memories != supplied_memories
-            ):
+            if domain["name"] != snapshot.name or current_memories != supplied_memories:
                 raise ConcurrentUpdateError(
-                    f"subject evidence changed: {snapshot.subject_id}"
+                    f"domain evidence changed: {snapshot.domain_id}"
                 )
             self._insert_operation(
                 connection,
                 operation_id,
                 memory_space_id,
-                "refresh_subject_summary",
+                "refresh_domain_summary",
                 actor,
                 config_signature,
-                "Rewrite a linked subject summary from all active memories.",
+                "Rewrite a linked domain summary from all active memories.",
                 now,
             )
             connection.execute(
                 """
-                UPDATE subjects SET summary = ?, summary_revision = summary_revision + 1,
-                    updated_at = ? WHERE subject_id = ?
+                UPDATE domains SET summary = ?, summary_revision = summary_revision + 1,
+                    updated_at = ? WHERE domain_id = ?
                 """,
-                (summary, now, snapshot.subject_id),
+                (summary, now, snapshot.domain_id),
             )
-            self._upsert_subject_embedding(
+            self._upsert_domain_embedding(
                 connection,
-                snapshot.subject_id,
+                snapshot.domain_id,
                 "name_summary",
-                _subject_embedding_text(snapshot.name, summary),
+                _domain_embedding_text(snapshot.name, summary),
                 summary_embedding,
                 signature_id,
                 now,
@@ -1542,22 +1533,22 @@ class Store:
             self._effect(
                 connection,
                 operation_id,
-                "subject",
-                snapshot.subject_id,
+                "domain",
+                snapshot.domain_id,
                 "summary_refreshed",
             )
             cursor = connection.execute(
                 """
                 UPDATE episode_summary_refresh_targets
                 SET completed_by_operation_id = ?
-                WHERE add_operation_id = ? AND subject_id = ?
+                WHERE add_operation_id = ? AND domain_id = ?
                     AND completed_by_operation_id IS NULL
                 """,
-                (operation_id, add_operation_id, snapshot.subject_id),
+                (operation_id, add_operation_id, snapshot.domain_id),
             )
             if cursor.rowcount != 1:
                 raise ConcurrentUpdateError(
-                    f"summary refresh target is no longer pending: {snapshot.subject_id}"
+                    f"summary refresh target is no longer pending: {snapshot.domain_id}"
                 )
         return operation_id
 
@@ -1572,7 +1563,7 @@ class Store:
     ) -> None:
         current = connection.execute(
             """
-            SELECT v.memory_version_id, v.version_no, v.content FROM memory_units u
+            SELECT v.memory_version_id, v.version_no, v.content FROM memories u
             JOIN memory_versions v ON v.memory_id = u.memory_id AND v.is_latest = 1
             WHERE u.memory_id = ? AND u.memory_space_id = ? AND u.lifecycle_status = 'active'
             """,
@@ -1585,7 +1576,7 @@ class Store:
         ):
             raise ValidationError("memory provenance contains duplicate episodes")
         episode_rows = connection.execute(
-            f"SELECT episode_id, source_started_at, source_ended_at FROM situational_episodes WHERE memory_space_id = ? AND episode_id IN ({_placeholders(update.provenance_episode_ids)})",
+            f"SELECT episode_id, source_started_at, source_ended_at FROM episodes WHERE memory_space_id = ? AND episode_id IN ({_placeholders(update.provenance_episode_ids)})",
             (memory_space_id, *update.provenance_episode_ids),
         ).fetchall()
         if len(episode_rows) != len(update.provenance_episode_ids):
@@ -1617,9 +1608,9 @@ class Store:
                 "INSERT INTO memory_version_provenance(memory_version_id, episode_id) VALUES (?, ?)",
                 (update.memory_version_id, episode_id),
             )
-        latest_source_at = _latest_source_anchor(episode_rows)
+        latest_source_at = _latest_source_time(episode_rows)
         connection.execute(
-            "UPDATE memory_units SET latest_source_at = ?, updated_at = ? WHERE memory_id = ?",
+            "UPDATE memories SET latest_source_at = ?, updated_at = ? WHERE memory_id = ?",
             (latest_source_at, now, update.memory_id),
         )
         self._insert_memory_embedding(connection, update, signature_id, now)
@@ -1642,7 +1633,7 @@ class Store:
     ) -> None:
         cursor = connection.execute(
             """
-            UPDATE memory_units SET lifecycle_status = 'retired', retired_at = ?,
+            UPDATE memories SET lifecycle_status = 'retired', retired_at = ?,
                 retired_by_operation_id = ?, updated_at = ?
             WHERE memory_id = ? AND memory_space_id = ? AND lifecycle_status = 'active'
             """,
@@ -1652,7 +1643,7 @@ class Store:
             raise NotFoundError(f"active memory not found: {memory_id}")
         connection.execute(
             """
-            UPDATE subject_memory_links SET unlinked_at = ?, closed_by_operation_id = ?
+            UPDATE domain_memory_links SET unlinked_at = ?, closed_by_operation_id = ?
             WHERE memory_id = ? AND unlinked_at IS NULL
             """,
             (now, operation_id, memory_id),
@@ -1668,9 +1659,9 @@ class Store:
         *,
         add_operation_id: str,
         memory_space_id: str,
-        original: SubjectSnapshot,
+        original: DomainSnapshot,
         result: Literal["full_split", "partial_split"],
-        new_subjects: Sequence[PreparedSplitSubject],
+        new_domains: Sequence[PreparedSplitDomain],
         signature_id: str,
         actor: str,
         config_signature: str,
@@ -1679,91 +1670,91 @@ class Store:
         now = utc_milliseconds()
         with self._transaction() as connection:
             row = connection.execute(
-                "SELECT name, summary_revision FROM subjects WHERE subject_id = ? AND memory_space_id = ? AND lifecycle_status = 'active'",
-                (original.subject_id, memory_space_id),
+                "SELECT name, summary_revision FROM domains WHERE domain_id = ? AND memory_space_id = ? AND lifecycle_status = 'active'",
+                (original.domain_id, memory_space_id),
             ).fetchone()
             if row is None:
-                raise NotFoundError(f"active subject not found: {original.subject_id}")
+                raise NotFoundError(f"active domain not found: {original.domain_id}")
             if row["summary_revision"] != original.summary_revision:
-                raise ConcurrentUpdateError(f"stale subject: {original.subject_id}")
-            current_ids = self._subject_memory_ids(connection, original.subject_id)
+                raise ConcurrentUpdateError(f"stale domain: {original.domain_id}")
+            current_ids = self._domain_memory_ids(connection, original.domain_id)
             input_ids = {memory.memory_id for memory in original.memories}
             if current_ids != input_ids:
                 raise ConcurrentUpdateError(
-                    f"subject membership changed: {original.subject_id}"
+                    f"domain membership changed: {original.domain_id}"
                 )
             self._insert_operation(
                 connection,
                 operation_id,
                 memory_space_id,
-                "split_subject",
+                "split_domain",
                 actor,
                 config_signature,
-                f"Apply {result} to an over-capacity subject.",
+                f"Apply {result} to an over-capacity domain.",
                 now,
             )
             moved_ids = {
-                link.memory_id for prepared in new_subjects for link in prepared.links
+                link.memory_id for prepared in new_domains for link in prepared.links
             }
             if result == "full_split":
                 close_ids = current_ids
                 connection.execute(
                     """
                     DELETE FROM episode_summary_refresh_targets
-                    WHERE add_operation_id = ? AND subject_id = ?
+                    WHERE add_operation_id = ? AND domain_id = ?
                     """,
-                    (add_operation_id, original.subject_id),
+                    (add_operation_id, original.domain_id),
                 )
                 connection.execute(
                     """
-                    UPDATE subjects SET lifecycle_status = 'retired', new_memory_count = 0, retired_at = ?,
+                    UPDATE domains SET lifecycle_status = 'retired', new_memory_count = 0, retired_at = ?,
                         retired_by_operation_id = ?, updated_at = ?
-                    WHERE subject_id = ?
+                    WHERE domain_id = ?
                     """,
-                    (now, operation_id, now, original.subject_id),
+                    (now, operation_id, now, original.domain_id),
                 )
                 self._effect(
-                    connection, operation_id, "subject", original.subject_id, "retired"
+                    connection, operation_id, "domain", original.domain_id, "retired"
                 )
             else:
                 close_ids = moved_ids
                 connection.execute(
                     """
-                    UPDATE subjects SET new_memory_count = 0, updated_at = ?
-                    WHERE subject_id = ?
+                    UPDATE domains SET new_memory_count = 0, updated_at = ?
+                    WHERE domain_id = ?
                     """,
-                    (now, original.subject_id),
+                    (now, original.domain_id),
                 )
                 self._effect(
                     connection,
                     operation_id,
-                    "subject",
-                    original.subject_id,
+                    "domain",
+                    original.domain_id,
                     "split_retained",
                 )
             if close_ids:
                 connection.execute(
                     f"""
-                    UPDATE subject_memory_links SET unlinked_at = ?, closed_by_operation_id = ?
-                    WHERE subject_id = ? AND unlinked_at IS NULL
+                    UPDATE domain_memory_links SET unlinked_at = ?, closed_by_operation_id = ?
+                    WHERE domain_id = ? AND unlinked_at IS NULL
                         AND memory_id IN ({_placeholders(tuple(close_ids))})
                     """,
-                    (now, operation_id, original.subject_id, *close_ids),
+                    (now, operation_id, original.domain_id, *close_ids),
                 )
-            for prepared in new_subjects:
-                target_id = prepared.subject.subject_id
+            for prepared in new_domains:
+                target_id = prepared.domain.domain_id
                 if prepared.expected_revision is None:
-                    self._insert_subject(
+                    self._insert_domain(
                         connection,
                         memory_space_id,
-                        prepared.subject,
+                        prepared.domain,
                         operation_id,
                         signature_id,
                         now,
                     )
                 else:
                     target = connection.execute(
-                        "SELECT summary_revision FROM subjects WHERE subject_id=? AND memory_space_id=?",
+                        "SELECT summary_revision FROM domains WHERE domain_id=? AND memory_space_id=?",
                         (target_id, memory_space_id),
                     ).fetchone()
                     if (
@@ -1771,16 +1762,16 @@ class Store:
                         or target["summary_revision"] != prepared.expected_revision
                     ):
                         raise ConcurrentUpdateError(f"stale split target: {target_id}")
-                    self._reactivate_subject(connection, target_id, operation_id, now)
+                    self._reactivate_domain(connection, target_id, operation_id, now)
                 connection.execute(
-                    """INSERT OR IGNORE INTO anchor_subjects(anchor_id, subject_id)
-                    SELECT anchor_id, ? FROM anchor_subjects WHERE subject_id=?""",
-                    (target_id, original.subject_id),
+                    """INSERT OR IGNORE INTO entity_domains(entity_id, domain_id)
+                    SELECT entity_id, ? FROM entity_domains WHERE domain_id=?""",
+                    (target_id, original.domain_id),
                 )
                 added = 0
                 for link in prepared.links:
                     existing = connection.execute(
-                        "SELECT link_id, link_basis FROM subject_memory_links WHERE subject_id=? AND memory_id=? AND unlinked_at IS NULL",
+                        "SELECT link_id, link_basis FROM domain_memory_links WHERE domain_id=? AND memory_id=? AND unlinked_at IS NULL",
                         (target_id, link.memory_id),
                     ).fetchone()
                     if existing is None:
@@ -1791,22 +1782,22 @@ class Store:
                         and link.basis == "direct"
                     ):
                         connection.execute(
-                            "UPDATE subject_memory_links SET unlinked_at=?, closed_by_operation_id=? WHERE link_id=?",
+                            "UPDATE domain_memory_links SET unlinked_at=?, closed_by_operation_id=? WHERE link_id=?",
                             (now, operation_id, existing["link_id"]),
                         )
                         self._insert_link(connection, link, operation_id, now)
                 if prepared.expected_revision is not None:
                     connection.execute(
-                        "UPDATE subjects SET new_memory_count=new_memory_count+?, updated_at=? WHERE subject_id=?",
+                        "UPDATE domains SET new_memory_count=new_memory_count+?, updated_at=? WHERE domain_id=?",
                         (added, now, target_id),
                     )
                     self._effect(
-                        connection, operation_id, "subject", target_id, "split_reused"
+                        connection, operation_id, "domain", target_id, "split_reused"
                     )
             self._insert_summary_refresh_targets(
                 connection,
                 add_operation_id,
-                {prepared.subject.subject_id for prepared in new_subjects},
+                {prepared.domain.domain_id for prepared in new_domains},
             )
             self._validate_active_memory_links(connection, memory_space_id)
         return operation_id
@@ -1815,7 +1806,7 @@ class Store:
         self,
         *,
         memory_space_id: str,
-        subject_id: str,
+        domain_id: str,
         expected_revision: int,
         reason: str,
         actor: str,
@@ -1824,36 +1815,36 @@ class Store:
         operation_id = str(uuid4())
         with self._transaction() as connection:
             row = connection.execute(
-                "SELECT summary_revision FROM subjects WHERE subject_id = ? AND memory_space_id = ? AND lifecycle_status = 'active'",
-                (subject_id, memory_space_id),
+                "SELECT summary_revision FROM domains WHERE domain_id = ? AND memory_space_id = ? AND lifecycle_status = 'active'",
+                (domain_id, memory_space_id),
             ).fetchone()
             if row is None:
-                raise NotFoundError(f"active subject not found: {subject_id}")
+                raise NotFoundError(f"active domain not found: {domain_id}")
             if row["summary_revision"] != expected_revision:
-                raise ConcurrentUpdateError(f"stale subject: {subject_id}")
+                raise ConcurrentUpdateError(f"stale domain: {domain_id}")
             self._insert_operation(
                 connection,
                 operation_id,
                 memory_space_id,
-                "split_subject",
+                "split_domain",
                 actor,
                 config_signature,
                 reason,
                 utc_milliseconds(),
             )
             self._effect(
-                connection, operation_id, "subject", subject_id, "split_deferred"
+                connection, operation_id, "domain", domain_id, "split_deferred"
             )
         return operation_id
 
     def public_search(
         self, memory_space_id: str, query: str, query_vector: np.ndarray
     ) -> SearchResult:
-        subject_hits = self._scan_subjects(
+        domain_hits = self._scan_domains(
             memory_space_id,
             query_vector,
-            self.config.search_subject_top_k,
-            self.config.search_subject_min_similarity,
+            self.config.search_domain_top_k,
+            self.config.search_domain_min_similarity,
             public=True,
         )
         memory_hits = self._scan_memories(
@@ -1864,42 +1855,42 @@ class Store:
         )
         with self._connect() as connection:
             signature_id = self._active_signature(connection, memory_space_id)
-            subject_refs: list[tuple[str, float, tuple[str, ...]]] = []
+            domain_refs: list[tuple[str, float, tuple[str, ...]]] = []
             memory_refs: list[tuple[str, float, tuple[str, ...]]] = []
-            subject_similarities = dict(subject_hits)
+            domain_similarities = dict(domain_hits)
             memory_similarities = dict(memory_hits)
-            direct_subject_ids = tuple(item[0] for item in subject_hits)
-            subject_order = list(direct_subject_ids)
+            direct_domain_ids = tuple(item[0] for item in domain_hits)
+            domain_order = list(direct_domain_ids)
             memory_order = [item[0] for item in memory_hits]
-            for subject_id, similarity in subject_hits:
+            for domain_id, similarity in domain_hits:
                 rows = connection.execute(
                     """
-                    SELECT u.memory_id, e.vector FROM subject_memory_links l
-                    JOIN memory_units u ON u.memory_id = l.memory_id AND u.lifecycle_status = 'active'
+                    SELECT u.memory_id, e.vector FROM domain_memory_links l
+                    JOIN memories u ON u.memory_id = l.memory_id AND u.lifecycle_status = 'active'
                     JOIN memory_versions v ON v.memory_id = u.memory_id AND v.is_latest = 1
                     JOIN memory_embeddings e ON e.memory_version_id = v.memory_version_id AND e.model_signature_id = ?
-                    WHERE l.subject_id = ? AND l.unlinked_at IS NULL
+                    WHERE l.domain_id = ? AND l.unlinked_at IS NULL
                     """,
-                    (signature_id, subject_id),
+                    (signature_id, domain_id),
                 ).fetchall()
                 attached_hits = _top_embedded_items(
                     rows,
                     query_vector,
                     "memory_id",
-                    self.config.search_subject_attached_memory_k,
+                    self.config.search_domain_attached_memory_k,
                 )
                 attached = tuple(item[0] for item in attached_hits)
                 memory_similarities.update(attached_hits)
                 for memory_id in attached:
                     if memory_id not in memory_order:
                         memory_order.append(memory_id)
-                subject_refs.append((subject_id, similarity, attached))
+                domain_refs.append((domain_id, similarity, attached))
             for memory_id, similarity in memory_hits:
                 rows = connection.execute(
                     """
-                    SELECT s.subject_id, e.vector FROM subject_memory_links l
-                    JOIN subjects s ON s.subject_id = l.subject_id AND s.lifecycle_status = 'active'
-                    JOIN subject_embeddings e ON e.subject_id = s.subject_id
+                    SELECT s.domain_id, e.vector FROM domain_memory_links l
+                    JOIN domains s ON s.domain_id = l.domain_id AND s.lifecycle_status = 'active'
+                    JOIN domain_embeddings e ON e.domain_id = s.domain_id
                         AND e.embedding_kind = 'name' AND e.model_signature_id = ?
                     WHERE l.memory_id = ? AND l.unlinked_at IS NULL
                     """,
@@ -1908,49 +1899,49 @@ class Store:
                 attached_hits = _top_embedded_items(
                     rows,
                     query_vector,
-                    "subject_id",
-                    self.config.search_memory_attached_subject_k,
+                    "domain_id",
+                    self.config.search_memory_attached_domain_k,
                 )
                 attached = tuple(item[0] for item in attached_hits)
-                subject_similarities.update(attached_hits)
-                for subject_id in attached:
-                    if subject_id not in subject_order:
-                        subject_order.append(subject_id)
+                domain_similarities.update(attached_hits)
+                for domain_id in attached:
+                    if domain_id not in domain_order:
+                        domain_order.append(domain_id)
                 memory_refs.append((memory_id, similarity, attached))
-            subject_ids = set(subject_order)
+            domain_ids = set(domain_order)
             memory_ids = set(memory_order)
-            subjects = self._load_search_subjects(
+            domains = self._load_search_domains(
                 connection,
-                subject_order,
-                set(direct_subject_ids),
-                subject_similarities,
+                domain_order,
+                set(direct_domain_ids),
+                domain_similarities,
             )
             memories = self._load_search_memories(
                 connection, memory_order, memory_similarities
             )
-            links = self._load_search_links(connection, subject_ids, memory_ids)
-        from fluxfold.models import RankedMemoryRef, RankedSubjectRef
+            links = self._load_search_links(connection, domain_ids, memory_ids)
+        from fluxfold.models import RankedDomainRef, RankedMemoryRef
 
         return SearchResult(
             query,
-            subjects,
+            domains,
             memories,
             links,
-            tuple(RankedSubjectRef(*item) for item in subject_refs),
+            tuple(RankedDomainRef(*item) for item in domain_refs),
             tuple(RankedMemoryRef(*item) for item in memory_refs),
         )
 
-    def active_subject_ids(self, memory_space_id: str) -> tuple[str, ...]:
+    def active_domain_ids(self, memory_space_id: str) -> tuple[str, ...]:
         with self._connect() as connection:
             return tuple(
                 row[0]
                 for row in connection.execute(
-                    "SELECT subject_id FROM subjects WHERE memory_space_id = ? AND lifecycle_status = 'active' ORDER BY subject_id",
+                    "SELECT domain_id FROM domains WHERE memory_space_id = ? AND lifecycle_status = 'active' ORDER BY domain_id",
                     (memory_space_id,),
                 )
             )
 
-    def operation_active_subject_ids(
+    def operation_active_domain_ids(
         self, memory_space_id: str, operation_id: str | None
     ) -> tuple[str, ...]:
         if operation_id is None:
@@ -1960,18 +1951,18 @@ class Store:
                 row[0]
                 for row in connection.execute(
                     """
-                    SELECT DISTINCT l.subject_id FROM subject_memory_links l
-                    JOIN subjects s ON s.subject_id = l.subject_id
+                    SELECT DISTINCT l.domain_id FROM domain_memory_links l
+                    JOIN domains s ON s.domain_id = l.domain_id
                         AND s.lifecycle_status = 'active'
                     WHERE s.memory_space_id = ? AND l.opened_by_operation_id = ?
                         AND l.unlinked_at IS NULL
-                    ORDER BY l.subject_id
+                    ORDER BY l.domain_id
                     """,
                     (memory_space_id, operation_id),
                 )
             )
 
-    def pending_summary_refresh_subject_ids(
+    def pending_summary_refresh_domain_ids(
         self, memory_space_id: str, add_operation_id: str | None
     ) -> tuple[str, ...]:
         if add_operation_id is None:
@@ -1981,12 +1972,12 @@ class Store:
                 row[0]
                 for row in connection.execute(
                     """
-                    SELECT t.subject_id FROM episode_summary_refresh_targets t
-                    JOIN subjects s ON s.subject_id = t.subject_id
+                    SELECT t.domain_id FROM episode_summary_refresh_targets t
+                    JOIN domains s ON s.domain_id = t.domain_id
                         AND s.lifecycle_status = 'active'
                     WHERE t.add_operation_id = ? AND s.memory_space_id = ?
                         AND t.completed_by_operation_id IS NULL
-                    ORDER BY t.subject_id
+                    ORDER BY t.domain_id
                     """,
                     (add_operation_id, memory_space_id),
                 )
@@ -1998,40 +1989,40 @@ class Store:
                 """
                 SELECT
                     ms.space_key AS space_key,
-                    s.subject_id AS subject_id,
+                    s.domain_id AS domain_id,
                     s.name AS name,
                     s.summary AS summary,
                     u.memory_id AS memory_id,
                     v.content AS content
                 FROM memory_spaces ms
-                LEFT JOIN subjects s
+                LEFT JOIN domains s
                     ON s.memory_space_id = ms.memory_space_id
                     AND s.lifecycle_status = 'active'
-                LEFT JOIN subject_memory_links l
-                    ON l.subject_id = s.subject_id AND l.unlinked_at IS NULL
-                LEFT JOIN memory_units u
+                LEFT JOIN domain_memory_links l
+                    ON l.domain_id = s.domain_id AND l.unlinked_at IS NULL
+                LEFT JOIN memories u
                     ON u.memory_id = l.memory_id AND u.lifecycle_status = 'active'
                 LEFT JOIN memory_versions v
                     ON v.memory_id = u.memory_id AND v.is_latest = 1
-                ORDER BY ms.space_key, s.name, s.subject_id, u.memory_id
+                ORDER BY ms.space_key, s.name, s.domain_id, u.memory_id
                 """
             ).fetchall()
-        spaces: dict[str, dict[str, MemoryBankSubject]] = {}
-        subject_order: dict[str, list[str]] = {}
+        spaces: dict[str, dict[str, MemoryBankDomain]] = {}
+        domain_order: dict[str, list[str]] = {}
         for row in rows:
             space_key = str(row["space_key"])
             spaces.setdefault(space_key, {})
-            subject_order.setdefault(space_key, [])
-            subject_id = row["subject_id"]
-            if subject_id is None:
+            domain_order.setdefault(space_key, [])
+            domain_id = row["domain_id"]
+            if domain_id is None:
                 continue
-            current = spaces[space_key].get(subject_id)
+            current = spaces[space_key].get(domain_id)
             if current is None:
-                current = MemoryBankSubject(row["name"], row["summary"], ())
-                spaces[space_key][subject_id] = current
-                subject_order[space_key].append(subject_id)
+                current = MemoryBankDomain(row["name"], row["summary"], ())
+                spaces[space_key][domain_id] = current
+                domain_order[space_key].append(domain_id)
             if row["memory_id"] is not None:
-                spaces[space_key][subject_id] = MemoryBankSubject(
+                spaces[space_key][domain_id] = MemoryBankDomain(
                     current.name,
                     current.summary,
                     (*current.memory_contents, row["content"]),
@@ -2039,64 +2030,64 @@ class Store:
         return tuple(
             MemoryBankSpace(
                 space_key,
-                tuple(spaces[space_key][subject_id] for subject_id in subject_ids),
+                tuple(spaces[space_key][domain_id] for domain_id in domain_ids),
             )
-            for space_key, subject_ids in subject_order.items()
+            for space_key, domain_ids in domain_order.items()
         )
 
     def space_statistics(self, memory_space_id: str) -> dict[str, Any]:
         with self._connect() as connection:
             source_chars = connection.execute(
-                "SELECT coalesce(sum(source_chars), 0) FROM situational_episodes WHERE memory_space_id = ?",
+                "SELECT coalesce(sum(source_chars), 0) FROM episodes WHERE memory_space_id = ?",
                 (memory_space_id,),
             ).fetchone()[0]
             episode_count = connection.execute(
-                "SELECT count(*) FROM situational_episodes WHERE memory_space_id = ?",
+                "SELECT count(*) FROM episodes WHERE memory_space_id = ?",
                 (memory_space_id,),
             ).fetchone()[0]
             memory_content_chars = connection.execute(
                 """
-                SELECT coalesce(sum(v.char_count), 0) FROM memory_units u
+                SELECT coalesce(sum(v.char_count), 0) FROM memories u
                 JOIN memory_versions v ON v.memory_id = u.memory_id AND v.is_latest = 1
                 WHERE u.memory_space_id = ? AND u.lifecycle_status = 'active'
                 """,
                 (memory_space_id,),
             ).fetchone()[0]
             summary_chars = connection.execute(
-                "SELECT coalesce(sum(length(summary)), 0) FROM subjects WHERE memory_space_id = ? AND lifecycle_status = 'active'",
+                "SELECT coalesce(sum(length(summary)), 0) FROM domains WHERE memory_space_id = ? AND lifecycle_status = 'active'",
                 (memory_space_id,),
             ).fetchone()[0]
             active_memories = connection.execute(
-                "SELECT count(*) FROM memory_units WHERE memory_space_id = ? AND lifecycle_status = 'active'",
+                "SELECT count(*) FROM memories WHERE memory_space_id = ? AND lifecycle_status = 'active'",
                 (memory_space_id,),
             ).fetchone()[0]
             retired_memories = connection.execute(
-                "SELECT count(*) FROM memory_units WHERE memory_space_id = ? AND lifecycle_status = 'retired'",
+                "SELECT count(*) FROM memories WHERE memory_space_id = ? AND lifecycle_status = 'retired'",
                 (memory_space_id,),
             ).fetchone()[0]
-            active_subjects = connection.execute(
-                "SELECT count(*) FROM subjects WHERE memory_space_id = ? AND lifecycle_status = 'active'",
+            active_domains = connection.execute(
+                "SELECT count(*) FROM domains WHERE memory_space_id = ? AND lifecycle_status = 'active'",
                 (memory_space_id,),
             ).fetchone()[0]
-            retired_subjects = connection.execute(
-                "SELECT count(*) FROM subjects WHERE memory_space_id = ? AND lifecycle_status = 'retired'",
+            retired_domains = connection.execute(
+                "SELECT count(*) FROM domains WHERE memory_space_id = ? AND lifecycle_status = 'retired'",
                 (memory_space_id,),
             ).fetchone()[0]
             review_count = connection.execute(
-                "SELECT count(*) FROM domain_operations WHERE memory_space_id = ? AND operation_type = 'review_subject'",
+                "SELECT count(*) FROM memory_operations WHERE memory_space_id = ? AND operation_type = 'review_domain'",
                 (memory_space_id,),
             ).fetchone()[0]
             split_count = connection.execute(
-                "SELECT count(*) FROM domain_operations WHERE memory_space_id = ? AND operation_type = 'split_subject'",
+                "SELECT count(*) FROM memory_operations WHERE memory_space_id = ? AND operation_type = 'split_domain'",
                 (memory_space_id,),
             ).fetchone()[0]
             refresh_count = connection.execute(
-                "SELECT count(*) FROM domain_operations WHERE memory_space_id = ? AND operation_type = 'refresh_subject_summary'",
+                "SELECT count(*) FROM memory_operations WHERE memory_space_id = ? AND operation_type = 'refresh_domain_summary'",
                 (memory_space_id,),
             ).fetchone()[0]
             rewritten_memories = connection.execute(
                 """
-                SELECT count(*) FROM memory_units u
+                SELECT count(*) FROM memories u
                 JOIN memory_versions v ON v.memory_id = u.memory_id AND v.is_latest = 1
                 WHERE u.memory_space_id = ? AND u.lifecycle_status = 'active'
                     AND v.version_no > 1
@@ -2108,11 +2099,11 @@ class Store:
                 SELECT
                     coalesce(sum(l.link_basis = 'direct'), 0) AS direct_links,
                     coalesce(sum(l.link_basis = 'contextual'), 0) AS contextual_links
-                FROM memory_units u
-                LEFT JOIN subject_memory_links l
+                FROM memories u
+                LEFT JOIN domain_memory_links l
                     ON l.memory_id = u.memory_id AND l.unlinked_at IS NULL
-                LEFT JOIN subjects s
-                    ON s.subject_id = l.subject_id AND s.lifecycle_status = 'active'
+                LEFT JOIN domains s
+                    ON s.domain_id = l.domain_id AND s.lifecycle_status = 'active'
                 WHERE u.memory_space_id = ? AND u.lifecycle_status = 'active'
                 GROUP BY u.memory_id
                 """,
@@ -2122,7 +2113,7 @@ class Store:
                 """
                 SELECT coalesce(max(n), 0) FROM (
                     SELECT count(p.episode_id) AS n
-                    FROM memory_units u
+                    FROM memories u
                     JOIN memory_versions v
                         ON v.memory_id = u.memory_id AND v.is_latest = 1
                     LEFT JOIN memory_version_provenance p
@@ -2133,20 +2124,20 @@ class Store:
                 """,
                 (memory_space_id,),
             ).fetchone()[0]
-            subject_rows = connection.execute(
+            domain_rows = connection.execute(
                 """
                 SELECT
                     s.name AS name,
                     coalesce(sum(l.link_basis = 'direct'), 0) AS direct_links,
                     coalesce(sum(l.link_basis = 'contextual'), 0) AS contextual_links
-                FROM subjects s
-                LEFT JOIN subject_memory_links l
-                    ON l.subject_id = s.subject_id AND l.unlinked_at IS NULL
-                LEFT JOIN memory_units u
+                FROM domains s
+                LEFT JOIN domain_memory_links l
+                    ON l.domain_id = s.domain_id AND l.unlinked_at IS NULL
+                LEFT JOIN memories u
                     ON u.memory_id = l.memory_id AND u.lifecycle_status = 'active'
                 WHERE s.memory_space_id = ? AND s.lifecycle_status = 'active'
-                GROUP BY s.subject_id, s.name
-                ORDER BY s.name, s.subject_id
+                GROUP BY s.domain_id, s.name
+                ORDER BY s.name, s.domain_id
                 """,
                 (memory_space_id,),
             ).fetchall()
@@ -2155,15 +2146,15 @@ class Store:
         link_counts = [
             row["direct_links"] + row["contextual_links"] for row in memory_link_rows
         ]
-        memories_per_subject = [
-            row["direct_links"] + row["contextual_links"] for row in subject_rows
+        memories_per_domain = [
+            row["direct_links"] + row["contextual_links"] for row in domain_rows
         ]
         return {
             "source_chars": source_chars,
             "memory_chars": memory_chars,
             "memory_compression_rate": rate,
             "active_memories": active_memories,
-            "active_subjects": active_subjects,
+            "active_domains": active_domains,
             "episode_count": episode_count,
             "direct_links": sum(row["direct_links"] for row in memory_link_rows),
             "contextual_links": sum(
@@ -2179,52 +2170,52 @@ class Store:
             "mean_links_per_memory": (
                 0.0 if not link_counts else sum(link_counts) / len(link_counts)
             ),
-            "max_memories_per_subject": max(memories_per_subject, default=0),
-            "mean_memories_per_subject": (
+            "max_memories_per_domain": max(memories_per_domain, default=0),
+            "mean_memories_per_domain": (
                 0.0
-                if not memories_per_subject
-                else sum(memories_per_subject) / len(memories_per_subject)
+                if not memories_per_domain
+                else sum(memories_per_domain) / len(memories_per_domain)
             ),
             "max_provenance_per_memory": max_provenance_per_memory,
             "retired_memories": retired_memories,
-            "retired_subjects": retired_subjects,
+            "retired_domains": retired_domains,
             "rewritten_memories": rewritten_memories,
-            "subject_review_count": review_count,
-            "subject_split_count": split_count,
-            "subject_summary_refresh_count": refresh_count,
-            "subjects": [
+            "domain_review_count": review_count,
+            "domain_split_count": split_count,
+            "domain_summary_refresh_count": refresh_count,
+            "domains": [
                 {
                     "name": row["name"],
                     "direct_links": row["direct_links"],
                     "contextual_links": row["contextual_links"],
                 }
-                for row in subject_rows
+                for row in domain_rows
             ],
         }
 
-    def _load_search_subjects(
+    def _load_search_domains(
         self,
         connection: sqlite3.Connection,
         ids: Sequence[str],
         summary_ids: set[str],
         similarities: dict[str, float],
-    ) -> tuple[SearchSubject, ...]:
+    ) -> tuple[SearchDomain, ...]:
         if not ids:
             return ()
         stable_ids = tuple(ids)
         rows = connection.execute(
-            f"SELECT subject_id, name, summary FROM subjects WHERE subject_id IN ({_placeholders(stable_ids)})",
+            f"SELECT domain_id, name, summary FROM domains WHERE domain_id IN ({_placeholders(stable_ids)})",
             stable_ids,
         ).fetchall()
-        by_id = {row["subject_id"]: row for row in rows}
+        by_id = {row["domain_id"]: row for row in rows}
         return tuple(
-            SearchSubject(
-                subject_id,
-                by_id[subject_id]["name"],
-                by_id[subject_id]["summary"] if subject_id in summary_ids else None,
-                similarities[subject_id],
+            SearchDomain(
+                domain_id,
+                by_id[domain_id]["name"],
+                by_id[domain_id]["summary"] if domain_id in summary_ids else None,
+                similarities[domain_id],
             )
-            for subject_id in stable_ids
+            for domain_id in stable_ids
         )
 
     def _load_search_memories(
@@ -2238,7 +2229,7 @@ class Store:
         stable_ids = tuple(ids)
         rows = connection.execute(
             f"""
-            SELECT u.memory_id, u.latest_source_at, v.content FROM memory_units u
+            SELECT u.memory_id, u.latest_source_at, v.content FROM memories u
             JOIN memory_versions v ON v.memory_id = u.memory_id AND v.is_latest = 1
             WHERE u.memory_id IN ({_placeholders(stable_ids)})
             """,
@@ -2258,25 +2249,25 @@ class Store:
     def _load_search_links(
         self,
         connection: sqlite3.Connection,
-        subject_ids: set[str],
+        domain_ids: set[str],
         memory_ids: set[str],
     ) -> tuple[SearchLink, ...]:
-        if not subject_ids or not memory_ids:
+        if not domain_ids or not memory_ids:
             return ()
-        stable_subject_ids = tuple(sorted(subject_ids))
+        stable_domain_ids = tuple(sorted(domain_ids))
         stable_memory_ids = tuple(sorted(memory_ids))
         rows = connection.execute(
             f"""
-            SELECT subject_id, memory_id, link_basis FROM subject_memory_links
+            SELECT domain_id, memory_id, link_basis FROM domain_memory_links
             WHERE unlinked_at IS NULL
-                AND subject_id IN ({_placeholders(stable_subject_ids)})
+                AND domain_id IN ({_placeholders(stable_domain_ids)})
                 AND memory_id IN ({_placeholders(stable_memory_ids)})
-            ORDER BY subject_id, memory_id
+            ORDER BY domain_id, memory_id
             """,
-            (*stable_subject_ids, *stable_memory_ids),
+            (*stable_domain_ids, *stable_memory_ids),
         ).fetchall()
         return tuple(
-            SearchLink(row["subject_id"], row["memory_id"], row["link_basis"])
+            SearchLink(row["domain_id"], row["memory_id"], row["link_basis"])
             for row in rows
         )
 
@@ -2308,28 +2299,28 @@ class Store:
             )
         )
 
-    def _subject_memory_ids(
-        self, connection: sqlite3.Connection, subject_id: str
+    def _domain_memory_ids(
+        self, connection: sqlite3.Connection, domain_id: str
     ) -> set[str]:
         return {
             row[0]
             for row in connection.execute(
                 """
-                SELECT l.memory_id FROM subject_memory_links l
-                JOIN memory_units u ON u.memory_id = l.memory_id AND u.lifecycle_status = 'active'
-                WHERE l.subject_id = ? AND l.unlinked_at IS NULL
+                SELECT l.memory_id FROM domain_memory_links l
+                JOIN memories u ON u.memory_id = l.memory_id AND u.lifecycle_status = 'active'
+                WHERE l.domain_id = ? AND l.unlinked_at IS NULL
                 """,
-                (subject_id,),
+                (domain_id,),
             )
         }
 
     def memory_link_limit(self, memory_id: str) -> int:
         with self._connect() as connection:
-            anchor_count = connection.execute(
-                "SELECT count(*) FROM memory_anchors WHERE memory_id=?",
+            entity_count = connection.execute(
+                "SELECT count(*) FROM memory_entities WHERE memory_id=?",
                 (memory_id,),
             ).fetchone()[0]
-        return max(self.config.memory_active_subject_link_max, int(anchor_count))
+        return max(self.config.memory_active_domain_link_max, int(entity_count))
 
     def _validate_active_memory_links(
         self, connection: sqlite3.Connection, memory_space_id: str
@@ -2339,15 +2330,15 @@ class Store:
             SELECT u.memory_id,
                 sum(CASE WHEN l.unlinked_at IS NULL THEN 1 ELSE 0 END) AS active_links,
                 sum(CASE WHEN l.unlinked_at IS NULL AND l.link_basis = 'direct' THEN 1 ELSE 0 END) AS direct_links
-            FROM memory_units u
-            LEFT JOIN subject_memory_links l ON l.memory_id = u.memory_id
+            FROM memories u
+            LEFT JOIN domain_memory_links l ON l.memory_id = u.memory_id
             WHERE u.memory_space_id = ? AND u.lifecycle_status = 'active'
             GROUP BY u.memory_id
             HAVING active_links < 1 OR direct_links < 1 OR active_links > max(?,
-                (SELECT count(*) FROM memory_anchors ma WHERE ma.memory_id=u.memory_id))
+                (SELECT count(*) FROM memory_entities ma WHERE ma.memory_id=u.memory_id))
             LIMIT 1
             """,
-            (memory_space_id, self.config.memory_active_subject_link_max),
+            (memory_space_id, self.config.memory_active_domain_link_max),
         ).fetchone()
         if invalid is not None:
             raise ValidationError(
@@ -2379,7 +2370,7 @@ class Store:
     ) -> None:
         connection.execute(
             """
-            INSERT INTO domain_operations(
+            INSERT INTO memory_operations(
                 operation_id, memory_space_id, operation_type, actor,
                 config_signature, reason, committed_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -2406,7 +2397,7 @@ class Store:
     ) -> None:
         connection.execute(
             """
-            INSERT INTO domain_operation_effects(
+            INSERT INTO memory_operation_effects(
                 effect_id, operation_id, object_type, object_id, effect_type, metadata_json
             ) VALUES (?, ?, ?, ?, ?, ?)
             """,
@@ -2424,15 +2415,15 @@ class Store:
         self,
         connection: sqlite3.Connection,
         add_operation_id: str,
-        subject_ids: set[str],
+        domain_ids: set[str],
     ) -> None:
         connection.executemany(
             """
             INSERT OR IGNORE INTO episode_summary_refresh_targets(
-                add_operation_id, subject_id
+                add_operation_id, domain_id
             ) VALUES (?, ?)
             """,
-            [(add_operation_id, subject_id) for subject_id in sorted(subject_ids)],
+            [(add_operation_id, domain_id) for domain_id in sorted(domain_ids)],
         )
 
 
@@ -2485,7 +2476,7 @@ def _top_embedded_items(
     return tuple(ranked[:top_k])
 
 
-def _subject_embedding_text(name: str, summary: str) -> str:
+def _domain_embedding_text(name: str, summary: str) -> str:
     return f"{name}\n\n{summary}"
 
 
@@ -2495,7 +2486,7 @@ def _placeholders(values: Sequence[object]) -> str:
     return ",".join("?" for _ in values)
 
 
-def _latest_source_anchor(rows: Iterable[sqlite3.Row]) -> int | None:
-    anchors = [row["source_ended_at"] or row["source_started_at"] for row in rows]
-    known = [anchor for anchor in anchors if anchor is not None]
+def _latest_source_time(rows: Iterable[sqlite3.Row]) -> int | None:
+    timestamps = [row["source_ended_at"] or row["source_started_at"] for row in rows]
+    known = [timestamp for timestamp in timestamps if timestamp is not None]
     return max(known) if known else None
