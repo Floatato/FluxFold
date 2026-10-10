@@ -22,8 +22,6 @@ from fluxfold.errors import (
     ValidationError,
 )
 from fluxfold.models import (
-    CandidateDomain,
-    CandidateMemory,
     DomainSnapshot,
     EpisodeBlock,
     MemoryBankDomain,
@@ -1059,45 +1057,6 @@ class Store:
             ),
         )
 
-    def candidate_domains(
-        self,
-        memory_space_id: str,
-        query_vector: np.ndarray,
-        *,
-        top_k: int,
-        min_similarity: float,
-    ) -> tuple[CandidateDomain, ...]:
-        hits = self._scan_domains(memory_space_id, query_vector, top_k, min_similarity)
-        output: list[CandidateDomain] = []
-        with self._connect() as connection:
-            signature_id = self._active_signature(connection, memory_space_id)
-            for domain_id, similarity in hits:
-                row = connection.execute(
-                    "SELECT name FROM domains WHERE domain_id = ?",
-                    (domain_id,),
-                ).fetchone()
-                attached = connection.execute(
-                    """
-                    SELECT u.memory_id, v.content, e.vector FROM domain_memory_links l
-                    JOIN memories u ON u.memory_id = l.memory_id AND u.lifecycle_status = 'active'
-                    JOIN memory_versions v ON v.memory_id = u.memory_id AND v.is_latest = 1
-                    JOIN memory_embeddings e ON e.memory_version_id = v.memory_version_id AND e.model_signature_id = ?
-                    WHERE l.domain_id = ? AND l.unlinked_at IS NULL
-                    """,
-                    (signature_id, domain_id),
-                ).fetchall()
-                best = _best_embedded_row(attached, query_vector, "memory_id")
-                output.append(
-                    CandidateDomain(
-                        domain_id,
-                        row["name"],
-                        similarity,
-                        best["memory_id"] if best is not None else None,
-                        best["content"] if best is not None else None,
-                    )
-                )
-        return tuple(output)
-
     def entity_names(self, memory_space_id: str) -> tuple[NameEntry, ...]:
         with self._connect() as connection:
             return tuple(
@@ -1152,77 +1111,25 @@ class Store:
                 )
             }
 
-    def candidate_memories(
-        self,
-        memory_space_id: str,
-        query_vector: np.ndarray,
-        *,
-        top_k: int,
-        min_similarity: float,
-    ) -> tuple[CandidateMemory, ...]:
-        hits = self._scan_memories(memory_space_id, query_vector, top_k, min_similarity)
-        output: list[CandidateMemory] = []
-        with self._connect() as connection:
-            signature_id = self._active_signature(connection, memory_space_id)
-            for memory_id, similarity in hits:
-                row = connection.execute(
-                    """
-                    SELECT u.latest_source_at, v.content FROM memories u
-                    JOIN memory_versions v ON v.memory_id = u.memory_id AND v.is_latest = 1
-                    WHERE u.memory_id = ?
-                    """,
-                    (memory_id,),
-                ).fetchone()
-                attached = connection.execute(
-                    """
-                    SELECT s.domain_id, s.name, e.vector FROM domain_memory_links l
-                    JOIN domains s ON s.domain_id = l.domain_id AND s.lifecycle_status = 'active'
-                    JOIN domain_embeddings e ON e.domain_id = s.domain_id
-                        AND e.embedding_kind = 'name' AND e.model_signature_id = ?
-                    WHERE l.memory_id = ? AND l.unlinked_at IS NULL
-                    """,
-                    (signature_id, memory_id),
-                ).fetchall()
-                best = _best_embedded_row(attached, query_vector, "domain_id")
-                output.append(
-                    CandidateMemory(
-                        memory_id,
-                        row["content"],
-                        row["latest_source_at"],
-                        similarity,
-                        best["domain_id"] if best is not None else None,
-                        best["name"] if best is not None else None,
-                    )
-                )
-        return tuple(output)
-
     def _scan_domains(
         self,
         memory_space_id: str,
         query_vector: np.ndarray,
         top_k: int,
         min_similarity: float,
-        *,
-        public: bool = False,
     ) -> list[tuple[str, float]]:
-        visibility = (
-            """
+        sql = """
+            SELECT s.domain_id AS object_id, e.vector FROM domains s
+            JOIN memory_space_model_signatures a ON a.memory_space_id = s.memory_space_id AND a.purpose = 'retrieval'
+            JOIN domain_embeddings e ON e.domain_id = s.domain_id
+                AND e.embedding_kind = 'name' AND e.model_signature_id = a.model_signature_id
+            WHERE s.memory_space_id = ?
             AND s.lifecycle_status = 'active'
             AND EXISTS (
                 SELECT 1 FROM domain_memory_links l
                 JOIN memories u ON u.memory_id=l.memory_id AND u.lifecycle_status='active'
                 WHERE l.domain_id=s.domain_id AND l.unlinked_at IS NULL
             )
-        """
-            if public
-            else ""
-        )
-        sql = f"""
-            SELECT s.domain_id AS object_id, e.vector FROM domains s
-            JOIN memory_space_model_signatures a ON a.memory_space_id = s.memory_space_id AND a.purpose = 'retrieval'
-            JOIN domain_embeddings e ON e.domain_id = s.domain_id
-                AND e.embedding_kind = 'name' AND e.model_signature_id = a.model_signature_id
-            WHERE s.memory_space_id = ? {visibility}
             ORDER BY s.domain_id
         """
         return self._exact_scan(
@@ -1845,7 +1752,6 @@ class Store:
             query_vector,
             self.config.search_domain_top_k,
             self.config.search_domain_min_similarity,
-            public=True,
         )
         memory_hits = self._scan_memories(
             memory_space_id,
@@ -2442,21 +2348,6 @@ def _normalized_query(vector: np.ndarray) -> np.ndarray:
     if norm == 0:
         raise ValidationError("query embedding has zero norm")
     return np.ascontiguousarray(query / norm, dtype="<f4")
-
-
-def _best_embedded_row(
-    rows: Sequence[sqlite3.Row], query_vector: np.ndarray, id_field: str
-) -> sqlite3.Row | None:
-    if not rows:
-        return None
-    query = _normalized_query(query_vector)
-    return min(
-        rows,
-        key=lambda row: (
-            -float(np.frombuffer(row["vector"], dtype="<f4") @ query),
-            row[id_field],
-        ),
-    )
 
 
 def _top_embedded_items(

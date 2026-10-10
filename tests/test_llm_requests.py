@@ -7,7 +7,7 @@ from pydantic import TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
 from fluxfold import EpisodeBlock, FluxFold, NormalizedEpisode, Role
-from fluxfold.models import DomainSnapshot, LinkingStageOutput, MemorySnapshot
+from fluxfold.models import DomainSnapshot, LinkingOutput, MemorySnapshot
 from fluxfold.prompts import (
     extraction_input,
     repair_input,
@@ -199,7 +199,7 @@ def test_validation_feedback_collapses_repeated_array_errors() -> None:
         ],
     }
     try:
-        TypeAdapter(LinkingStageOutput).validate_python(malformed)
+        TypeAdapter(LinkingOutput).validate_python(malformed)
     except PydanticValidationError as error:
         feedback = validation_feedback(error)
     else:

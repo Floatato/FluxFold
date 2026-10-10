@@ -214,27 +214,25 @@ FluxFold 的核心工程判断是：**读取路径不使用 LLM，全部 LLM 成
 
 不过必须准确描述这个机制的分工。一次 search 只做一跳附带、每个候选只附带 1 个关联对象，且 Domain 通道按 **name** 排序、仅该通道命中才展示 summary。因此：
 
-- **association_search 与 contextual link 负责装箱**：把常识上会被新记忆改变、约束或补全、但文本并不相似的记录收进同一 domain。没有这一步，review 看不见箱子外面的那一跳。
+- **contextual link 负责装箱**：在初始候选里，把会改变、约束或补全另一 domain、但并不直接归属于它的 memory 收进该 domain。候选之外的 domain 这次 linking 看不见。
 - **统一 summary refresh 负责可展示的索引卡**：link、review 和 split 全部结束后，根据目标 domain 当时的全部成员重写 summary，供 Domain 通道命中时使用。它不改 memory 正文，也不参与默认的 domain 排序。
 - **review 负责箱内编译**：用兄妹记忆补全指代、把约束写回被影响的 memory（带时限）、对齐平行实例的句式、上提类别词，并重算 content embedding。只有这一步能让 Memory 通道在 query 只命中其中一跳时仍检索到完整证据；跨记忆关系由随后的 refresh 写入 summary。
 
-§2.2 的种牙/饮酒例子中，种牙记忆写入时 association_search 把饮食 domain 拉进候选并建 contextual；refresh 让饮食 summary 立刻带上术后限制；review 再把时限写进饮酒偏好正文。三者缺一，纯向量读路径都会在某一类 query 上失败。这也意味着该能力依赖 linking 召回、summary 质量和 review 改写，而不是检索结构本身。
+§2.2 的种牙/饮酒例子中，若饮食 domain 已在种牙 memory 的 entity 候选里，linking 可以对它建 contextual；refresh 让饮食 summary 带上术后限制；review 再把时限写进饮酒偏好正文。饮食 domain 若不在该 entity 的 name 候选中，这次写入不会把它拉进来。跨主题约束因此依赖初始召回是否已经覆盖相关 domain，以及 summary 质量和 review 改写。
 
 FluxFold 把 memory version、provenance 和 active link 作为事实源，domain summary 只是写入期生成的派生检索文本。每个 episode 持久化自己的 refresh targets 和完成状态，失败恢复只重试未完成项；系统仍不扫描全空间。候选集合限定为 link 新增 memory 的 domain、被 review 的 domain、link/split 新建 domain，并排除 full split 退役的 domain。共享 memory 因另一个 domain 的 review 发生变化时，其他 linked domains 不被扩散加入集合，因而仍可能保留旧表述。这个取舍既让本 episode 明确负责的 summary 可恢复收敛，又避免一次局部修改扩散成全空间 LLM 维护。
 
-### 6.3 设计二：写入期的主动关联检索与双通道候选召回
+### 6.3 设计二：按实体召回的批量 Domain linking
 
 针对 §2 的问题，以及 §3.2 中 LoCoMo multi-hop / open-domain 与 LongMemEval multi-session 的难点，FluxFold 在写入阶段把「装箱」和「编译」分开：
 
-**name-only 被动召回。** 以每条新 memory content 为 query，按 domain name embedding 取相似度 ≥ 0.25 的前 5 个。每条 memory 的前 2 个直接保留；所有命中再按 domain 聚合，以跨 memories 的最高相似度排序取全局前 10。两部分合并去重后，linking prompt 只展示 domain ID 和 name，不展示相似度、候选 memory 或 domain summary。相比 A-MEM 的 5 个 dense memory 近邻，这一入口直接比较组织单元，并通过批次聚合让多条相关 memories 共同扩大有限候选池。
+**按实体的 name-only 召回。** 每条新 memory 的每个 resolved entity，在该 entity 关联的 active 和 retired domains 里，用 memory content 向量对 domain name 向量排序，取相似度不低于 0 的前 3 个；该 entity 的同名 domain 不占这 3 个名额，并额外加入同一候选池。所有结果按唯一 name 合并为批次共享池。Linking prompt 只展示 domain name 与 entity names，不展示 ID、summary、分数或关联 memory。
 
-**最多五次主动关联检索。** 批量 linking 作为一个 agent loop，最多调用 5 次 `association_search(query)`。query 必须写成某条新记忆本身（加上常识）会改变或约束的另一主题名称，而不是复述新记忆：种牙去找 `Mike's dietary preferences` / `Mike's diet plan`，驾照停权去找 `Mike's travel plans` / `Mike's commute`，夜班去找 `Mike's evening plans` / `Mike's sleep schedule`。主动结果保留原来的双通道详细展示：Domain 通道带代表 memory，Memory 通道带关联 domain；各轮结果累积供最终决策使用。搜到的可以是漏掉的 direct home，也可以是 contextual 目标。Linking 只决定成员关系，不改写已有正文。
+**一次批量 linking。** 本 episode 的全部新 memory 共用一次 structured output，为每个 entity 选择 direct 归属，再从同一候选池选择 contextual domains。`contextual` 表示 memory 与该 domain 中的信息存在约束、影响、更新或解释关系，但该 domain 不是这条 memory 的组织归属。Linking 只决定成员关系，不改写已有正文。候选池之外的 domain 不能被选中。
 
-**批量决策、episode 原子提交。** 程序为本 episode 的全部新 memory 分配临时 `memory_ref`，合并初始候选后用一个 agent loop 输出整批 links。多条 memory 可以共同引用同一个新 domain ref；最终校验完成后才分配正式 domain ID，并把整批 memory、provenance、links 和 extraction completion 原子提交，因此工具轮次不会暴露部分正式结果。
+**episode 原子提交。** 程序在 linking 前分配正式 memory ID，并准备 entity 同名 domain。校验完成后把整批 entity、归属、memory、provenance、embedding、domain、link 和 extraction completion 原子提交。
 
-每条 link 记录 `direct` 或 `contextual` 依据：`direct` 表示该 domain 是这条 memory 的组织归属；`contextual` 表示 memory 会具体补全、约束、更新或解释该 domain 下已归档的信息。`contextual` 不表示较低优先级，两类 link 都参与 review、summary 和 search，第一版不据此调整检索分数。把文本不相似、但会被这条新记忆改变或约束的记录收进同一 domain，正是通过这次装箱完成的。
-
-需要说明的是，`association_search` 目前上限为 5 次调用，且 design.md 已将“对关闭、单轮与多轮主动关联性检索做消融，评估关联召回率、错误 link 和调用成本”列为待验证项。按 §5 的结论，这项消融必须通过**重建 memory space** 进行，不能在固定记忆库上关闭读取通道。
+每条 link 记录 `direct` 或 `contextual` 依据：`direct` 表示该 domain 是这条 memory 的组织归属；`contextual` 表示 memory 会具体补全、约束、更新或解释该 domain 下已归档的信息。`contextual` 不表示较低优先级，两类 link 都参与 review、summary 和 search，第一版不据此调整检索分数。文本不相似、但会被这条新记忆改变或约束的记录，只有在相关 domain 已经进入该 entity 的 name 候选时，才会在这次 linking 中被收进同一 domain。
 
 ### 6.4 设计三：episode 级 provenance 作为演化依据
 

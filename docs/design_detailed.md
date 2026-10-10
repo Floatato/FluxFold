@@ -736,7 +736,7 @@ episode
 → extraction 实体名称解析与必要的批量消歧
 → 准备 entity 同名初始 domain（全生命周期精确复用），分配正式 memory_id
 → 每条新 memory 在每个 entity 下召回前 3 个 domain name，额外加入同名 domain 后批次去重
-→ 为整批新 memories 执行一个 Domain linking agent loop
+→ 为整批新 memories 执行一次 Domain linking
 → 原子写入 memory、entity、归属关系、provenance、embedding、domain、links 和 operation
 → 先执行已触发的 Domain split / Domain review
 → 构造并持久化本 episode 的 summary refresh targets
@@ -794,8 +794,7 @@ episode 包含 messages 和有值的 `source_started_at`、`source_ended_at`、
 `source_timezone`；缺失的时间字段不进入 prompt。每条 message 包含
 `speaker_id`、`content`，并仅在该 message 自身有 `observed_at` 时包含该字段。来源未提供
 speaker ID 时，以规范化的 `user` / `assistant` role 值填入 `speaker_id`。Linking 的 new memory
-包含正式 `memory_id`、content、resolved entity names 和逐 memory 的 `link_limit`，初始 candidates 只包含 domain name 和 entity names；主动关联检索也不
-展示 memory 的来源时间。Review 不展示 domain ID、旧 summary 或 memory 来源时间，但保留
+包含正式 `memory_id`、content、resolved entity names 和逐 memory 的 `link_limit`，candidates 只包含 domain name 和 entity names，不展示 memory 的来源时间。Review 不展示 domain ID、旧 summary 或 memory 来源时间，但保留
 生成 update 所需的 memory ID、content、link basis 和 provenance episode IDs。按需展开的来源
 包含 episode ID、source 时间范围与时区，以及每条 message 的 speaker ID、content 和可用的
 `observed_at`。Split 不展示 domain ID、旧 summary、provenance IDs 或 memory 来源时间。
@@ -911,7 +910,7 @@ Extraction 后解析 entity names，先查询同一 space 的全部已知 entiti
 本阶段的疑似项一次性反馈给 LLM，携带原输入和此前输出；无疑似项不增加调用。
 Entity 候选只提供 name，不向 LLM 提供向量或 BM25 分数。反馈 prompt 简短要求判断是否
 同一实体；相同则选候选名称，否则保留提出的名称。这个简洁要求仅适用于名称反馈；
-LINKING_SYSTEM 独立完整说明输入、每 entity 的决策顺序、direct/contextual 边界、主动检索、
+LINKING_SYSTEM 独立完整说明输入、每 entity 的决策顺序、direct/contextual 边界、
 输出约束和具体示例，不假设 LLM 能看到其他阶段的 prompt 或设计文档。
 该回合只输出名称映射，不重新 extraction 或改写 memory 内容。程序校验映射完整且目标合法，
 沿本批较早名称的映射解析最终 canonical name，同步替换全部引用，再按最终对象去重；
@@ -923,20 +922,10 @@ Extraction 和 entity 解析后，程序在 linking 前准备同名初始 domain
 linking 失败不残留半成品。新容器可能暂时没有 memory links。Review 和 split 的 prompt
 不包含 entity 信息，程序负责稳定关系维护。Split 只做精确名称复用，不做近似消歧。
 
-本 episode 的全部新 memories 共用一个 Domain linking agent loop。模型每一轮可以返回整批
-最终 `links`，也可以返回一个 `association_search(query)` 工具请求；单次 loop 最多执行 5 次
-主动检索，第 6 个模型回合必须在已经累积的结果上给出最终 links。每次主动检索的候选展示
-保持详细的 Domain + Memory 双通道结构：Domain 通道包含 domain name、相似度和最相关的
-一条关联 memory，Memory 通道包含 memory content、相似度和最相关的关联 domain；
-结果按 query 分轮累积，之前轮次不会被后续结果覆盖。
-
-主动检索用于寻找可能影响或约束当前 memory、可能被当前 memory 影响或约束，或者与它存在
-其他超出文本语义相似度的逻辑关系的一个或多个 domains。query 写成这些可能 domains 的
-名称，而不是复述 new memory。主动检索寻找不适合作为当前 memory 的 direct 归属的
-contextual 目标。prompt 要求模型在输出 links 前逐条检查这种跨主题关系；不能仅因已经能选择
-direct domain、正文没有点名另一领域、或被动候选看似合理而跳过。Linking 只决定成员关系，不改写
-已有 memory 正文；同一 domain 内的指代补全、约束写回、实例对齐和类别上提由 Domain review
-完成。
+本 episode 的全部新 memories 共用一次 Domain linking。模型返回整批最终 `links`。
+候选只展示 domain name 与 entity names。contextual 目标必须来自这批 candidates；
+候选之外的 domain 不能被选中。Linking 只决定成员关系，不改写已有 memory 正文；
+同一 domain 内的指代补全、约束写回、实例对齐和类别上提由 Domain review 完成。
 
 
 | 配置项                                        | 值    | 含义                                             |
@@ -946,34 +935,16 @@ direct domain、正文没有点名另一领域、或被动候选看似合理而�
 | `name_resolution_bm25_threshold`          | 2.0  | 名称消歧候选的 BM25 阈值 |
 | `extraction_memory_warning_threshold`     | 20   | 提取条数超过此值时 warning |
 | `linking_candidate_warning_threshold`     | 30   | 初始去重候选数超过此值时 warning |
-| `domain_candidate_min_similarity`         | 0 | Domain 通道允许候选进入结果的最低 query-domain name 余弦相似度 |
-| `association_domain_candidate_top_k`      | 8    | 每次主动检索 Domain 通道的 domain 上限                  |
-| `domain_candidate_attached_memory_k`      | 1    | 每个 Domain 通道候选附带的关联 memory 数                  |
-| `memory_candidate_top_k`                   | 8    | Memory 通道最多保留的 memory 数                        |
-| `memory_candidate_min_similarity`          | 0 | Memory 通道允许候选进入结果的最低 query-memory 余弦相似度        |
-| `memory_candidate_attached_domain_k`      | 1    | 每个 Memory 通道候选附带的关联 domain 数                  |
-| `association_search_max_calls`             | 5    | 一个批次 linking agent loop 的主动检索调用上限              |
+| `domain_candidate_min_similarity`         | 0 | entity domain name 候选的最低余弦相似度 |
 | `memory_link_preferred_min`                | 1    | Prompt 建议一条 memory 通常至少链接的 domain 数           |
 | `memory_link_preferred_max`                | 4    | Prompt 建议一条 memory 通常最多链接的 domain 数           |
 | `memory_active_domain_link_max`           | 5    | 每条 memory 的 link 上限基础值；有效上限取此值与 entity 数量的较大值      |
 
 
-主动检索的 Domain 通道按 query 与 active/retired domain name embedding 取前 8 个，再删除相似度
-低于 0 的 domain。每个保留 domain 附带其 active memories 中与 query 最相似的 1 条；
-没有 linked memory 时只提供 domain。
-
-主动检索的 Memory 通道按 query 与 active memory content embedding 取前 8 条，再删除相似度低于
-0 的 memory。每条保留 memory 附带其 active domains 中 name embedding 与 query 最
-相似的 1 个；没有 domain 时只提供 memory。
-
-主动检索的两个通道完成后，候选按真实 domain-memory 关系组织成去重的 domain groups；
-先列 Domain 通道 domains，再列仅由 Memory 通道引入的 domains，同一 domain 和同一组内
-的 memory 只展示一次。不同新 memories 的候选视图互相独立，只在各自视图内去重，不跨
-memory 去重或共享召回上限。主动结果不展示 domain summary。这些候选检索只使用向量相似度；
-公开 search 和 association_search 保持纯向量；BM25 仅用于上述写入名称消歧。
+初始候选与公开 search 只使用向量相似度；BM25 仅用于上述写入名称消歧。
 
 程序在 extraction 后为全部新 memories 分配正式 `memory_id`，输入、linking 输出和落库
-始终使用同一个 ID。批次候选池完成后启动一次 linking loop；输出覆盖所有 memories。
+始终使用同一个 ID。批次候选池完成后执行一次 linking；输出覆盖所有 memories。
 全部 assignment 校验成功后，将准备好的 domains、entities、关系、memory、provenance、
 embeddings、links、恢复状态和 extraction completion 原子提交，中间检索不暴露部分写入。
 
@@ -995,15 +966,8 @@ LLM 判断每个已给出的 entity 最适合的 domain，再判断 contextual d
 
 
 种牙是医疗事件，归属是 `Mike`；记忆正文完全不提饮食，但凭口腔手术会限制咀嚼、进食和
-饮酒的常识，实际检索到 `Mike's dietary preferences` 时应对其建 `contextual`。仅凭种牙正文
-做被动召回，它与饮食偏好文本不相似，通常不会出现。
-
-例如 new memory 是 `Mike recently had dental implant surgery` 时，query 可以写
-`Mike's dietary preferences, Mike's diet plan`，因为手术可能约束这些 domains 描述的内容；
-new memory 是 `Mike plans to drive to Boston next weekend` 时，query 可以写
-`Mike's driving licence, Mike's driving restrictions`，因为这些 domains 中的信息可能反过来
-约束新计划是否可行。每次 query 可以包含一个或多个可能的 domain 名称，整个 batch agent
-loop 仍最多调用 5 次主动检索。
+饮酒的常识，当 `Mike's dietary preferences` 已在 candidates 中时应对它建 `contextual`。
+候选之外的 domain 不能因为这种常识被追加进来。
 
 Linking 把这些记忆收进同一 domain 之后，并不改写旧正文。公开 search 按 memory content
 和 domain name 排序，每个 domain 只附带 1 条 memory，且仅 Domain 通道命中的 domain
@@ -1375,10 +1339,6 @@ domains 的 name 与 summary，以及各自 active linked memories 的 content�
 - memory-space build 的开始、完成、暂停、恢复和失败；
 - episode 的 extraction 完成、Domain linking 完成和原子提交；
 - 一次 episode 提取、创建和写入的 memory 数，新建 domain 数及新建 link 数；
-- 本 episode 的 association search 详细结果合计涉及的唯一 candidate memory 数；初始
-name-only candidates 不包含 memory，因此未调用主动检索时该值为 0。若至少一次调用
-association search，还记录 `association_search_called = true`，以及主动结果相对初始候选额外
-引入的唯一 candidate memory 数；
 - 记忆写入与整理阶段每次 LLM 调用的阶段、attempt、success/failed 结果、耗时，以及
 `input_tokens`、`output_tokens` 和 `total_tokens`；不记录 generation provider
 使用的其他 token 子类别；
@@ -1398,15 +1358,12 @@ association search，还记录 `association_search_called = true`，以及主动
 该日志单独写入 `llm_io_samples.md`。每次返回了模型输出的 LLM 调用各自以 0.1 概率独立
 触发采样；未通过 structured-output 校验的调用也独立参与，后续 repair 调用展示它实际
 收到的 repair prompt。每个样本只展示完整 User prompt 和完整 Model output，不展示 system
-prompt、stage、request ID、run ID、时间戳或 agent loop 的其他轮次。没有返回模型输出的
+prompt、stage、request ID、run ID 或时间戳。没有返回模型输出的
 provider 失败无法形成样本。
 
 各类别按采样成功数计数，满额即停止该类别的随机抽样：
 
-- `extract`、未调用主动检索的 `link`、`review`、`split`、`summary` 各 10 个；
-- 调用过主动 `association_search` 的 `link` 为 5 个。这类 linking agent loop 中，发起
-  `association_search` 的中间 LLM 调用不参与采样，只有返回最终 linking 决策的最后一次
-  LLM 调用以 0.1 概率参与采样。
+- `extract`、`link`、`review`、`split`、`summary` 各 10 个。
 
 `review` 不按是否请求 provenance 拆分配额；两轮 review 中的每次 LLM 调用分别参与
 随机采样并共用 10 个上限。某类调用在本次 build 中未出现则该项空缺。显式恢复续跑时，
@@ -1524,17 +1481,11 @@ memory 使用程序分配的正式 ID。候选在 linking 前已包含每个 ent
 }
 ```
 
-主动关联检索的中间请求：
-
-```json
-{"result": "association_search", "query": "likely Domain names"}
-```
-
 程序验证每个 memory_id 恰好输出一次、每个输入 entity 恰好分配一次、direct target 的
-entity 成员关系包含指定 entity。所有 domain 名称必须来自共享 candidates 或该 memory 的
-主动检索结果。相同目标去重，direct 优先；distinct links 不超过输入中的 link_limit。
-初始 candidates 展示 name 和 entities，主动结果另含关联 memory 和检索分数；都不展示
-domain ID 或 summary。无额外的临时 ref、创建 domain 或 domain 消歧输出。
+entity 成员关系包含指定 entity。所有 domain 名称必须来自共享 candidates。相同目标去重，
+direct 优先；distinct links 不超过输入中的 link_limit。candidates 展示 name 和 entities，
+不展示 domain ID、summary、关联 memory 或检索分数。无额外的临时 ref、创建 domain
+或 domain 消歧输出。
 
 Extraction 的条件 entity 名称消歧回合每个疑似项一条：
 
@@ -2198,7 +2149,7 @@ embedding 配置都不提供 per-user 或 per-space 覆盖，也不要求运行�
 ### 3.1 检索与存储扩展
 
 - 实验 BM25、关键词或其他词法召回，以及向量/词法候选池、融合权重、RRF、重排、分词和
-BM25 参数；当前公开 search 与 association_search 保持纯向量，写入名称消歧使用向量或 BM25 候选。
+BM25 参数；当前公开 search 保持纯向量，写入名称消歧使用向量或 BM25 候选。
 - 对比 domain name 与 name+summary embedding，评估 summary 提供的信息和陈旧影响。
 - 评估最低相似度、top-k、attached object 数和最终上下文容量对不同查询类型的影响。
 - 只有精确扫描出现可复现性能瓶颈时，评估 SQLite vector extension、ANN 或外部向量索引，
@@ -2212,7 +2163,7 @@ BM25 参数；当前公开 search 与 association_search 保持纯向量，写�
 
 - 当标注或端到端结果持续出现过切、欠切或成本问题时，对比其他 embedding/boundary 参数
 与 LLM boundary detection。
-- 对候选召回参数、Domain/Memory 通道和主动 association search 做消融，评估漏链、错链、
+- 对候选召回参数做消融，评估漏链、错链、
 link basis 与推理成本。
 - 如果写入顺序持续造成旧 memory 缺少后来才成立的 domain link，再评估有限 link 回填。
 - 根据 review/split 的去重、冲突、summary、碎片化、重叠和成本结果，实验新的 prompt、

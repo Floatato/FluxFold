@@ -19,7 +19,7 @@ _LLM_IO_SAMPLE_HEADER = """# LLM I/O samples
 
 Each LLM call that returns model output has an independent 10% chance of being sampled. Each sample contains only the user prompt and model output.
 
-Quotas: extract, link (no `association_search`), review, split, and summary ×10; link with `association_search` ×5. For a link agent loop that uses `association_search`, only the final linking decision is eligible.
+Quotas: extract, link, review, split, and summary ×10.
 
 """
 

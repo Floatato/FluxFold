@@ -112,7 +112,6 @@ def test_review_replacement_provenance_requires_existing_episode(tmp_path) -> No
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
                 domain_candidate_min_similarity=-1.0,
-                memory_candidate_min_similarity=-1.0,
             ),
         )
         space = await engine.create_or_open_space("test:alice")
@@ -187,7 +186,6 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
                 domain_candidate_min_similarity=-1.0,
-                memory_candidate_min_similarity=-1.0,
                 search_domain_min_similarity=-1.0,
                 search_memory_min_similarity=-1.0,
             ),
@@ -291,7 +289,6 @@ def test_add_episode_serializes_episodes_within_a_space(tmp_path) -> None:
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
                 domain_candidate_min_similarity=-1.0,
-                memory_candidate_min_similarity=-1.0,
             ),
         )
         space = await engine.create_or_open_space("test:pipeline")
@@ -410,8 +407,7 @@ def test_episode_links_all_new_memories_in_one_batch(tmp_path) -> None:
             ).memories
         }
         assert payload["candidates"] == [{"name": "Alice", "entities": ["Alice"]}]
-        assert payload["association_search_results"] == []
-        assert payload["association_searches_remaining"] == 5
+        assert set(payload) == {"new_memories", "candidates"}
         assert result.memories_created == 2
         assert result.domains_created == 1
         assert result.links_created == 2
@@ -460,73 +456,6 @@ def test_initial_domain_candidates_rank_within_each_entity(
             "Bob",
         ]
         assert legal == {candidate["name"] for candidate in candidates}
-        await engine.close()
-
-    asyncio.run(scenario())
-
-
-def test_link_agent_allows_five_association_search_calls(tmp_path) -> None:
-    class FiveAssociationSearches(FakeGenerationProvider):
-        async def generate(self, request: GenerationRequest):
-            if '"name_resolution"' in request.user_prompt:
-                return await super().generate(request)
-            if request.stage == "domain_linking":
-                payload = json.loads(request.user_prompt)
-                if payload["association_searches_remaining"] > 0:
-                    self.requests.append(request)
-                    call_number = len(payload["association_search_results"]) + 1
-                    return GenerationResponse(
-                        text=json.dumps(
-                            {
-                                "result": "association_search",
-                                "query": f"Alice related topic {call_number}",
-                            }
-                        ),
-                        input_tokens=6,
-                        output_tokens=4,
-                        total_tokens=10,
-                        request_id=f"association-{call_number}",
-                    )
-            return await super().generate(request)
-
-    async def scenario() -> None:
-        generation = FiveAssociationSearches()
-        engine = await FluxFold.open(
-            db_path=str(tmp_path / "five-association-searches.sqlite3"),
-            generation_provider=generation,
-            embedding_provider=FakeEmbeddingProvider(),
-        )
-        space = await engine.create_or_open_space("test:five-association-searches")
-
-        result = await engine.add_episode(
-            space.memory_space_id, _episode("one", "Alice likes hiking.")
-        )
-
-        linking_requests = [
-            request
-            for request in generation.requests
-            if request.stage == "domain_linking"
-        ]
-        assert len(linking_requests) == 6
-        payloads = [json.loads(request.user_prompt) for request in linking_requests]
-        assert [payload["association_searches_remaining"] for payload in payloads] == [
-            5,
-            4,
-            3,
-            2,
-            1,
-            0,
-        ]
-        assert [len(payload["association_search_results"]) for payload in payloads] == [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-        ]
-        assert result.memories_created == 1
-        assert result.links_created == 1
         await engine.close()
 
     asyncio.run(scenario())
@@ -681,17 +610,14 @@ def test_add_episode_persists_terminal_failure_and_replays_it(tmp_path) -> None:
 def test_existing_domain_link_triggers_review(tmp_path) -> None:
     async def scenario() -> None:
         generation = FakeGenerationProvider()
-        events: list[dict[str, object]] = []
         engine = await FluxFold.open(
             db_path=str(tmp_path / "review.sqlite3"),
             generation_provider=generation,
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
                 domain_candidate_min_similarity=-1.0,
-                memory_candidate_min_similarity=-1.0,
                 domain_review_new_memory_threshold=1,
             ),
-            event_sink=events.append,
         )
         space = await engine.create_or_open_space("test:review")
         await engine.add_episode(
@@ -705,15 +631,6 @@ def test_existing_domain_link_triggers_review(tmp_path) -> None:
         assert (
             engine.space_statistics(space.memory_space_id)["domain_review_count"] == 1
         )
-        linking_events = [
-            event
-            for event in events
-            if event["event_type"] == "domain_linking_completed"
-        ]
-        assert linking_events[0]["candidate_memory_count"] == 0
-        assert linking_events[1]["candidate_memory_count"] == 0
-        assert linking_events[1]["association_search_called"] is False
-        assert linking_events[1]["association_additional_candidate_memory_count"] == 0
         await engine.close()
 
     asyncio.run(scenario())
@@ -730,7 +647,6 @@ def test_small_domain_skips_summary_llm_until_it_has_three_links(
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
                 domain_candidate_min_similarity=-1.0,
-                memory_candidate_min_similarity=-1.0,
             ),
         )
         space = await engine.create_or_open_space("test:refresh")
@@ -791,7 +707,6 @@ def test_search_groups_domains_and_only_exposes_five_summaries(tmp_path) -> None
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
                 domain_candidate_min_similarity=-1.0,
-                memory_candidate_min_similarity=-1.0,
                 search_domain_min_similarity=-1.0,
                 search_memory_min_similarity=-1.0,
             ),
@@ -857,7 +772,6 @@ def test_failed_summary_refresh_is_recovered_by_episode_replay(tmp_path) -> None
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
                 domain_candidate_min_similarity=-1.0,
-                memory_candidate_min_similarity=-1.0,
             ),
             event_sink=events.append,
         )
@@ -1078,7 +992,6 @@ def test_domain_split_outcomes(
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
                 domain_candidate_min_similarity=-1.0,
-                memory_candidate_min_similarity=-1.0,
                 domain_split_memory_count_threshold=episode_count,
                 domain_review_new_memory_threshold=10,
             ),
@@ -1118,7 +1031,6 @@ def test_split_retries_when_a_moved_memory_would_lose_its_direct_link(tmp_path) 
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
                 domain_candidate_min_similarity=-1.0,
-                memory_candidate_min_similarity=-1.0,
                 domain_split_memory_count_threshold=3,
                 domain_review_new_memory_threshold=10,
             ),
@@ -1156,7 +1068,6 @@ def test_split_retries_when_a_result_domain_exceeds_memory_max(tmp_path) -> None
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
                 domain_candidate_min_similarity=-1.0,
-                memory_candidate_min_similarity=-1.0,
                 domain_split_memory_count_threshold=4,
                 domain_split_result_target_memory_max=3,
                 domain_review_new_memory_threshold=10,
@@ -1178,52 +1089,6 @@ def test_split_retries_when_a_result_domain_exceeds_memory_max(tmp_path) -> None
         ]
         assert len(split_requests) == 2
         assert "a split domain has too many memories" in split_requests[1].user_prompt
-        await engine.close()
-
-    asyncio.run(scenario())
-
-
-def test_association_search_results_keep_the_detailed_candidate_view(tmp_path) -> None:
-    async def scenario() -> None:
-        generation = FakeGenerationProvider()
-        events: list[dict[str, object]] = []
-        engine = await FluxFold.open(
-            db_path=str(tmp_path / "association.sqlite3"),
-            generation_provider=generation,
-            embedding_provider=FakeEmbeddingProvider(),
-            config=FluxFoldConfig().with_overrides(
-                domain_candidate_min_similarity=-1.0,
-                memory_candidate_min_similarity=-1.0,
-            ),
-            event_sink=events.append,
-        )
-        space = await engine.create_or_open_space("test:association")
-        await engine.add_episode(
-            space.memory_space_id, _episode("one", "Alice likes hiking.", 0)
-        )
-        generation.association_search_once = True
-        result = await engine.add_episode(
-            space.memory_space_id, _episode("two", "Alice bought boots.", 1)
-        )
-        assert result.domains_created == 0
-        linking_calls = [
-            request
-            for request in generation.requests
-            if request.stage == "domain_linking"
-        ]
-        assert len(linking_calls) == 3
-        final_payload = json.loads(linking_calls[-1].user_prompt)
-        assert "last_mentioned_at" not in json.dumps(
-            final_payload["association_search_results"]
-        )
-        linking_events = [
-            event
-            for event in events
-            if event["event_type"] == "domain_linking_completed"
-        ]
-        assert linking_events[1]["candidate_memory_count"] == 1
-        assert linking_events[1]["association_search_called"] is True
-        assert linking_events[1]["association_additional_candidate_memory_count"] == 1
         await engine.close()
 
     asyncio.run(scenario())
@@ -1264,7 +1129,6 @@ def test_review_provenance_and_memory_changes(tmp_path, review_mode: str) -> Non
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
                 domain_candidate_min_similarity=-1.0,
-                memory_candidate_min_similarity=-1.0,
                 search_domain_min_similarity=-1.0,
                 search_memory_min_similarity=-1.0,
                 domain_review_new_memory_threshold=1,
@@ -1320,7 +1184,6 @@ def test_review_retries_when_replacement_provenance_is_invalid(tmp_path) -> None
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
                 domain_candidate_min_similarity=-1.0,
-                memory_candidate_min_similarity=-1.0,
                 domain_review_new_memory_threshold=1,
             ),
             event_sink=events.append,

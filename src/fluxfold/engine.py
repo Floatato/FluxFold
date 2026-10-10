@@ -28,14 +28,12 @@ from fluxfold.errors import (
 )
 from fluxfold.models import (
     AddResult,
-    AssociationSearchOutput,
     DeferSplitOutput,
     DomainSnapshot,
     EmbeddingRebuildResult,
     ExtractionOutput,
     FullSplitOutput,
     LinkingOutput,
-    LinkingStageOutput,
     MaintenanceResult,
     MemoriesExtraction,
     MemoryBankSpace,
@@ -89,7 +87,6 @@ EventSink = Callable[[dict[str, object]], None]
 LLM_IO_SAMPLE_QUOTAS: dict[str, int] = {
     "extract": 10,
     "link": 10,
-    "link_association_search": 5,
     "review": 10,
     "split": 10,
     "summary": 10,
@@ -125,13 +122,6 @@ class _PreparedAdd:
     memory_vectors: tuple[Any, ...]
     prepared_memories: tuple[PreparedMemory, ...]
     entities: tuple[NameEntry, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class _LinkingMetrics:
-    candidate_memory_count: int
-    association_search_called: bool
-    association_additional_candidate_memory_count: int
 
 
 class FluxFold:
@@ -381,7 +371,7 @@ class FluxFold:
             memory_space_id, prepared.entities
         )
         if contents:
-            linking, linking_metrics = await self._link_memories(
+            linking = await self._link_memories(
                 memory_space_id,
                 memory_ids,
                 contents,
@@ -393,7 +383,6 @@ class FluxFold:
             )
         else:
             linking = LinkingOutput(memories=[])
-            linking_metrics = _LinkingMetrics(0, False, 0)
         self._event(
             "domain_linking_completed",
             memory_space_id=memory_space_id,
@@ -405,11 +394,6 @@ class FluxFold:
                     | set(memory.contextual_domains)
                 )
                 for memory in linking.memories
-            ),
-            candidate_memory_count=linking_metrics.candidate_memory_count,
-            association_search_called=linking_metrics.association_search_called,
-            association_additional_candidate_memory_count=(
-                linking_metrics.association_additional_candidate_memory_count
             ),
         )
         prepared_links, domain_touches, affected_domain_ids = self._prepare_link_commit(
@@ -698,7 +682,7 @@ class FluxFold:
         contents: Sequence[str],
         vectors: Sequence[Any],
         memory_entities: Sequence[list[str]],
-    ) -> tuple[LinkingOutput, _LinkingMetrics]:
+    ) -> LinkingOutput:
         candidates, legal_domain_ids = self._recall_initial_domain_candidates(
             memory_space_id, vectors, memory_entities
         )
@@ -716,83 +700,22 @@ class FluxFold:
                 memory_ids, contents, memory_entities, strict=True
             )
         ]
-        association_results: list[dict[str, Any]] = []
-        association_memory_ids: set[str] = set()
-        turns: list[_LlmTurn] = []
-        max_searches = (
-            self.config.association_search_max_calls
-            if self.config.association_search_enabled
-            else 0
+
+        def validate(value: LinkingOutput) -> None:
+            self._validate_linking(
+                value, memory_ids, legal_by_memory, memory_entities, memory_space_id
+            )
+
+        output, _ = await self._structured_output(
+            stage="domain_linking",
+            system_prompt=LINKING_SYSTEM,
+            user_prompt=linking_input(new_memories, candidates),
+            adapter=TypeAdapter(LinkingOutput),
+            temperature=self.config.linking_temperature,
+            validator=validate,
+            sample_kind="link",
         )
-
-        while True:
-            searches_remaining = max_searches - len(association_results)
-
-            def validate(value: LinkingStageOutput) -> None:
-                if isinstance(value, AssociationSearchOutput):
-                    if searches_remaining == 0:
-                        raise ValidationError(
-                            "association_search call limit has been reached"
-                        )
-                    if not value.query.strip():
-                        raise ValidationError(
-                            "association_search query must not be blank"
-                        )
-                    return
-                self._validate_linking(
-                    value, memory_ids, legal_by_memory, memory_entities, memory_space_id
-                )
-
-            try:
-                output, turn = await self._structured_output(
-                    stage="domain_linking",
-                    system_prompt=LINKING_SYSTEM,
-                    user_prompt=linking_input(
-                        new_memories,
-                        candidates,
-                        association_results,
-                        searches_remaining,
-                    ),
-                    adapter=TypeAdapter(LinkingStageOutput),
-                    temperature=self.config.linking_temperature,
-                    validator=validate,
-                    sample_turns=turns,
-                )
-            except StageFailure:
-                if not association_results:
-                    for failed_turn in turns:
-                        self._offer_llm_sample("link", failed_turn)
-                raise
-            output = cast(LinkingStageOutput, output)
-            if isinstance(output, LinkingOutput):
-                if association_results:
-                    self._offer_llm_sample("link_association_search", turn)
-                else:
-                    for completed_turn in turns:
-                        self._offer_llm_sample("link", completed_turn)
-                return output, _LinkingMetrics(
-                    len(association_memory_ids),
-                    bool(association_results),
-                    len(association_memory_ids),
-                )
-
-            association_vector = (await self._embed_queries([output.query]))[0]
-            association_candidates, association_legal = (
-                self._recall_association_candidates(
-                    memory_space_id,
-                    memory_ids,
-                    [association_vector] * len(memory_ids),
-                )
-            )
-            association_memory_ids.update(_candidate_memory_ids(association_candidates))
-            for memory_id, domain_ids in association_legal.items():
-                legal_by_memory[memory_id].update(domain_ids)
-            association_results.append(
-                {
-                    "query": output.query,
-                    "candidates_by_memory": association_candidates,
-                }
-            )
+        return cast(LinkingOutput, output)
 
     def _recall_initial_domain_candidates(
         self,
@@ -836,75 +759,6 @@ class FluxFold:
                 candidate_count=len(pool),
             )
         return list(pool.values()), set(pool)
-
-    def _recall_association_candidates(
-        self,
-        memory_space_id: str,
-        memory_ids: Sequence[str],
-        vectors: Sequence[Any],
-    ) -> tuple[dict[str, dict[str, object]], dict[str, set[str]]]:
-        memberships = self._store.domain_entity_names(memory_space_id)
-        candidates: dict[str, dict[str, object]] = {}
-        legal: dict[str, set[str]] = {}
-        for memory_id, vector in zip(memory_ids, vectors, strict=True):
-            domains = self._store.candidate_domains(
-                memory_space_id,
-                vector,
-                top_k=self.config.association_domain_candidate_top_k,
-                min_similarity=self.config.domain_candidate_min_similarity,
-            )
-            memories = self._store.candidate_memories(
-                memory_space_id,
-                vector,
-                top_k=self.config.memory_candidate_top_k,
-                min_similarity=self.config.memory_candidate_min_similarity,
-            )
-            groups: dict[str, dict[str, object]] = {}
-            for domain in domains:
-                group: dict[str, object] = {
-                    "name": domain.name,
-                    "domain_similarity": domain.similarity,
-                    "memory_hits": [],
-                }
-                if domain.attached_memory_id is not None:
-                    cast(list[dict[str, object]], group["memory_hits"]).append(
-                        {
-                            "memory_id": domain.attached_memory_id,
-                            "content": domain.attached_memory_content,
-                            "source": "domain_channel_attachment",
-                        }
-                    )
-                groups[domain.domain_id] = group
-            unattached_memories: list[dict[str, object]] = []
-            for memory in memories:
-                memory_value: dict[str, object] = {
-                    "memory_id": memory.memory_id,
-                    "content": memory.content,
-                    "similarity": memory.similarity,
-                    "source": "memory_channel",
-                }
-                domain_id = memory.attached_domain_id
-                if domain_id is None:
-                    unattached_memories.append(memory_value)
-                    continue
-                if domain_id not in groups:
-                    groups[domain_id] = {
-                        "name": memory.attached_domain_name,
-                        "domain_similarity": None,
-                        "memory_hits": [],
-                    }
-                hits = cast(list[dict[str, object]], groups[domain_id]["memory_hits"])
-                if not any(hit["memory_id"] == memory.memory_id for hit in hits):
-                    hits.append(memory_value)
-            for domain_id, group in groups.items():
-                group["entities"] = sorted(memberships[domain_id])
-            legal_ids = {str(group["name"]) for group in groups.values()}
-            candidates[memory_id] = {
-                "domains": list(groups.values()),
-                "unattached_memories": unattached_memories,
-            }
-            legal[memory_id] = legal_ids
-        return candidates, legal
 
     def _validate_linking(
         self,
@@ -1605,7 +1459,6 @@ class FluxFold:
         temperature: float,
         validator: Callable[[Any], None],
         sample_kind: str | None = None,
-        sample_turns: list[_LlmTurn] | None = None,
     ) -> tuple[Any, _LlmTurn]:
         started = time.monotonic()
         current_input = user_prompt
@@ -1623,8 +1476,6 @@ class FluxFold:
                     )
                 )
                 turn = _LlmTurn(current_input, response.text)
-                if sample_turns is not None:
-                    sample_turns.append(turn)
                 if sample_kind is not None:
                     self._offer_llm_sample(sample_kind, turn)
                 failed_output = response.text
@@ -1851,19 +1702,6 @@ _SECRET_RE = re.compile(
     r"\b(?:api[_ -]?key|session[_ -]?token|verification[_ -]?code|password)\s*[:=]\s*\S+",
     re.IGNORECASE,
 )
-
-
-def _candidate_memory_ids(
-    candidates: dict[str, dict[str, object]],
-) -> set[str]:
-    memory_ids: set[str] = set()
-    for value in candidates.values():
-        for group in cast(list[dict[str, object]], value["domains"]):
-            for memory in cast(list[dict[str, object]], group["memory_hits"]):
-                memory_ids.add(cast(str, memory["memory_id"]))
-        for memory in cast(list[dict[str, object]], value["unattached_memories"]):
-            memory_ids.add(cast(str, memory["memory_id"]))
-    return memory_ids
 
 
 def _parse_json_object(text: str) -> dict[str, object]:

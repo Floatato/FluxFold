@@ -25,7 +25,6 @@ class FakeGenerationProvider:
         split_missing_direct_first: bool = False,
         split_oversized_first: bool = False,
         review_invalid_provenance_first: bool = False,
-        association_search_once: bool = False,
         review_mode: str = "keep",
         extraction_delay_seconds: float = 0.0,
         answer_delay_seconds: float = 0.0,
@@ -36,13 +35,11 @@ class FakeGenerationProvider:
         self.split_missing_direct_first = split_missing_direct_first
         self.split_oversized_first = split_oversized_first
         self.review_invalid_provenance_first = review_invalid_provenance_first
-        self.association_search_once = association_search_once
         self.review_mode = review_mode
         self.extraction_delay_seconds = extraction_delay_seconds
         self.answer_delay_seconds = answer_delay_seconds
         self.always_new_domain = always_new_domain
         self.requests: list[GenerationRequest] = []
-        self._association_requested = False
         self._illegal_split_emitted = False
         self._oversized_split_emitted = False
         self._invalid_review_emitted = False
@@ -113,17 +110,6 @@ class FakeGenerationProvider:
                 self.active_extractions -= 1
         elif request.stage == "domain_linking":
             payload = _original_json(request.user_prompt)
-            if self.association_search_once and not self._association_requested:
-                self._association_requested = True
-                return GenerationResponse(
-                    text=json.dumps(
-                        {"result": "association_search", "query": "Alice activities"}
-                    ),
-                    input_tokens=6,
-                    output_tokens=4,
-                    total_tokens=10,
-                    request_id="fake-request",
-                )
             memories = payload["new_memories"]
             candidates = payload["candidates"]
             text = json.dumps(

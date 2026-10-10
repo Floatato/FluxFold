@@ -117,24 +117,8 @@ Examples:
   reason for a contextual link. Nor should `Mike` receive a contextual link just
   to repeat the direct assignment to `Mike's Beijing trip` at a broader level.
 
-The candidate pool may omit Domains with these logical relationships. When
-there is a concrete reason to look for one and `association_searches_remaining`
-is positive, use `association_search` to find contextual targets: Domains that
-may affect or constrain the memory, be affected or constrained by it, or have
-another logical relationship with it, without being its direct organizational
-home. Write the query as likely Domain names rather than paraphrasing the memory.
-
-For dental surgery, for example, search `Mike's dietary preferences, Mike's diet
-plan`; for permanent remote work, search `Mike's car purchase plan, Mike's
-commuting plans`. These searches find information whose assumptions or
-constraints may have changed, even when the wording differs from the memory.
-
-Request one query per response, up to five searches. Earlier results remain
-usable. Use returned memories as evidence to decide whether a contextual link
-is warranted; being returned by search does not itself justify a link. Shared
-`candidates` are available to every new memory; a Domain found only by search
-is available only to the memory whose results list it. When no searches remain,
-finalize using the available Domains.
+Only Domains listed in `candidates` may be selected. If a logically related
+Domain is absent, leave it unlinked.
 
 Contextual targets need not share the memory's entities. List each once in
 `contextual_domains`, omitting Domains already selected directly. The total
@@ -144,10 +128,7 @@ links. Do not add weak links to fill the budget.
 
 # 3. Output
 Return exactly one JSON object, with no prose, Markdown, or extra fields.
-To request a search:
-{"result":"association_search","query":"likely Domain names"}
-
-Otherwise, return assignments for every supplied memory, using this shape:
+Return assignments for every supplied memory, using this shape:
 {
   "result":"links",
   "memories":[
@@ -451,15 +432,11 @@ def extraction_input(episode: NormalizedEpisode) -> str:
 def linking_input(
     memories: list[dict[str, Any]],
     candidates: list[dict[str, Any]],
-    association_results: list[dict[str, Any]],
-    association_searches_remaining: int,
 ) -> str:
     return json.dumps(
         {
             "new_memories": memories,
             "candidates": candidates,
-            "association_search_results": association_results,
-            "association_searches_remaining": association_searches_remaining,
         },
         ensure_ascii=False,
     )

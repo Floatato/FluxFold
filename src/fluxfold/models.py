@@ -320,16 +320,6 @@ class NameResolutionOutput(StrictModel):
     resolutions: list[NameResolution]
 
 
-class AssociationSearchOutput(StrictModel):
-    result: Literal["association_search"]
-    query: str
-
-
-LinkingStageOutput = Annotated[
-    LinkingOutput | AssociationSearchOutput, Field(discriminator="result")
-]
-
-
 class KeepContent(StrictModel):
     action: Literal["keep"]
 
@@ -412,25 +402,6 @@ SplitStageOutput = Annotated[
     FullSplitOutput | PartialSplitOutput | DeferSplitOutput,
     Field(discriminator="result"),
 ]
-
-
-@dataclass(frozen=True, slots=True)
-class CandidateMemory:
-    memory_id: str
-    content: str
-    latest_source_at: int | None
-    similarity: float
-    attached_domain_id: str | None = None
-    attached_domain_name: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class CandidateDomain:
-    domain_id: str
-    name: str
-    similarity: float
-    attached_memory_id: str | None = None
-    attached_memory_content: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

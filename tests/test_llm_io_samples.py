@@ -42,7 +42,6 @@ async def _open(
         embedding_provider=FakeEmbeddingProvider(),
         config=FluxFoldConfig().with_overrides(
             domain_candidate_min_similarity=-1.0,
-            memory_candidate_min_similarity=-1.0,
             **overrides,
         ),
         event_sink=events.append,
@@ -182,40 +181,6 @@ def test_split_is_sampled_up_to_its_quota(tmp_path, monkeypatch) -> None:
     asyncio.run(scenario())
 
 
-def test_association_search_samples_only_the_final_decision(
-    tmp_path, monkeypatch
-) -> None:
-    async def scenario() -> None:
-        monkeypatch.setattr("fluxfold.engine.random.random", lambda: 0.0)
-        generation = FakeGenerationProvider()
-        events: list[dict[str, object]] = []
-        engine = await _open(
-            tmp_path, name="association", generation=generation, events=events
-        )
-        space = await engine.create_or_open_space("test:association")
-        await engine.add_episode(
-            space.memory_space_id, _episode("one", "Alice likes hiking.", 0)
-        )
-        generation.association_search_once = True
-        await engine.add_episode(
-            space.memory_space_id, _episode("two", "Alice bought boots.", 1)
-        )
-        assert len(_samples(events, "link")) == 1
-        samples = _samples(events, "link_association_search")
-        assert len(samples) == 1
-        sample = samples[0]
-        prompt = json.loads(str(sample["user_prompt"]))
-        assert prompt["association_search_results"][0]["query"] == ("Alice activities")
-        assert json.loads(str(sample["output"]))["result"] == "links"
-        assert all(
-            json.loads(str(item["output"]))["result"] != "association_search"
-            for item in _samples(events)
-        )
-        await engine.close()
-
-    asyncio.run(scenario())
-
-
 def test_provenance_review_samples_each_llm_call(tmp_path, monkeypatch) -> None:
     async def scenario() -> None:
         monkeypatch.setattr("fluxfold.engine.random.random", lambda: 0.0)
@@ -311,23 +276,6 @@ def test_artifact_writer_renders_readable_samples_and_enforces_quota(tmp_path) -
     resumed.event(extract)
     resumed_text = resumed.paths.llm_io_samples.read_text(encoding="utf-8")
     assert resumed_text.count("## extract · sample") == 10
-
-
-def test_artifact_writer_enforces_association_search_quota(tmp_path) -> None:
-    writer = ArtifactWriter(RunPaths(tmp_path / "run"))
-    event = {
-        "event_type": "llm_io_sample",
-        "kind": "link_association_search",
-        "timestamp_ms": 1,
-        "user_prompt": '{"association_search_results":[{"query":"q1"}]}',
-        "output": '{"result":"links","memories":[]}',
-    }
-    for _ in range(6):
-        writer.event(event)
-    text = writer.paths.llm_io_samples.read_text(encoding="utf-8")
-    assert text.count("## link_association_search · sample") == 5
-    assert '"query": "q1"' in text
-    assert '"result": "association_search"' not in text
 
 
 def test_artifact_writer_overwrites_memory_bank_snapshot(tmp_path) -> None:

@@ -37,7 +37,6 @@ def _alice_record(question_id: str) -> dict[str, object]:
 def _search_config() -> FluxFoldConfig:
     return FluxFoldConfig().with_overrides(
         domain_candidate_min_similarity=-1.0,
-        memory_candidate_min_similarity=-1.0,
         search_domain_min_similarity=-1.0,
         search_memory_min_similarity=-1.0,
     )

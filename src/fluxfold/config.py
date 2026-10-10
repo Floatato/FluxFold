@@ -30,13 +30,6 @@ class FluxFoldConfig:
     extraction_memory_warning_threshold: int = 20
     linking_candidate_warning_threshold: int = 30
     domain_candidate_min_similarity: float = 0.0
-    association_domain_candidate_top_k: int = 8
-    domain_candidate_attached_memory_k: int = 1
-    memory_candidate_top_k: int = 8
-    memory_candidate_min_similarity: float = 0.0
-    memory_candidate_attached_domain_k: int = 1
-    association_search_enabled: bool = True
-    association_search_max_calls: int = 5
     memory_link_preferred_min: int = 1
     memory_link_preferred_max: int = 4
     memory_active_domain_link_max: int = 5
@@ -103,7 +96,6 @@ class FluxFoldConfig:
                     "_retries",
                 )
             )
-            and field.name not in {"association_search_max_calls"}
         }
         positive_names.update(
             {
@@ -119,17 +111,12 @@ class FluxFoldConfig:
         for name in (
             "name_resolution_min_similarity",
             "domain_candidate_min_similarity",
-            "memory_candidate_min_similarity",
             "search_domain_min_similarity",
             "search_memory_min_similarity",
         ):
             value = getattr(self, name)
             if not -1.0 <= value <= 1.0:
                 raise ValidationError(f"cosine threshold must be in [-1, 1]: {name}")
-        if not 0 <= self.association_search_max_calls <= 5:
-            raise ValidationError(
-                "association_search_max_calls must be between zero and five"
-            )
         if self.memory_link_preferred_max > self.memory_active_domain_link_max:
             raise ValidationError("preferred link maximum exceeds the hard maximum")
         if (

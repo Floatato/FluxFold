@@ -294,7 +294,6 @@ def test_name_scoring_and_zero_recall_defaults():
     config = FluxFoldConfig()
     assert (
         config.domain_candidate_min_similarity
-        == config.memory_candidate_min_similarity
         == config.search_domain_min_similarity
         == config.search_memory_min_similarity
         == 0
@@ -623,12 +622,6 @@ def test_retired_domains_are_recalled_rebuilt_and_reactivated_without_old_links(
         )
         assert len(candidates) == 4
         assert "Alice" in {item["name"] for item in candidates}
-        hits = engine._store.candidate_domains(sid, vector, top_k=20, min_similarity=-1)
-        assert {root, work} <= {hit.domain_id for hit in hits}
-        assert (
-            next(hit for hit in hits if hit.domain_id == root).attached_memory_id
-            is None
-        )
         result = await engine.search(sid, "Alice")
         assert not {root, work} & {domain.domain_id for domain in result.domains}
         # Retrieval alone does not restore either retired domain.
@@ -709,13 +702,7 @@ def test_public_search_filters_empty_domains_before_top_k(tmp_path):
                 signature,
                 1,
             )
-        write_hits = engine._store.candidate_domains(
-            space.memory_space_id, vector, top_k=1, min_similarity=-1
-        )
-        assert write_hits[0].domain_id == "empty"
-        public = engine._store._scan_domains(
-            space.memory_space_id, vector, 1, -1, public=True
-        )
+        public = engine._store._scan_domains(space.memory_space_id, vector, 1, -1)
         assert len(public) == 1 and public[0][0] != "empty"
         result = await engine.search(space.memory_space_id, "empty exact match")
         assert all(domain.domain_id != "empty" for domain in result.domains)
