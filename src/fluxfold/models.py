@@ -424,10 +424,16 @@ class DomainSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class MemoryBankMemory:
+    content: str
+    basis: Literal["direct", "contextual"]
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryBankDomain:
     name: str
     summary: str | None
-    memory_contents: tuple[str, ...]
+    memories: tuple[MemoryBankMemory, ...]
 
 
 @dataclass(frozen=True, slots=True)

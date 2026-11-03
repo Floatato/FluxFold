@@ -25,6 +25,7 @@ from fluxfold.models import (
     DomainSnapshot,
     EpisodeBlock,
     MemoryBankDomain,
+    MemoryBankMemory,
     MemoryBankSpace,
     MemorySnapshot,
     MemorySpace,
@@ -40,7 +41,7 @@ from fluxfold.models import (
 from fluxfold.names import NameEntry, normalized_name
 from fluxfold.providers import EmbeddingModelInfo
 
-SCHEMA_VERSION = "7"
+SCHEMA_VERSION = "8"
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +303,9 @@ class Store:
         )
         connection.execute(
             "DELETE FROM entities WHERE memory_space_id=?", (memory_space_id,)
+        )
+        connection.execute(
+            "DELETE FROM domain_lineage WHERE memory_space_id=?", (memory_space_id,)
         )
         connection.execute(
             "DELETE FROM domains WHERE memory_space_id = ?", (memory_space_id,)
@@ -1561,6 +1565,47 @@ class Store:
         )
         self._effect(connection, operation_id, "memory", memory_id, "retired")
 
+    def domain_ancestors(self, memory_space_id: str) -> dict[str, set[str]]:
+        """Return transitive ancestors, including retired intermediate domains."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """WITH RECURSIVE ancestors(child, parent) AS (
+                    SELECT child_domain_id, parent_domain_id FROM domain_lineage WHERE memory_space_id=?
+                    UNION
+                    SELECT a.child, e.parent_domain_id FROM ancestors a
+                    JOIN domain_lineage e ON e.child_domain_id=a.parent
+                ) SELECT child, parent FROM ancestors""",
+                (memory_space_id,),
+            ).fetchall()
+        result: dict[str, set[str]] = {}
+        for row in rows:
+            result.setdefault(row["child"], set()).add(row["parent"])
+        return result
+
+    def _insert_lineage_edge(
+        self,
+        connection: sqlite3.Connection,
+        memory_space_id: str,
+        parent: str,
+        child: str,
+        operation_id: str,
+    ) -> None:
+        cycle = connection.execute(
+            """WITH RECURSIVE descendants(id) AS (
+                SELECT ? UNION
+                SELECT e.child_domain_id FROM domain_lineage e JOIN descendants d ON e.parent_domain_id=d.id
+            ) SELECT 1 FROM descendants WHERE id=?""",
+            (child, parent),
+        ).fetchone()
+        if cycle is not None:
+            raise ValidationError("split would create a domain lineage cycle")
+        connection.execute(
+            """INSERT OR IGNORE INTO domain_lineage
+            (memory_space_id, parent_domain_id, child_domain_id, created_by_operation_id)
+            VALUES (?, ?, ?, ?)""",
+            (memory_space_id, parent, child, operation_id),
+        )
+
     def commit_split(
         self,
         *,
@@ -1674,6 +1719,13 @@ class Store:
                     """INSERT OR IGNORE INTO entity_domains(entity_id, domain_id)
                     SELECT entity_id, ? FROM entity_domains WHERE domain_id=?""",
                     (target_id, original.domain_id),
+                )
+                self._insert_lineage_edge(
+                    connection,
+                    memory_space_id,
+                    original.domain_id,
+                    target_id,
+                    operation_id,
                 )
                 added = 0
                 for link in prepared.links:
@@ -1899,7 +1951,8 @@ class Store:
                     s.name AS name,
                     s.summary AS summary,
                     u.memory_id AS memory_id,
-                    v.content AS content
+                    v.content AS content,
+                    l.link_basis AS link_basis
                 FROM memory_spaces ms
                 LEFT JOIN domains s
                     ON s.memory_space_id = ms.memory_space_id
@@ -1931,7 +1984,10 @@ class Store:
                 spaces[space_key][domain_id] = MemoryBankDomain(
                     current.name,
                     current.summary,
-                    (*current.memory_contents, row["content"]),
+                    (
+                        *current.memories,
+                        MemoryBankMemory(row["content"], row["link_basis"]),
+                    ),
                 )
         return tuple(
             MemoryBankSpace(
@@ -2220,14 +2276,6 @@ class Store:
             )
         }
 
-    def memory_link_limit(self, memory_id: str) -> int:
-        with self._connect() as connection:
-            entity_count = connection.execute(
-                "SELECT count(*) FROM memory_entities WHERE memory_id=?",
-                (memory_id,),
-            ).fetchone()[0]
-        return max(self.config.memory_active_domain_link_max, int(entity_count))
-
     def _validate_active_memory_links(
         self, connection: sqlite3.Connection, memory_space_id: str
     ) -> None:
@@ -2240,11 +2288,10 @@ class Store:
             LEFT JOIN domain_memory_links l ON l.memory_id = u.memory_id
             WHERE u.memory_space_id = ? AND u.lifecycle_status = 'active'
             GROUP BY u.memory_id
-            HAVING active_links < 1 OR direct_links < 1 OR active_links > max(?,
-                (SELECT count(*) FROM memory_entities ma WHERE ma.memory_id=u.memory_id))
+            HAVING direct_links < 1
             LIMIT 1
             """,
-            (memory_space_id, self.config.memory_active_domain_link_max),
+            (memory_space_id,),
         ).fetchone()
         if invalid is not None:
             raise ValidationError(

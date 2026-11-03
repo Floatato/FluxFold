@@ -81,8 +81,8 @@ dataset session
 → normalize + persist immutable episode (content_hash, source_sequence)
 → memory extraction + entity resolution (0..N memories with named entities, or no_valuable_memory)
 → prepare same-name entity domains and actual memory IDs
-→ per-memory, per-entity domain-name recall (active/retired top 3 plus same-name domain; batch deduplication)
-→ batched Domain linking           (one structured decision per episode)
+→ per-memory, per-entity domain-name recall (active/retired top 5, independently per memory and entity)
+→ batched Domain linking           (Jev direct Choice, ancestor filtering, contextual Noul)
 → atomic commit                     (entities, memberships, memories, versions, provenance, embeddings, domains, reactivation, links, completion)
 → Domain split / Domain review    (split first when both are due)
 → Domain summary refresh           (durable episode targets, up to 5 concurrent rewrites)

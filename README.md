@@ -1,6 +1,6 @@
 # FluxFold
 
-FluxFold is an experimental agent-memory library that spends LLM cost on the write path and keeps the read path as exact vector search. Memories carry named base `entities` and are grouped into bounded `domain`s which can be reviewed and split as they grow. Linking recalls up to three domains per memory and entity, plus its same-name container, and assigns each entity to the finest fitting domain before adding contextual links. Domain names are unique across active and retired objects; selected retired domains are reactivated. Ambiguous entity names receive a conditional LLM resolution pass. Public search excludes retired and empty domains before selecting its top results.
+FluxFold is an experimental agent-memory library that spends LLM cost on the write path and keeps the read path as exact vector search. Memories carry named base `entities` and are grouped into bounded `domain`s which can be reviewed and split as they grow. Linking recalls the top five domains per memory and entity. Jev Choice selects the finest fitting domain; Noul judges remaining candidates after excluding direct targets and their ancestors. Code selects at most two contextual targets per entity. Split lineage is persisted as an acyclic graph with multiple parents. Domain names are unique across active and retired objects; selected retired domains are reactivated. Ambiguous entity names receive a conditional LLM resolution pass. Public search excludes retired and empty domains before selecting its top results.
 
 The experimental version is a Python library with adapters and runners for LongMemEval-S and LoCoMo_refined. It is not production-ready and has no product CLI, TUI, connector, daemon, or network service.
 
@@ -22,11 +22,11 @@ Already have the environment:
 uv sync
 ```
 
-Current experimental databases use schema version 7. Builds from earlier schemas need a new database; the library rejects incompatible schemas and does not migrate existing benchmark runs.
+Current experimental databases use schema version 8. Builds from earlier schemas need a new database; the library rejects incompatible schemas and does not migrate existing benchmark runs.
 
 ## Library usage
 
-`FluxFold` is asynchronous. Applications provide a generation provider. Retrieval uses the local `sentence-transformers/all-MiniLM-L6-v2` model by default; the model is downloaded from Hugging Face on first use and then reused from the local cache. An OpenAI-compatible embedding adapter remains available for explicit configuration.
+`FluxFold` is asynchronous. Applications provide generation and typed decision providers for writes. Retrieval uses the local `sentence-transformers/all-MiniLM-L6-v2` model by default; the model is downloaded from Hugging Face on first use and then reused from the local cache. An OpenAI-compatible embedding adapter remains available for explicit configuration.
 
 ```python
 import asyncio
@@ -36,6 +36,7 @@ from fluxfold import (
     FluxFold,
     NormalizedEpisode,
     OpenAICompatibleGenerationProvider,
+    TypeSafeDecisionProvider,
     Role,
 )
 
@@ -48,6 +49,7 @@ async def main() -> None:
     async with await FluxFold.open(
         db_path="fluxfold.sqlite3",
         generation_provider=generation,
+        decision_provider=TypeSafeDecisionProvider(),  # reads TYPESAFE_API_KEY
     ) as engine:
         space = await engine.create_or_open_space("example")
         await engine.add_episode(
@@ -82,7 +84,7 @@ cp .env.example .env
 ```
 
 Fill the empty values in `.env` for the three generation groups (`FLUXFOLD_BUILD_*`,
-`FLUXFOLD_ANSWER_*`, `FLUXFOLD_SCORE_*`). The benchmark uses the bundled local embedding model unless `.env` explicitly selects `openai-compatible`, then:
+`FLUXFOLD_ANSWER_*`, `FLUXFOLD_SCORE_*`) and `TYPESAFE_API_KEY` for linking. The benchmark uses the bundled local embedding model unless `.env` explicitly selects `openai-compatible`, then:
 
 ```bash
 uv run python -m benchmarks.scripts.build_sample --dataset longmemeval
@@ -97,3 +99,10 @@ uv run python -m benchmarks.scripts.score_sample --dataset locomo_refined
 ```
 
 `build` without `--run-dir` creates `runs/{dataset}_{month}.{day}_{HH:MM}_{seq}` using local time, for example `runs/longmemeval_8.27_21:02_1`. A second build in the same minute becomes `_2`. `answer` and `score` without `--run-dir` use the latest run of that dataset and mode. Pass `--run-dir` to override. Replace `_sample` with `_full` for complete datasets. Optional `--config` TOML overrides go under `[fluxfold]`. Build accepts `--memory-space-build-concurrency N` to override how many memory spaces are built at once (default 10).
+
+Jev linking uses `TYPESAFE_API_KEY` and defaults to the pinned `jev-1.14.0` model
+(`FLUXFOLD_LINK_MODEL` in benchmark builds). Existing experimental databases must
+be rebuilt for the domain-lineage schema. Read-only use does not require a decision
+provider. Build runs write full `link_decisions.jsonl` and `link_decisions.md` traces,
+including probabilities, candidate filtering, per-entity selections, and commit status.
+The final memory bank marks each membership as direct or contextual.

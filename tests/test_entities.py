@@ -4,17 +4,20 @@ import asyncio
 import json
 import sqlite3
 
-import numpy as np
 import pytest
 
 from fluxfold import FluxFold, FluxFoldConfig
 from fluxfold.errors import ErrorClass, StageFailure, ValidationError
 from fluxfold.models import FullSplitOutput
-from fluxfold.names import NameEntry, bm25_scores, normalized_name
+from fluxfold.names import bm25_scores, normalized_name
 from fluxfold.prompts import EXTRACTION_SYSTEM
 from fluxfold.providers import GenerationResponse
 from fluxfold.storage import PreparedLink
-from tests.fakes import FakeEmbeddingProvider, FakeGenerationProvider
+from tests.fakes import (
+    FakeDecisionProvider,
+    FakeEmbeddingProvider,
+    FakeGenerationProvider,
+)
 from tests.test_engine import _episode
 
 
@@ -64,6 +67,7 @@ def test_entity_alias_resolution_is_atomic_persistent_and_warns(tmp_path):
         engine = await FluxFold.open(
             db_path=str(tmp_path / "aliases.db"),
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
             event_sink=events.append,
         )
@@ -76,7 +80,7 @@ def test_entity_alias_resolution_is_atomic_persistent_and_warns(tmp_path):
         )
         bank = engine.memory_bank()[0]
         assert [domain.name for domain in bank.domains] == ["Alice"]
-        assert len(bank.domains[0].memory_contents) == 2
+        assert len(bank.domains[0].memories) == 2
         with engine._store._connect() as db:
             assert db.execute("SELECT count(*) FROM entities").fetchone()[0] == 1
             assert db.execute("SELECT count(*) FROM memory_entities").fetchone()[0] == 2
@@ -103,13 +107,13 @@ def test_exact_name_reuse_works_when_domain_is_not_recalled(tmp_path, monkeypatc
         engine = await FluxFold.open(
             db_path=str(tmp_path / "exact.db"),
             generation_provider=FakeGenerationProvider(),
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
         )
         first = await engine.create_or_open_space("first")
         await engine.add_episode(
             first.memory_space_id, _episode("1", "Alice likes hiking", 0)
         )
-        engine.config = FluxFoldConfig(domain_candidate_min_similarity=1.0)
         result = await engine.add_episode(
             first.memory_space_id, _episode("2", "Alice bought land", 1)
         )
@@ -133,19 +137,21 @@ def test_exact_name_reuse_works_when_domain_is_not_recalled(tmp_path, monkeypatc
     asyncio.run(scenario())
 
 
-def test_failed_link_does_not_persist_entities(tmp_path):
-    class FailingProvider(FakeGenerationProvider):
-        async def generate(self, request):
-            if request.stage == "domain_linking":
-                raise StageFailure(
-                    "domain_linking", ErrorClass.INVALID_STRUCTURED_OUTPUT, "invalid"
-                )
-            return await super().generate(request)
+def test_failed_link_does_not_persist_entities(tmp_path, monkeypatch):
+    from fluxfold.linking import Linker
+
+    async def fail(self, *args):
+        raise StageFailure(
+            "domain_linking_direct", ErrorClass.INVALID_STRUCTURED_OUTPUT, "invalid"
+        )
+
+    monkeypatch.setattr(Linker, "link", fail)
 
     async def scenario():
         engine = await FluxFold.open(
             db_path=str(tmp_path / "failed.db"),
-            generation_provider=FailingProvider(),
+            generation_provider=FakeGenerationProvider(),
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
         )
         space = await engine.create_or_open_space("a")
@@ -165,6 +171,7 @@ def test_batch_entity_proposals_resolve_against_earlier_proposals(tmp_path):
         engine = await FluxFold.open(
             db_path=str(tmp_path / "batch.db"),
             generation_provider=AliasProvider(),
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
         )
         space = await engine.create_or_open_space("a")
@@ -212,6 +219,7 @@ def test_split_reuses_existing_target_and_unions_entity_membership(tmp_path):
         engine = await FluxFold.open(
             db_path=str(tmp_path / "split.db"),
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
         )
         space = await engine.create_or_open_space("a")
@@ -258,6 +266,9 @@ def test_split_reuses_existing_target_and_unions_entity_membership(tmp_path):
         )
         memberships = engine._store.domain_entity_names(space.memory_space_id)
         assert memberships[catalog["Bob"]] == {"Alice", "Bob"}
+        assert engine._store.domain_ancestors(space.memory_space_id)[
+            catalog["Bob"]
+        ] == {catalog["Alice"]}
         target = engine._store.domain_snapshot(space.memory_space_id, catalog["Bob"])
         assert len(target.memories) == 9
         assert target.new_memory_count == 2
@@ -293,10 +304,7 @@ def test_name_scoring_and_zero_recall_defaults():
     assert scores[0] > scores[2] > scores[1] == 0
     config = FluxFoldConfig()
     assert (
-        config.domain_candidate_min_similarity
-        == config.search_domain_min_similarity
-        == config.search_memory_min_similarity
-        == 0
+        config.search_domain_min_similarity == config.search_memory_min_similarity == 0
     )
 
 
@@ -320,6 +328,7 @@ def test_size_warnings_do_not_truncate_extraction_or_candidates(tmp_path, monkey
         engine = await FluxFold.open(
             db_path=str(tmp_path / "warnings.db"),
             generation_provider=ManyMemories(),
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
             event_sink=events.append,
         )
@@ -331,27 +340,6 @@ def test_size_warnings_do_not_truncate_extraction_or_candidates(tmp_path, monkey
         assert any(
             event["event_type"] == "extraction_memory_count_warning"
             and event["memory_count"] == 21
-            for event in events
-        )
-        entries = tuple(
-            NameEntry(str(index), f"Domain {index}", np.array([1.0]))
-            for index in range(33)
-        )
-        monkeypatch.setattr(engine._store, "domain_names", lambda _: entries)
-        monkeypatch.setattr(
-            engine._store,
-            "domain_entity_names",
-            lambda _: {str(index): {f"Entity {index // 3}"} for index in range(33)},
-        )
-        candidates, _ = engine._recall_initial_domain_candidates(
-            space.memory_space_id,
-            [np.array([1.0])],
-            [[f"Entity {index}" for index in range(11)]],
-        )
-        assert len(candidates) == 44
-        assert any(
-            event["event_type"] == "linking_candidate_count_warning"
-            and event["candidate_count"] == 44
             for event in events
         )
         await engine.close()
@@ -367,6 +355,7 @@ def test_model_switch_rebuilds_entity_vectors_and_space_delete_cleans_relations(
         engine = await FluxFold.open(
             db_path=str(path),
             generation_provider=FakeGenerationProvider(),
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
         )
         space = await engine.create_or_open_space("a")
@@ -378,6 +367,7 @@ def test_model_switch_rebuilds_entity_vectors_and_space_delete_cleans_relations(
         engine = await FluxFold.open(
             db_path=str(path),
             generation_provider=FakeGenerationProvider(),
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(revision="2"),
         )
         rebuilt = await engine.rebuild_retrieval_embeddings(space.memory_space_id)
@@ -398,7 +388,7 @@ def test_model_switch_rebuilds_entity_vectors_and_space_delete_cleans_relations(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("version", ["4", "5", "6"])
+@pytest.mark.parametrize("version", ["4", "5", "6", "7"])
 def test_old_schema_rejected_before_applying_new_ddl(tmp_path, version):
     from fluxfold.storage import Store
 
@@ -421,56 +411,30 @@ def test_old_schema_rejected_before_applying_new_ddl(tmp_path, version):
 def test_direct_assignments_cover_entities_without_counting_inherited_memberships(
     tmp_path,
 ):
-    from fluxfold.models import LinkingOutput
-
     class Provider(FakeGenerationProvider):
-        shared = False
-
         async def generate(self, request):
-            if "name_resolution" in request.user_prompt:
-                return await super().generate(request)
-            if request.stage == "memory_extraction":
+            if (
+                request.stage == "memory_extraction"
+                and "name_resolution" not in request.user_prompt
+            ):
                 return response(
                     {
                         "result": "memories",
                         "memories": [
                             {
-                                "content": "A joint fact about six people.",
-                                "entities": [f"Person {index}" for index in range(6)],
+                                "content": "A joint fact.",
+                                "entities": [f"Person {i}" for i in range(6)],
                             }
-                        ],
-                    }
-                )
-            if request.stage == "domain_linking":
-                self.requests.append(request)
-                payload = json.loads(request.user_prompt)
-                return response(
-                    {
-                        "result": "links",
-                        "memories": [
-                            {
-                                "memory_id": memory["memory_id"],
-                                "direct_assignments": [
-                                    {
-                                        "entity": entity,
-                                        "domain": "Person 0" if self.shared else entity,
-                                    }
-                                    for entity in memory["entities"]
-                                ],
-                                # Duplicate contextual references to a direct target must collapse.
-                                "contextual_domains": ["Person 0", "Person 0"],
-                            }
-                            for memory in payload["new_memories"]
                         ],
                     }
                 )
             return await super().generate(request)
 
     async def scenario():
-        generation = Provider()
         engine = await FluxFold.open(
             db_path=str(tmp_path / "coverage.db"),
-            generation_provider=generation,
+            generation_provider=Provider(),
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
         )
         space = await engine.create_or_open_space("coverage")
@@ -478,16 +442,6 @@ def test_direct_assignments_cover_entities_without_counting_inherited_membership
             space.memory_space_id, _episode("1", "six people", 0)
         )
         assert first.domains_created == first.links_created == 6
-        payload = json.loads(
-            next(
-                r.user_prompt
-                for r in generation.requests
-                if r.stage == "domain_linking"
-            )
-        )
-        assert payload["new_memories"][0]["link_limit"] == 6
-        assert "base_domains" not in payload
-        # Simulate the all-entity memberships inherited by split children.
         with engine._store._transaction() as db:
             db.execute(
                 "INSERT OR IGNORE INTO entity_domains SELECT entity_id, domain_id FROM entities CROSS JOIN domains"
@@ -495,43 +449,7 @@ def test_direct_assignments_cover_entities_without_counting_inherited_membership
         second = await engine.add_episode(
             space.memory_space_id, _episode("2", "six people again", 1)
         )
-        assert second.links_created == 6
-        generation.shared = True
-        third = await engine.add_episode(
-            space.memory_space_id, _episode("3", "shared scope", 2)
-        )
-        assert third.links_created == 1
-        ids = [
-            memory.memory_id
-            for memory in engine._store.domain_snapshot(
-                space.memory_space_id,
-                engine._store.domain_names(space.memory_space_id)[0].object_id,
-            ).memories
-        ]
-        assert payload["new_memories"][0]["memory_id"] in ids
-        entities = [f"Person {index}" for index in range(6)]
-        valid = {
-            "result": "links",
-            "memories": [
-                {
-                    "memory_id": "test-id",
-                    "direct_assignments": [
-                        {"entity": name, "domain": name} for name in entities
-                    ],
-                    "contextual_domains": [],
-                }
-            ],
-        }
-        output = LinkingOutput.model_validate(valid)
-        output.memories[0].direct_assignments[-1].entity = entities[0]
-        with pytest.raises(ValidationError, match="exactly one direct assignment"):
-            engine._validate_linking(
-                output,
-                ["test-id"],
-                {"test-id": set(entities)},
-                [entities],
-                space.memory_space_id,
-            )
+        assert second.links_created == 1
         await engine.close()
 
     asyncio.run(scenario())
@@ -564,6 +482,7 @@ def test_retired_domains_are_recalled_rebuilt_and_reactivated_without_old_links(
         engine = await FluxFold.open(
             db_path=path,
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
         )
         space = await engine.create_or_open_space("lifecycle")
@@ -617,10 +536,22 @@ def test_retired_domains_are_recalled_rebuilt_and_reactivated_without_old_links(
         assert root not in engine._store.active_domain_ids(sid)
         assert work not in engine._store.active_domain_ids(sid)
         vector = (await engine._embed_queries(["Alice"]))[0]
-        candidates, _ = engine._recall_initial_domain_candidates(
-            sid, [vector], [["Alice"]]
+        events = []
+        engine._event_sink = events.append
+        await engine._link_memories(
+            sid,
+            ["probe"],
+            ["Alice"],
+            [vector],
+            [["Alice"]],
+            [],
+            episode_id="probe",
+            link_attempt_id="probe",
         )
-        assert len(candidates) == 4
+        candidates = next(e for e in events if e["event_type"] == "link_decision")[
+            "groups"
+        ][0]["candidates"]
+        assert len(candidates) == 5
         assert "Alice" in {item["name"] for item in candidates}
         result = await engine.search(sid, "Alice")
         assert not {root, work} & {domain.domain_id for domain in result.domains}
@@ -630,11 +561,29 @@ def test_retired_domains_are_recalled_rebuilt_and_reactivated_without_old_links(
         engine = await FluxFold.open(
             db_path=path,
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(revision="2"),
         )
         rebuilt = await engine.rebuild_retrieval_embeddings(sid)
         assert rebuilt.domains_embedded == 5
         assert len(engine._store.domain_names(sid)) == 5
+
+        class RootDecision(FakeDecisionProvider):
+            async def decide(self, questions):
+                result = await super().decide(questions)
+                for key, question in questions.items():
+                    if question.kind == "choice":
+                        result.answers[key] = {
+                            "type": "choice",
+                            "choice": "Alice",
+                            "probabilities": {
+                                name: float(name == "Alice")
+                                for name in question.options
+                            },
+                        }
+                return result
+
+        engine._decision = RootDecision()
         second = await engine.add_episode(sid, _episode("2", "new Alice facts", 1))
         assert second.domains_created == 0
         restored = engine._store.domain_snapshot(sid, root)
@@ -680,6 +629,7 @@ def test_public_search_filters_empty_domains_before_top_k(tmp_path):
         engine = await FluxFold.open(
             db_path=str(tmp_path / "empty.db"),
             generation_provider=FakeGenerationProvider(),
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig(
                 search_domain_top_k=1, search_domain_min_similarity=-1.0

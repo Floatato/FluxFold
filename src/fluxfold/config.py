@@ -24,15 +24,12 @@ class FluxFoldConfig:
     episode_chars_max: int = 96_000
     message_chars_max: int = 32_000
     longmemeval_message_chars_max: int = 80_000
-    entity_domain_candidate_top_k: int = 3
+    entity_domain_candidate_top_k: int = 5
     name_resolution_min_similarity: float = 0.8
     name_resolution_bm25_threshold: float = 2.0
     extraction_memory_warning_threshold: int = 20
-    linking_candidate_warning_threshold: int = 30
-    domain_candidate_min_similarity: float = 0.0
-    memory_link_preferred_min: int = 1
-    memory_link_preferred_max: int = 4
-    memory_active_domain_link_max: int = 5
+    contextual_domain_max_per_entity: int = 2
+    contextual_probability_threshold: float = 0.5
     domain_review_new_memory_threshold: int = 8
     review_provenance_memory_max: int = 8
     memory_provenance_episode_max: int = 6
@@ -42,7 +39,6 @@ class FluxFoldConfig:
     domain_split_result_domain_max: int = 5
     domain_split_result_min_memories: int = 3
     domain_split_result_target_memory_max: int = 20
-    domain_split_memory_membership_max: int = 2
     search_domain_top_k: int = 5
     search_domain_min_similarity: float = 0.0
     search_domain_attached_memory_k: int = 1
@@ -50,7 +46,6 @@ class FluxFoldConfig:
     search_memory_min_similarity: float = 0.0
     search_memory_attached_domain_k: int = 1
     extraction_temperature: float = 0.1
-    linking_temperature: float = 0.0
     review_temperature: float = 0.1
     split_temperature: float = 0.1
     structured_output_max_retries: int = 5
@@ -97,6 +92,10 @@ class FluxFoldConfig:
                 )
             )
         }
+        positive_names.discard("contextual_probability_threshold")
+        if not 0 <= self.contextual_probability_threshold <= 1:
+            raise ValidationError("contextual probability threshold must be in [0, 1]")
+        positive_names.add("contextual_domain_max_per_entity")
         positive_names.update(
             {
                 "embedding_batch_concurrency_per_operation",
@@ -110,15 +109,12 @@ class FluxFoldConfig:
                 raise ValidationError(f"configuration value must be positive: {name}")
         for name in (
             "name_resolution_min_similarity",
-            "domain_candidate_min_similarity",
             "search_domain_min_similarity",
             "search_memory_min_similarity",
         ):
             value = getattr(self, name)
             if not -1.0 <= value <= 1.0:
                 raise ValidationError(f"cosine threshold must be in [-1, 1]: {name}")
-        if self.memory_link_preferred_max > self.memory_active_domain_link_max:
-            raise ValidationError("preferred link maximum exceeds the hard maximum")
         if (
             self.domain_split_result_min_memories
             > self.domain_split_result_target_memory_max

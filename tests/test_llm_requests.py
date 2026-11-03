@@ -17,23 +17,27 @@ from fluxfold.prompts import (
     validation_feedback,
 )
 from fluxfold.providers import GenerationRequest, GenerationResponse
-from tests.fakes import FakeEmbeddingProvider, FakeGenerationProvider
+from tests.fakes import (
+    FakeDecisionProvider,
+    FakeEmbeddingProvider,
+    FakeGenerationProvider,
+)
 
 
 class RepairingGenerationProvider(FakeGenerationProvider):
     def __init__(self) -> None:
         super().__init__()
-        self._invalid_linking_outputs = iter(
+        self._invalid_extraction_outputs = iter(
             (
-                json.dumps({"result": "links", "first_marker": True}),
-                json.dumps({"result": "links", "second_marker": True}),
+                json.dumps({"result": "memories", "first_marker": True}),
+                json.dumps({"result": "memories", "second_marker": True}),
             )
         )
 
     async def generate(self, request: GenerationRequest) -> GenerationResponse:
-        if request.stage == "domain_linking":
+        if request.stage == "memory_extraction":
             try:
-                text = next(self._invalid_linking_outputs)
+                text = next(self._invalid_extraction_outputs)
             except StopIteration:
                 pass
             else:
@@ -231,6 +235,7 @@ def test_structured_retry_does_not_accumulate_older_outputs(tmp_path) -> None:
         engine = await FluxFold.open(
             db_path=str(tmp_path / "repair.sqlite3"),
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
             event_sink=events.append,
         )
@@ -244,22 +249,23 @@ def test_structured_retry_does_not_accumulate_older_outputs(tmp_path) -> None:
 
         await engine.add_episode(space.memory_space_id, episode)
 
-        linking_requests = [
+        extraction_requests = [
             request
             for request in generation.requests
-            if request.stage == "domain_linking"
+            if request.stage == "memory_extraction"
         ]
-        assert len(linking_requests) == 3
-        assert "first_marker" in linking_requests[1].user_prompt
-        assert "second_marker" in linking_requests[2].user_prompt
-        assert "first_marker" not in linking_requests[2].user_prompt
-        assert all(request.timeout_seconds is None for request in linking_requests)
-        linking_call_events = [
+        assert len(extraction_requests) == 3
+        assert "first_marker" in extraction_requests[1].user_prompt
+        assert "second_marker" in extraction_requests[2].user_prompt
+        assert "first_marker" not in extraction_requests[2].user_prompt
+        assert all(request.timeout_seconds is None for request in extraction_requests)
+        extraction_call_events = [
             event
             for event in events
-            if event["event_type"] == "llm_call" and event["stage"] == "domain_linking"
+            if event["event_type"] == "llm_call"
+            and event["stage"] == "memory_extraction"
         ]
-        assert [event["result"] for event in linking_call_events] == [
+        assert [event["result"] for event in extraction_call_events] == [
             "failed",
             "failed",
             "success",

@@ -8,6 +8,7 @@ from collections.abc import Sequence
 
 import numpy as np
 
+from fluxfold.decisions import DecisionQuestion, DecisionResponse
 from fluxfold.providers import (
     EmbeddingModelInfo,
     EmbeddingResponse,
@@ -108,37 +109,6 @@ class FakeGenerationProvider:
                 )
             finally:
                 self.active_extractions -= 1
-        elif request.stage == "domain_linking":
-            payload = _original_json(request.user_prompt)
-            memories = payload["new_memories"]
-            candidates = payload["candidates"]
-            text = json.dumps(
-                {
-                    "result": "links",
-                    "memories": [
-                        {
-                            "memory_id": memory["memory_id"],
-                            "direct_assignments": [
-                                {
-                                    "entity": entity,
-                                    "domain": next(
-                                        candidate["name"]
-                                        for candidate in candidates
-                                        if entity in candidate["entities"]
-                                        and (
-                                            not self.always_new_domain
-                                            or candidate["name"] == entity
-                                        )
-                                    ),
-                                }
-                                for entity in memory["entities"]
-                            ],
-                            "contextual_domains": [],
-                        }
-                        for memory in memories
-                    ],
-                }
-            )
         elif request.stage == "domain_review":
             payload = _original_json(request.user_prompt)
             memories = payload["domain"]["memories"]
@@ -371,3 +341,33 @@ def _original_json(prompt: str) -> dict[str, object]:
     value = json.loads(original)
     assert isinstance(value, dict)
     return value
+
+
+class FakeDecisionProvider:
+    def __init__(self):
+        self.requests = []
+
+    @property
+    def model_id(self):
+        return "fake-decision"
+
+    async def decide(self, questions: dict[str, DecisionQuestion]) -> DecisionResponse:
+        self.requests.append(questions)
+        answers = {}
+        for key, question in questions.items():
+            if question.kind == "choice":
+                chosen = question.options[0]
+                answers[key] = {
+                    "type": "choice",
+                    "choice": chosen,
+                    "probabilities": {
+                        option: float(option == chosen) for option in question.options
+                    },
+                    "confidence": 1.0,
+                }
+            else:
+                answers[key] = {"type": "noul", "noul": 0.0}
+        return DecisionResponse(answers, self.model_id, 6, 4)
+
+    async def close(self):
+        pass

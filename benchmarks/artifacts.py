@@ -19,7 +19,7 @@ _LLM_IO_SAMPLE_HEADER = """# LLM I/O samples
 
 Each LLM call that returns model output has an independent 10% chance of being sampled. Each sample contains only the user prompt and model output.
 
-Quotas: extract, link, review, split, and summary ×10.
+Quotas: extract, review, split, and summary ×10.
 
 """
 
@@ -39,6 +39,14 @@ class RunPaths:
     @property
     def events(self) -> Path:
         return self.root / "build_events.jsonl"
+
+    @property
+    def link_decisions(self) -> Path:
+        return self.root / "link_decisions.jsonl"
+
+    @property
+    def link_report(self) -> Path:
+        return self.root / "link_decisions.md"
 
     @property
     def llm_io_samples(self) -> Path:
@@ -101,6 +109,7 @@ class ArtifactWriter:
         self._llm_output_tokens = 0
         self._llm_total_tokens = 0
         self._terminal_failures = 0
+        self._link_metrics: Counter[str] = Counter()
         self._llm_io_sample_counts = _llm_io_sample_counts(paths.llm_io_samples)
         if paths.events.exists():
             for line in paths.events.read_text(encoding="utf-8").splitlines():
@@ -109,6 +118,11 @@ class ArtifactWriter:
 
     def event(self, event: dict[str, object]) -> None:
         event_type = str(event.get("event_type", ""))
+        if event_type.startswith("link_") and event_type != "link_batch_summary":
+            self._write_link_event(event)
+            return
+        if event_type == "episode_committed":
+            self._write_link_event(event)
         if event_type == "llm_io_sample":
             self._accept_llm_io_sample(event)
             return
@@ -120,6 +134,14 @@ class ArtifactWriter:
                 handle.write(
                     json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
                 )
+
+    def _write_link_event(self, event: dict[str, object]) -> None:
+        with self._lock:
+            record = {"run_id": self.run_id, **event}
+            with self.paths.link_decisions.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            with self.paths.link_report.open("a", encoding="utf-8") as handle:
+                handle.write(_render_link_event(record))
 
     def _accept_llm_io_sample(self, event: dict[str, object]) -> None:
         kind = str(event["kind"])
@@ -144,6 +166,7 @@ class ArtifactWriter:
     def build_metrics(self) -> dict[str, int]:
         with self._lock:
             return {
+                **self._link_metrics,
                 "successful_llm_call_count": self._successful_llm_calls,
                 "failed_llm_call_count": self._failed_llm_calls,
                 "build_llm_input_tokens": self._llm_input_tokens,
@@ -153,6 +176,31 @@ class ArtifactWriter:
             }
 
     def _count_event(self, event: dict[str, object]) -> None:
+        if event.get("event_type") == "link_batch_summary":
+            for field in ("noul_probabilities", "choice_margins"):
+                for value in event.get(field, []):
+                    bucket = min(int(float(value) * 10), 9)
+                    self._link_metrics[f"link_{field}_bin_{bucket}"] += 1
+            for key in (
+                "direct_question_count",
+                "contextual_question_count",
+                "single_candidate_count",
+                "direct_link_count",
+                "contextual_link_count",
+                "entity_limit_count",
+            ):
+                self._link_metrics[f"link_{key}"] += int(event[key])
+        if event.get("event_type") == "llm_call" and str(
+            event.get("stage", "")
+        ).startswith("domain_linking_"):
+            stage = str(event["stage"])
+            self._link_metrics[f"{stage}_calls"] += 1
+            self._link_metrics[f"{stage}_{event['result']}"] += 1
+            for key in ("input_tokens", "output_tokens", "question_count"):
+                self._link_metrics[f"{stage}_{key}"] += int(event.get(key, 0))
+            self._link_metrics[f"{stage}_elapsed_ms"] += round(
+                float(event["elapsed_seconds"]) * 1000
+            )
         if event.get("event_type") == "llm_call":
             self._llm_input_tokens += int(event.get("input_tokens", 0))
             self._llm_output_tokens += int(event.get("output_tokens", 0))
@@ -416,11 +464,11 @@ def _render_memory_bank(
             lines.extend([f"### {_heading_text(domain.name)}", ""])
             if domain.summary:
                 lines.extend([domain.summary, ""])
-            if not domain.memory_contents:
+            if not domain.memories:
                 lines.extend(["_(no active memories)_", ""])
                 continue
-            for content in domain.memory_contents:
-                lines.append(_bullet(content))
+            for memory in domain.memories:
+                lines.append(_bullet(f"[{memory.basis}] {memory.content}"))
             lines.append("")
     return "\n".join(lines)
 
@@ -484,3 +532,62 @@ def _markdown_fence(text: str, language: str) -> str:
     body = text if text.endswith("\n") else f"{text}\n"
     opener = f"{ticks}{language}\n" if language else f"{ticks}\n"
     return f"{opener}{body}{ticks}"
+
+
+def _render_link_event(event: dict[str, Any]) -> str:
+    kind = event["event_type"]
+    heading = f"## {kind} · episode {event.get('episode_id', '')} · attempt {event.get('link_attempt_id', '')}"
+    lines = [heading, ""]
+    if kind == "link_decision":
+        lines.extend(
+            [
+                f"Fact `{event['memory_id']}`: {event['content']}",
+                "",
+                "Status: prepared (see episode_committed for the transaction outcome).",
+                "",
+            ]
+        )
+        for group in event["groups"]:
+            lines.extend(
+                [
+                    f"### Entity: {_heading_text(group['entity'])}",
+                    "",
+                    f"Direct: {group['direct']} ({group['selection']})",
+                    "",
+                    "| Candidate | Recall similarity | Choice probability |",
+                    "| --- | ---: | ---: |",
+                ]
+            )
+            probabilities = group["probabilities"] or {}
+            for candidate in group["candidates"]:
+                name = candidate["name"]
+                lines.append(
+                    f"| {name.replace('|', '&#124;')} | {candidate['similarity']:.4f} | {probabilities.get(name, '—')} |"
+                )
+            lines.extend(
+                [
+                    "",
+                    "| Contextual candidate | Probability | Result |",
+                    "| --- | ---: | --- |",
+                ]
+            )
+            for item in group["contextual"]:
+                lines.append(
+                    f"| {item['domain'].replace('|', '&#124;')} | {item.get('probability', '—')} | {item['reason']} |"
+                )
+            lines.append("")
+        lines.extend(
+            [
+                "Final prepared links:",
+                "",
+                "```json",
+                json.dumps(event["final"], ensure_ascii=False, indent=2),
+                "```",
+                "",
+            ]
+        )
+    else:
+        lines.extend(
+            ["```json", json.dumps(event, ensure_ascii=False, indent=2), "```", ""]
+        )
+    return "\n".join(lines) + "\n"

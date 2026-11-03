@@ -15,7 +15,11 @@ from benchmarks.runner import answer_run, build_run, score_run
 
 from fluxfold import FluxFoldConfig
 from fluxfold.errors import ErrorClass, ProviderError, ValidationError
-from tests.fakes import FakeEmbeddingProvider, FakeGenerationProvider
+from tests.fakes import (
+    FakeDecisionProvider,
+    FakeEmbeddingProvider,
+    FakeGenerationProvider,
+)
 
 
 def _alice_record(question_id: str) -> dict[str, object]:
@@ -36,13 +40,15 @@ def _alice_record(question_id: str) -> dict[str, object]:
 
 def _search_config() -> FluxFoldConfig:
     return FluxFoldConfig().with_overrides(
-        domain_candidate_min_similarity=-1.0,
         search_domain_min_similarity=-1.0,
         search_memory_min_similarity=-1.0,
     )
 
 
 def _patch_providers(monkeypatch, generation: FakeGenerationProvider) -> None:
+    monkeypatch.setattr(
+        "benchmarks.runner.decision_provider", lambda config: FakeDecisionProvider()
+    )
     monkeypatch.setenv("FLUXFOLD_BUILD_MODEL", "fake-generation")
     monkeypatch.setenv("FLUXFOLD_ANSWER_MODEL", "fake-generation")
     monkeypatch.setenv("FLUXFOLD_SCORE_MODEL", "fake-generation")
@@ -197,9 +203,9 @@ def test_build_answer_score_produces_results(tmp_path, monkeypatch) -> None:
     assert f"after memory space `{spaces[0].space_key}` completed" in bank_text
     assert f"## `{spaces[0].space_key}`" in bank_text
     assert "### Alice" in bank_text
-    assert "- Alice likes hiking." in bank_text
-    assert "- Alice owns hiking boots." in bank_text
-    assert "- Alice hikes on weekends." in bank_text
+    assert "- [direct] Alice likes hiking." in bank_text
+    assert "- [direct] Alice owns hiking boots." in bank_text
+    assert "- [direct] Alice hikes on weekends." in bank_text
     build_summary = json.loads(paths.build_summary.read_text(encoding="utf-8"))
     assert build_summary["successful_llm_call_count"] > 0
     assert build_summary["failed_llm_call_count"] == 0

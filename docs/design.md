@@ -159,7 +159,7 @@ FluxFold 采用 Python 3.12 及以上版本、`uv`、单 package 和 `src` layou
 - `uv.lock` 应提交到版本控制，以复现本地开发和 CI 环境。
 - FluxFold 作为单个 Python distribution 开发；现阶段不拆分 core、CLI 或其他子 package，也不建立 workspace。
 - 可导入 package 使用 `src/fluxfold/` 目录，公共 import 名称为 `fluxfold`。
-- 实验版运行时依赖包括 NumPy，用于 SQLite 之上的精确向量扫描；Hugging Face Hub、Tokenizers 和 ONNX Runtime，用于下载、缓存并运行默认的本地 embedding；以及 `socksio`，供 OpenAI 兼容 HTTP 客户端在 SOCKS 代理下工作。不暴露 CLI entry point，也不加入 Typer 或 Textual。
+- 实验版运行时依赖包括 NumPy，用于 SQLite 之上的精确向量扫描；Hugging Face Hub、Tokenizers 和 ONNX Runtime，用于下载、缓存并运行默认的本地 embedding；`typesafe-sdk` 用于 Jev Choice/Noul linking；以及 `socksio`，供 OpenAI 兼容 HTTP 客户端在 SOCKS 代理下工作。不暴露 CLI entry point，也不加入 Typer 或 Textual。
 - 第一版正式版仍使用同一个 distribution：通过 `pyproject.toml` 的 `[project.scripts]` 暴露 `fluxfold` 命令，并加入 Typer 与 Textual。
 - 首次建立本地开发环境时运行 `scripts/setup-dev.sh`：安装 `.python-version` 指定的 Python、按 `uv.lock` 同步环境、将 `LoCoMo_refined` 与 `LongMemEval` clone 到 `data/` 并下载 LongMemEval-S，然后执行与日常开发相同的质量检查和 `uv build`。该脚本只负责一次性 bootstrap，不是任务运行器；日常开发仍直接使用 `uv run`。
 
@@ -319,7 +319,7 @@ FluxFold 当前优先采用能够尽快形成端到端闭环的简单方案。�
 | 正式版仅在合法的 `assistant final → user` 候选点上比较 message embedding 差值，并按 soft、hard 与 flush 规则选择候选边界或整体 seal。详细规则见 `design_detailed.md` 2.2.4 节 | 带标注样本或端到端任务持续出现过切、欠切、延迟过高或成本不可接受 | 调整 embedding、阈值和 buffer 策略；必要时将 LLM situation boundary detection 作为对照方案 |
 | memory extractor 按未来价值与独立生命周期提取 `0..N` 条自包含记忆，并保留 episode provenance。详细规则见 `design_detailed.md` 1.2.2 节 | 数据集或真实交互出现持续的提取遗漏、噪声、粒度不稳定、时间状态错误或来源归属错误 | 调整提取规则、结构化输出、字符数上限和 provenance 使用方式，并增加对应的定向评测 |
 | 写入阶段的 Domain 通道仅使用 `domain name` 召回候选。详细规则见 `design_detailed.md` 1.1.7 和 1.2.3 节 | Domain 候选召回持续遗漏相关组织单元，或 summary 能够提供有效区分信息 | 对比仅使用 `domain name` 与使用 `domain name + domain summary` 的召回效果 |
-| 写入阶段由 extraction 提取并解析持久化基础实体，程序准备 entity 同名 domain，并在每个 entity 下召回 active/retired domain 的前 3 个，额外加入同名容器，去重后交给 linking；逐 entity 选择最细粒度匹配 domain，再判断 contextual。Domain 名称全生命周期唯一，实际接收新 link 的 retired domain 恢复 active；仅 entity 的疑似名称由向量/BM25 候选和条件 LLM 反馈消歧。每条 memory 的有效 link 上限为基础值 5 与 entity 数量的较大值，并以 `direct` 或 `contextual` 记录依据。详细规则见 `design_detailed.md` 1.2.3 节 | 候选数量或相似度门槛造成漏召回、候选噪声、批次决策互相干扰，或两类 link 的判定不稳定 | 对召回参数与批次规模做消融，并分别评估漏链、错链、重复新 domain 与 `link_basis` 分类质量 |
+| 写入阶段由 extraction 提取并解析持久化基础实体，程序准备 entity 同名 domain，每个 fact 在每个 entity 下召回 active/retired domain 的 top-5；Jev Choice 选择最细粒度适合的 domain，程序排除 direct target 及谱系祖先后，Jev Noul 判断剩余候选相关性。Domain 名称全生命周期唯一，实际接收新 link 的 retired domain 恢复 active；仅 entity 的疑似名称由向量/BM25 候选和条件 LLM 反馈消歧。每个 fact 对每个 entity 选择一个 direct 和最多两个 contextual targets，最终合并去重；split 谱系持久化为允许多父节点的无环图。详细规则见 `design_detailed.md` 1.2.3 节 | 候选数量或相似度门槛造成漏召回、候选噪声、批次决策互相干扰，或两类 link 的判定不稳定 | 对召回参数与批次规模做消融，并分别评估漏链、错链、重复新 domain 与 `link_basis` 分类质量 |
 | 新建 domain 时只建立当前 episode 组织批次中由 LLM 选定的 memory links，不回填更早 episode 的 memories。详细规则见 `design_detailed.md` 1.2.3 节 | 写入顺序导致早期记忆持续缺少后来才成立的 domain link | 评估有限回填本次候选中的旧 memory；采用前验证其是否造成零碎 domain、冗余 link 或 top-k 结果挤占 |
 | domain 新增记忆达到阈值后，审核全部当前 active 关联记忆：除去重、冲突与退役外，还用同 domain 内其他记忆补全指代、把约束写回被影响的 memory、规范化平行实例、上提类别词，并最多按需读取一次 provenance。详细规则见 `design_detailed.md` 1.2.4 节 | 去重、冲突处理、summary 质量、正文编译质量、审核成本或一次来源读取无法满足要求 | 调整触发阈值、审核 schema、来源读取条件和允许的记忆修改范围 |
 | 审核只拼接共同描述同一个且不可独立更新的事实。详细规则见 `design_detailed.md` 1.2.4 节 | 数据集或真实查询表明紧密逻辑、因果或时序关系因分散存储而难以召回和使用 | 实验更大的拼接粒度，允许将不同但紧密关联的事实组成更丰富的 memory，并配套更复杂的更新措施，与当前方案比较 |

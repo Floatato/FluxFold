@@ -294,6 +294,15 @@ extraction 确定的归属，同样以这对 ID 为主键。实体和两种关�
 Review 不修改实体归属；split 的新 domain 全量继承父 domain 的实体，复用已有 target 时
 与其原关系取并集。退役 domain 的实体关系保留并参与写入侧候选召回。删除 space 时一起删除。
 
+##### `domain_lineage`
+
+保存 `memory_space_id`、`parent_domain_id`、`child_domain_id` 和 `created_by_operation_id`。
+父子 ID 对唯一。Full/partial split 对每个结果 target 建立边，包括复用已有同名 domain；
+允许多父节点，禁止自环和间接环。模型输出阶段检查已有谱系，事务提交时再次检查拟新增边。
+无效输出沿用 split 修复流程；所有边与 split 结果一起提交或回滚。
+退役和重新激活保留谱系。祖先查询跨越所有 active/retired 中间节点，不受召回集合限制。
+删除 memory space 时删除谱系。实验数据库采用新 schema 重建。
+
 ##### `domain_memory_links`
 
 
@@ -313,8 +322,9 @@ Review 不修改实体归属；split 的新 domain 全量继承父 domain 的实
 domain 要收的那种事实、事件、状态、决定或目标。`contextual` 表示该 domain 不是归属，
 但 memory 与其下已归档的信息存在具体的约束、影响、更新或解释关系；关系可以由任一方
 施加，未来对该 domain 的回答需要看见这条记忆，即使两边文本不相似。每条 new memory
-至少建立一个 `direct` link，且可以有多个 `direct` link；全部 active domain links 合计不得
-超过 `max(memory_active_domain_link_max, 该 memory 的 entity 数量)`，默认基础值为 5。
+至少建立一个 `direct` link，且可以有多个 `direct` link。新 memory linking 对每个 entity
+独立选择一个 direct target，以及最多两个 contextual targets；按本次 assignment 计数，
+不从 domain 继承的全部 entity 关系反推归属。最终按 memory–domain 去重，direct 优先。
 `contextual` link 按需建立，不表示较低优先级。
 SQLite 使用 `CHECK (link_basis IN ('direct', 'contextual'))` 约束取值。
 
@@ -327,8 +337,7 @@ SQLite 使用 `CHECK (link_basis IN ('direct', 'contextual'))` 约束取值。
 只建立指向该 memory 真正归属且更具体 domain 的 direct link。该规则不禁止一条 memory
 同时关联两个没有包含关系的领域，也不排除指向存在上述具体关系的其他 domain 的
 contextual link。
-包含关系只由 LLM 根据当前输入判断；程序不保存 domain 层级、不主动维护包含关系，也
-不对一般性的语义包含关系作校验。Partial split 中原 domain 与本次新 domains 之间的关系由操作类型直接确定，按下述 split 规则关闭旧 links。
+程序保存 split 产生的 domain 谱系，并据此过滤 linking 候选。Partial split 按下述规则关闭旧 links。
 
 Domain 分裂时：
 
@@ -528,7 +537,7 @@ LLM 阶段参数如下：
 | 阶段                | temperature | top-p |
 | ----------------- | ----------- | ----- |
 | memory extraction | 0.1         | 不传    |
-| domain linking   | 0.0         | 不传    |
+| domain linking（Jev Choice/Noul） | 不传 | 不传 |
 | Domain review    | 0.1         | 不传    |
 | Domain split     | 0.1         | 不传    |
 | Domain summary refresh | 0.1   | 不传    |
@@ -572,12 +581,12 @@ SQLite 等数据库基础设施不属于 model provider。具体 provider adapte
 可恢复的调用失败和能够被确定性校验的输出错误，不把空响应、provider 错误或校验失败转换为
 合法零结果。
 
-`transient_transport`、`rate_limited` 和 `service_unavailable` 由 OpenAI-compatible SDK
+Generation/embedding 的 `transient_transport`、`rate_limited` 和 `service_unavailable` 由 OpenAI-compatible SDK
 执行 transport retry，不在 FluxFold 内再套一层相同循环。SDK 默认会重试连接错误、超时、
 HTTP 408/409/429 和 5xx；FluxFold 在 SDK 耗尽后仍按上表把最终错误归一化为 `error_class`。
 `quota_exhausted`、鉴权和非法请求在归一化之后不由 Memory Engine 再发一次逻辑请求。
 
-`invalid_structured_output` 或 `incomplete_output` 在初次生成后最多额外重新生成 5 次，因此
+生成式阶段的 `invalid_structured_output` 或 `incomplete_output` 在初次生成后最多额外重新生成 5 次，因此
 一次逻辑输出最多生成 6 次。每次重新生成中的传输失败仍由该次 SDK 调用独立重试；不设置
 跨 transport 与 structured-output 修复的 provider 调用总上限。每个结构化阶段的 system
 prompt 必须给出与程序校验一致的完整判别联合字段、嵌套结构、枚举值和少量合法示例，不能用
@@ -735,8 +744,8 @@ episode
 → memory extraction
 → extraction 实体名称解析与必要的批量消歧
 → 准备 entity 同名初始 domain（全生命周期精确复用），分配正式 memory_id
-→ 每条新 memory 在每个 entity 下召回前 3 个 domain name，额外加入同名 domain 后批次去重
-→ 为整批新 memories 执行一次 Domain linking
+→ 每条新 memory 在每个 entity 下召回 top-5 domain name，分别保留候选集合 S
+→ 批量 direct Choice，再过滤已选目标及祖先，批量 contextual Noul
 → 原子写入 memory、entity、归属关系、provenance、embedding、domain、links 和 operation
 → 先执行已触发的 Domain split / Domain review
 → 构造并持久化本 episode 的 summary refresh targets
@@ -794,7 +803,7 @@ episode 包含 messages 和有值的 `source_started_at`、`source_ended_at`、
 `source_timezone`；缺失的时间字段不进入 prompt。每条 message 包含
 `speaker_id`、`content`，并仅在该 message 自身有 `observed_at` 时包含该字段。来源未提供
 speaker ID 时，以规范化的 `user` / `assistant` role 值填入 `speaker_id`。Linking 的 new memory
-包含正式 `memory_id`、content、resolved entity names 和逐 memory 的 `link_limit`，candidates 只包含 domain name 和 entity names，不展示 memory 的来源时间。Review 不展示 domain ID、旧 summary 或 memory 来源时间，但保留
+的程序记录包含正式 `memory_id`、content 和 resolved entity names。Jev Choice 只接收 fact、当前 entity、候选 domain names 及候选间祖先关系；Noul 只接收 fact 和 domain name，不展示来源时间、summary、成员 memories、召回分数或数量约束。Review 不展示 domain ID、旧 summary 或 memory 来源时间，但保留
 生成 update 所需的 memory ID、content、link basis 和 provenance episode IDs。按需展开的来源
 包含 episode ID、source 时间范围与时区，以及每条 message 的 speaker ID、content 和可用的
 `observed_at`。Split 不展示 domain ID、旧 summary、provenance IDs 或 memory 来源时间。
@@ -857,48 +866,44 @@ Extraction 中允许不具备来源明确姓名或名称的 entity 是未命名�
 的项目或事件作为具有稳定自身身份的持续对象时，它可以成为基础实体；描述性的所有格范围仍是
 依赖范围。
 
-direct link 的必要条件是目标 domain 是当前 memory 对某一基础实体的组织归属：memory
-属于该 domain 要收的那种事实、事件、状态、决定或目标，依据 domain 收的是哪类东西判断，
-而不是记忆是否碰巧提到它。每个基础实体独立执行以下顺序：
+##### Entity-local candidate recall and Jev decisions
 
-1. 只考察范围可能承接当前实体的已有 domain candidates；属于其他实体的合适 domain
-   candidate 不参与本实体决策。
-2. 存在合适 domain candidates 时，只选择 memory 真正归属的最细粒度候选。已有依赖范围
-   domain 可以被选择，因为 split 已经确立了该边界；不得选择并不适合的更细 domain，且不
-   得为了重复同一归属而同时 direct 或 contextual link 到其更粗父级。
-3. 没有更细粒度候选适合时，选择 candidates 中已经准备好的 entity 同名 domain。
-   Linking 不创建 domain；细粒度 domain 由 split 产生。
+每条 fact 的每个 resolved entity 独立构造集合 S：以 fact content 向量对该 entity 关联的
+active/retired domain name 向量排序，取 top-5；不足五个取全部。同名初始 domain 正常参与
+排序，相似度同分按 normalized_name 稳定排序。不同 entities 或同批其他 facts 的集合不扩展 S。
 
-例如 `Mike bought a camera for the Beijing trip` 选择 `Mike's Beijing trip`，不同时选择 `Mike`。
-`Mike is learning Spanish` 没有合适细分范围时选择 `Mike`。`James is developing a game project`
-选择已有且合适的项目 domain，否则使用 `James`，不创建 `James's game project`。
-`Project Aurora` 若为 extraction 给出的独立 entity，程序已经准备它的同名 domain。
+第一轮为每个 `(fact, entity)` 构造 Choice，选项恰好为 S。输入是 fact、entity、domain names
+以及 S 内候选间的传递祖先关系，中间节点可以不在 S。选择真正适合该事实的最具体范围，
+不能仅因深度更大就选不适合的 domain。单候选由程序直接选择，无概率、不调用模型。
+不同 entities 可以选择同一 domain；程序保持每 entity 的 assignment，落库时合并为一条 direct。
 
-`Mike and John are good friends` 对 Mike、John 分别选择一个目标；没有合适细分范围时分别
-选 `Mike`、`John`。如果已有适合且关联双方 entities 的 `Mike and John's friendship`，
-两个 entity 均可选择它，最终只保存一条 direct link。
+第二轮从各自 S 删除该 entity 的 direct target 及其全部祖先，并排除本 fact 其他 entities
+已选的 direct targets。每个剩余 `(fact, domain)` 用 Noul 判断是否存在值得共同发现的具体
+关系，包括约束、影响、因果、更新或解释；共同人物和泛泛主题联想不足以建立相关性。
+例如驾照暂停影响自驾计划、过敏约束饮食偏好；喜欢摄影本身不说明与某次旅行具体相关。
+模型只看 fact 与 domain name，不解释 direct/contextual 术语或数量要求。跨 entity 重复的
+同一 fact-domain 对仅判断一次；每个 entity 仍只在自己的剩余集合中消费结果。
 
-Domain 的 entity 成员关系用于候选资格，不能代替本次 assignment。比如 split 后
-`Mike's dietary preferences` 和 `John's Beijing trip` 均继承 Mike、John 两个 entities，
-对“Mike 吃素，John 下周去北京”，分别将 Mike 分配给前者、John 分配给后者是合法的。
-程序检查每个 entity 恰有一项 assignment，不按目标 domain 的全部继承关系反推分配次数。
+Noul 的 `p > 0.5` 作为当前实验的相关判断。每 entity 内按概率降序、normalized_name 升序
+排序，最多保留两条 contextual。不同 entities 的结果合并去重，direct 优先。空集合跳过调用；
+单个 contextual 候选仍需模型判断。所有选项均可不相关。Contextual targets 相互之间不做
+祖先排除。每 entity 两条是新 fact linking 的选择规则，不作为 split 后的全库不变量。
 
-全部基础实体决定 direct targets 后，先合并去重，再判断 contextual links。contextual link
-连接的既有 domain 不是 memory 的组织归属，但 memory 与该 domain 中的信息存在具体的约束、
-影响、更新或解释关系，未来检索时需要共同可见；约束或影响可以来自任一方向。它包括正文未
-点名、只凭常识才能发现的跨域关系，例如种牙手术与饮食偏好、驾驶计划与驾照限制。缺失的
-contextual 范围绝不触发新建 domain。
+同一 episode 的非平凡 Choice 批量请求，完成后批量 Noul。使用独立的 DecisionProvider 和
+TypeSafe 异步 SDK，默认固定 `jev-1.14.0`。环境变量 `TYPESAFE_API_KEY` 提供凭证，
+`FLUXFOLD_LINK_MODEL` 指定模型；纯读取不需要该 provider。Jev 不使用生成式输出修复 prompt。
+每次请求和失败均记录；引擎管理有限重试，SDK 禁用内部重试。容量超限时按问题顺序二分，
+缩减对应 state 后继续；单问题仍超限则按 context_overflow 失败，不裁剪事实或候选。
+输出验证问题覆盖、类型、合法选项及概率；异常沿用既有 StageFailure 与暂停/终态处理。
 
-对于每条 new memory 的每个 resolved entity，被动召回扫描该 entity 关联的 active 和
-retired domains，以 memory content 向量对 domain name 向量排序，取相似度不低于 0 的
-前 3 个；该 entity 的同名 domain 不占这 3 个名额，并额外加入同一个 candidates。
-所有结果按唯一 name 合并为批次共享池，无全局 top-k 截断，不另设 base_domains。
-同名 domain 即使为空或 retired 也必须提供。初始候选只展示 name 与 entity names，
-不展示 ID、summary、分数或关联 memory。去重后超过 30 个时输出 warning，继续处理。
-
-每条 memory 的 link_limit 为 `max(memory_active_domain_link_max, entity 数量)`，默认
-基础值为 5；先保证每个 entity 的 direct assignment，再按需添加 contextual。
-相同 memory–domain 对合并，direct 优先；linking、split 和存储事务检查相同的有效上限。
+| 配置项 | 默认值 | 含义 |
+| --- | --- | --- |
+| `entity_domain_candidate_top_k` | 5 | 每 fact 每 entity 的 S 大小上限 |
+| `contextual_domain_max_per_entity` | 2 | 每 fact 每 entity 的 contextual 选择上限 |
+| `contextual_probability_threshold` | 0.5 | Noul 概率严格大于该值时为相关 |
+| `name_resolution_min_similarity` | 0.8 | 名称消歧向量阈值 |
+| `name_resolution_bm25_threshold` | 2.0 | 名称消歧 BM25 阈值 |
+| `extraction_memory_warning_threshold` | 20 | 提取数量 warning，不截断 |
 
 ##### 名称解析与条件消歧
 
@@ -909,9 +914,7 @@ Extraction 后解析 entity names，先查询同一 space 的全部已知 entiti
 
 本阶段的疑似项一次性反馈给 LLM，携带原输入和此前输出；无疑似项不增加调用。
 Entity 候选只提供 name，不向 LLM 提供向量或 BM25 分数。反馈 prompt 简短要求判断是否
-同一实体；相同则选候选名称，否则保留提出的名称。这个简洁要求仅适用于名称反馈；
-LINKING_SYSTEM 独立完整说明输入、每 entity 的决策顺序、direct/contextual 边界、
-输出约束和具体示例，不假设 LLM 能看到其他阶段的 prompt 或设计文档。
+同一实体；相同则选候选名称，否则保留提出的名称。Jev 的 Choice/Noul instructions 独立说明对应判断，不假设模型看到其他阶段的 prompt。
 该回合只输出名称映射，不重新 extraction 或改写 memory 内容。程序校验映射完整且目标合法，
 沿本批较早名称的映射解析最终 canonical name，同步替换全部引用，再按最终对象去重；
 无效输出沿用 structured-output 有限修复及终态失败路径。非精确名称被确认复用时输出
@@ -922,62 +925,9 @@ Extraction 和 entity 解析后，程序在 linking 前准备同名初始 domain
 linking 失败不残留半成品。新容器可能暂时没有 memory links。Review 和 split 的 prompt
 不包含 entity 信息，程序负责稳定关系维护。Split 只做精确名称复用，不做近似消歧。
 
-本 episode 的全部新 memories 共用一次 Domain linking。模型返回整批最终 `links`。
-候选只展示 domain name 与 entity names。contextual 目标必须来自这批 candidates；
-候选之外的 domain 不能被选中。Linking 只决定成员关系，不改写已有 memory 正文；
-同一 domain 内的指代补全、约束写回、实例对齐和类别上提由 Domain review 完成。
-
-
-| 配置项                                        | 值    | 含义                                             |
-| ------------------------------------------ | ---- | ---------------------------------------------- |
-| `entity_domain_candidate_top_k`           | 3    | 每条 memory 每个 entity 的 domain 候选上限 |
-| `name_resolution_min_similarity`          | 0.8  | 名称消歧候选的向量阈值 |
-| `name_resolution_bm25_threshold`          | 2.0  | 名称消歧候选的 BM25 阈值 |
-| `extraction_memory_warning_threshold`     | 20   | 提取条数超过此值时 warning |
-| `linking_candidate_warning_threshold`     | 30   | 初始去重候选数超过此值时 warning |
-| `domain_candidate_min_similarity`         | 0 | entity domain name 候选的最低余弦相似度 |
-| `memory_link_preferred_min`                | 1    | Prompt 建议一条 memory 通常至少链接的 domain 数           |
-| `memory_link_preferred_max`                | 4    | Prompt 建议一条 memory 通常最多链接的 domain 数           |
-| `memory_active_domain_link_max`           | 5    | 每条 memory 的 link 上限基础值；有效上限取此值与 entity 数量的较大值      |
-
-
-初始候选与公开 search 只使用向量相似度；BM25 仅用于上述写入名称消歧。
-
-程序在 extraction 后为全部新 memories 分配正式 `memory_id`，输入、linking 输出和落库
-始终使用同一个 ID。批次候选池完成后执行一次 linking；输出覆盖所有 memories。
-全部 assignment 校验成功后，将准备好的 domains、entities、关系、memory、provenance、
-embeddings、links、恢复状态和 extraction completion 原子提交，中间检索不暴露部分写入。
-
-LLM 判断每个已给出的 entity 最适合的 domain，再判断 contextual domains；程序由这两类
-字段生成 `direct` 或 `contextual` basis。`direct` 表示该 domain 是这条 memory 的组织归属。`contextual`
-是跨语义范围的检索桥：memory 的归属在别处，但它与该 domain 下的信息存在具体的约束、
-影响、更新或解释关系；无论关系由哪一方施加，未来 query 命中该 domain 时都需要一并可见，
-即使两边文本不相似。
-
-以下例子补充说明 direct 与 contextual 的边界：
-
-
-| 新 memory | 应建立的 links |
-| --- | --- |
-| Mike likes eating apples | 已有 `Mike's dietary preferences` 时 link 到它；否则选择 candidates 中的 `Mike` direct |
-| Mike bought a camera for the Beijing trip | 已有 `Mike's Beijing trip` 时 link 到它；否则选择 candidates 中的 `Mike` direct |
-| Mike is learning Spanish | `Mike` direct |
-| Mike had dental implant surgery on 3 May 2024 | `Mike` direct；已有 `Mike's dietary preferences` 时 contextual |
-
-
-种牙是医疗事件，归属是 `Mike`；记忆正文完全不提饮食，但凭口腔手术会限制咀嚼、进食和
-饮酒的常识，当 `Mike's dietary preferences` 已在 candidates 中时应对它建 `contextual`。
-候选之外的 domain 不能因为这种常识被追加进来。
-
-Linking 把这些记忆收进同一 domain 之后，并不改写旧正文。公开 search 按 memory content
-和 domain name 排序，每个 domain 只附带 1 条 memory，且仅 Domain 通道命中的 domain
-展示 summary。因此跨记忆的指代补全、约束写回、平行实例对齐和类别上提，由随后的
-Domain review（可改 memory 正文并重 embed）和最终 summary refresh（只写 summary）完成。
-
-Prompt 要求先完成逐 entity 的 direct 分配，再添加有用的 contextual links，不以填满额度为目标；
-硬校验要求至少一个 direct link，全部 active links 不超过该 memory 的有效 link_limit。已有 domain 与其语义具体化 domain 同时
-成为候选时，direct 归属只选择该 memory 真正归属且更具体的一个；该规则不排除指向存在
-上述具体关系的其他 domain 的 contextual link。程序不校验或持久化 domain 的包含关系。
+程序在 extraction 后为新 memories 分配正式 ID。Jev 只作选择与判断，程序生成完整
+assignments 和 contextual targets，连同 memory、entity、provenance、embedding、domain、
+reactivation 与 completion 原子提交。Linking 不改写 memory 正文；跨记忆补全由 review 完成。
 
 每当新 memory 建立指向已有 domain 的 active link，原子 add 递增其 `new_memory_count`；新建
 domain 的初始计数为零。add 不 append memory content，也不更新 summary embedding；所有 link
@@ -1084,7 +1034,6 @@ review 而更新或退役、或没有新增 link 的其他容量变化，不触�
 | `domain_split_result_domain_max`           | 5         | full split 的新 domains 数或 partial split 的原 domain 加新 domains 总数上限 |
 | `domain_split_result_min_memories`          | 3         | 每个新建结果 domain 至少必须包含的 memory 数                                     |
 | `domain_split_result_target_memory_max`     | 20        | 每个新建结果 domain 的 memory 数硬上限                                          |
-| `domain_split_memory_membership_max`        | 2         | 一条输入 memory 最多可以归属的本次新建 domain 数                                   |
 
 
 active memory 数达到 24，或 latest contents 总字符数达到 8,000，即满足触发条件；字符
@@ -1096,7 +1045,7 @@ split 不进行向量或 BM25 近似名称消歧。输出 domain 的 normalized_
 且不得与原 domain 相同；与其他已有 active 或 retired domain 精确同名时复用其 ID，实际接收 links 的 retired target 恢复 active。
 每个结果继承父 domain 的全部 entities；复用目标与已有 entities 取并集。结果分组的
 3--20 条限制只约束本次迁入集合，不约束复用目标原有 memories。所有最终 links 在精确复用、
-去重后校验 direct 覆盖和每条 memory 总 link 上限；已有 direct 优先于 contextual。
+去重后校验 direct 覆盖；已有 direct 优先于 contextual。
 复用目标只按新增成员累计维护计数，并加入本 episode 的 summary refresh targets；
 不因 split 结果新增一个递归 maintenance loop，后续 episode 新增 link 时按常规规则维护。
 
@@ -1109,7 +1058,7 @@ split 的结构化结果只能是 `full_split`、`partial_split` 或 `defer_spli
 
 - **full split** 仅用于全部输入 memories 都能自然归入 2--5 个有意义、可独立检索、更新和
 增长的更细 domains，且没有仍需原粗粒度 domain 承接的残余 memory。原 domain 的每条
-active memory 至少进入一个、最多进入两个新 domains；原 domain 被完整替换并退役。不得为
+active memory 至少进入一个结果 domain；原 domain 被完整替换并退役。不得为
 覆盖完整而把离群 memory 强塞进某组或创建 catch-all。
 - 无法 full split 时，**partial split** 仅用于 1--4 个有意义、可独立增长的群组已经突出，
   但其余 memories 没有共同的更细范围、仍需原粗粒度 domain 承接。它创建新 domains，同时
@@ -1129,7 +1078,7 @@ benchmark 失败样本数。
 程序硬校验。
 被移出原 domain 的每条 memory，在关闭指向原 domain 的 link 之后，仍必须至少有一条 active
 `direct` link：来自本次新 domains 的新 direct，或仍指向 split 范围之外其他 domains 的既有
-direct。一条 memory 在本次新 domains 中最多出现两次；partial split 中出现在任一新 domain 的
+direct。Partial split 中出现在任一新 domain 的
 memory 到原 domain 的 link 由程序关闭，但它指向 split 范围之外其他 domains 的 links
 保持不变。不设置结果 domain 的字符目标、总 link 倍数或整体重叠率上限。
 
@@ -1321,13 +1270,12 @@ domains 时，对应 max/mean 为 0。
 
 #### 1.2.7 实验版记忆构建日志
 
-每次 memory-space build 生成三份日志：一份 JSONL 结构化事件日志，用于机器分析、统计和
+每次 memory-space build 生成以下日志：一份 JSONL 结构化事件日志，用于机器分析、统计和
 定位失败；一份 Markdown LLM 输入输出采样日志，用于人工抽查 user prompt 与模型输出；
 一份覆盖写入的 Markdown 记忆库快照，按 memory space 完成顺序展示已完成 spaces 的全部 active
-domains 的 name 与 summary，以及各自 active linked memories 的 content。不生成
-`build_audit.md`。记忆库快照和 LLM 输入输出样本不进入结构化事件 JSONL。
+domains 的 name 与 summary，以及各自 active linked memories 的 content。新增全量 `link_decisions.jsonl` 与 `link_decisions.md` 记录 Jev 两轮决策。记忆库快照和 LLM 输入输出样本不进入结构化事件 JSONL。
 
-这三份日志是实验产物，不是 SQLite 正式数据或可写事实源，不能反向驱动记忆状态，也不能
+这些日志是实验产物，不是 SQLite 正式数据或可写事实源，不能反向驱动记忆状态，也不能
 进入后续 LLM 输入。LLM 输入输出采样日志和记忆库快照都可能包含完整 memory 内容，必须
 按敏感实验产物保存。
 
@@ -1363,12 +1311,26 @@ provider 失败无法形成样本。
 
 各类别按采样成功数计数，满额即停止该类别的随机抽样：
 
-- `extract`、`link`、`review`、`split`、`summary` 各 10 个。
+- `extract`、`review`、`split`、`summary` 各 10 个。
 
 `review` 不按是否请求 provenance 拆分配额；两轮 review 中的每次 LLM 调用分别参与
 随机采样并共用 10 个上限。某类调用在本次 build 中未出现则该项空缺。显式恢复续跑时，
 已写入文件的样本计入配额，不因引擎重启而写入超过上限。JSON 形态的 prompt 与输出按缩进
 展开，便于阅读。
+
+##### 全量 link 决策日志
+
+`link_decisions.jsonl` 保存实际 state/questions、完整回答、model、request/call ID、
+episode/memory ID 和本次 link_attempt_id，包含重试和容量分批的每次调用。
+每 fact 的决策记录包含每 entity 的 S 及召回分数、全部 Choice 概率、单候选跳过、
+祖先和 direct 排除原因、全部 Noul 概率、低于分界、每 entity 额度截断和最终去重 links。
+`link_decisions.md` 按 episode/fact/entity 展示候选表、分数与程序处理结果，并保留完整请求。
+准备好的决策标为 prepared；只有关联的 episode_committed 表示正式提交，失败不伪装成提交。
+不伪造单候选概率，不要求 Jev 生成解释。这些正文记录不进入 build_events.jsonl。
+
+构建事件及汇总区分 Choice/Noul 的请求数、问题数、成功/失败、耗时和 tokens，记录单候选
+跳过数量、最终 direct/contextual 数、每 entity 截断数量与分数分布。请求数包括重试，
+逻辑问题数按最终成功完成的 linking 批次统计。后续维护事件按 episode、operation/domain IDs 关联。
 
 ##### 当前记忆库快照
 
@@ -1377,7 +1339,7 @@ provider 失败无法形成样本。
 已完成 spaces 的顺序，并将新完成的 spaces 排在其后。尚在构建或暂停的 spaces 不出现在文件中；
 首次有 space 完成前不生成该文件。
 每个 space 展示全部 active domains，每个 domain 给出 name 和 summary，其下列出当前
-active linked memories 的 content。不包含 domain ID、memory ID、link basis、retired 对象、
+active linked memories 的 content。每条 memory 标明 direct/contextual basis。不包含 domain ID、memory ID、retired 对象、
 来源 episode 或过程事件。同一 memory 若同时链到多个 domains，在每个 domain 下各出现一次。
 新建尚未 refresh 的 domain 可以没有 summary 正文。该文件不保留 episode 或 link 变动的中间快照。
 
@@ -1460,32 +1422,13 @@ Extraction 使用判别结果明确区分提取成功与“没有有价值的记
 程序在成功 extraction 后为每条 memory 分配正式 `memory_id`，供 linking 输入、输出和落库一致使用。畸形对象、缺失判别字段或 `result = "memories"` 但数组为空均不是
 `no_valuable_memory`。
 
-#### 1.4.2 Batched Domain linking
+#### 1.4.2 Typed Domain linking
 
-一个最终 linking 结果覆盖本 episode 的全部 new memories。Entity 和 domain 使用唯一名称，
-memory 使用程序分配的正式 ID。候选在 linking 前已包含每个 entity 的同名 domain：
-
-```json
-{
-  "result": "links",
-  "memories": [
-    {
-      "memory_id": "the supplied memory ID",
-      "direct_assignments": [
-        {"entity": "Mike", "domain": "Mike and John's friendship"},
-        {"entity": "John", "domain": "Mike and John's friendship"}
-      ],
-      "contextual_domains": []
-    }
-  ]
-}
-```
-
-程序验证每个 memory_id 恰好输出一次、每个输入 entity 恰好分配一次、direct target 的
-entity 成员关系包含指定 entity。所有 domain 名称必须来自共享 candidates。相同目标去重，
-direct 优先；distinct links 不超过输入中的 link_limit。candidates 展示 name 和 entities，
-不展示 domain ID、summary、关联 memory 或检索分数。无额外的临时 ref、创建 domain
-或 domain 消歧输出。
+Jev Choice 返回选中的候选、完整概率分布及 confidence；Noul 返回 yes 概率。
+程序验证每个问题恰有一个同类型答案，Choice 候选与概率键精确匹配输入且总概率为一，
+选中最高概率选项；所有概率必须有限且在 [0,1] 内。单候选不产生模型答案。
+程序按 §1.2.3 构造内部 `LinkingOutput`：每个 memory 对应逐 entity 的 direct assignments
+及去重后的 contextual domain names。该结构由程序生成，不作为 Jev 的生成式输出 schema。
 
 Extraction 的条件 entity 名称消歧回合每个疑似项一条：
 

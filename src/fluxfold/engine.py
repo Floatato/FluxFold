@@ -19,6 +19,7 @@ from pydantic import TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
 from fluxfold.config import FluxFoldConfig
+from fluxfold.decisions import DecisionProvider
 from fluxfold.errors import (
     ConcurrentUpdateError,
     ErrorClass,
@@ -26,6 +27,7 @@ from fluxfold.errors import (
     StageFailure,
     ValidationError,
 )
+from fluxfold.linking import Linker
 from fluxfold.models import (
     AddResult,
     DeferSplitOutput,
@@ -52,12 +54,10 @@ from fluxfold.models import (
 from fluxfold.names import NameEntry, bm25_scores, normalized_name
 from fluxfold.prompts import (
     EXTRACTION_SYSTEM,
-    LINKING_SYSTEM,
     REVIEW_SYSTEM,
     SPLIT_SYSTEM,
     SUMMARY_REFRESH_SYSTEM,
     extraction_input,
-    linking_input,
     repair_input,
     review_input,
     split_input,
@@ -86,7 +86,6 @@ EventSink = Callable[[dict[str, object]], None]
 
 LLM_IO_SAMPLE_QUOTAS: dict[str, int] = {
     "extract": 10,
-    "link": 10,
     "review": 10,
     "split": 10,
     "summary": 10,
@@ -132,6 +131,7 @@ class FluxFold:
         *,
         store: Store,
         generation_provider: GenerationProvider,
+        decision_provider: DecisionProvider | None = None,
         embedding_provider: EmbeddingProvider,
         config: FluxFoldConfig,
         event_sink: EventSink | None,
@@ -139,6 +139,7 @@ class FluxFold:
     ) -> None:
         self._store = store
         self._generation = generation_provider
+        self._decision = decision_provider
         self._embedding = embedding_provider
         self.config = config
         self._event_sink = event_sink
@@ -154,6 +155,7 @@ class FluxFold:
         *,
         db_path: str,
         generation_provider: GenerationProvider,
+        decision_provider: DecisionProvider | None = None,
         embedding_provider: EmbeddingProvider | None = None,
         config: FluxFoldConfig | None = None,
         event_sink: EventSink | None = None,
@@ -166,6 +168,7 @@ class FluxFold:
         return cls(
             store=Store(db_path, resolved),
             generation_provider=generation_provider,
+            decision_provider=decision_provider,
             embedding_provider=resolved_embedding,
             config=resolved,
             event_sink=event_sink,
@@ -179,9 +182,11 @@ class FluxFold:
         await self.close()
 
     async def close(self) -> None:
-        """Close both configured provider clients."""
+        """Close all configured provider clients."""
 
         await asyncio.gather(self._generation.close(), self._embedding.close())
+        if self._decision is not None:
+            await self._decision.close()
 
     async def create_or_open_space(self, space_key: str) -> MemorySpace:
         space = self._store.create_or_open_space(space_key)
@@ -370,6 +375,7 @@ class FluxFold:
         prepared_domains, entity_domains = self._prepare_entity_domains(
             memory_space_id, prepared.entities
         )
+        link_attempt_id = str(uuid4())
         if contents:
             linking = await self._link_memories(
                 memory_space_id,
@@ -380,6 +386,9 @@ class FluxFold:
                     memory.entities
                     for memory in cast(MemoriesExtraction, prepared.extraction).memories
                 ],
+                prepared.entities,
+                episode_id=current.episode_id,
+                link_attempt_id=link_attempt_id,
             )
         else:
             linking = LinkingOutput(memories=[])
@@ -434,6 +443,7 @@ class FluxFold:
         )
         self._event(
             "episode_committed",
+            link_attempt_id=link_attempt_id,
             memory_space_id=memory_space_id,
             episode_id=current.episode_id,
             operation_id=operation_id,
@@ -682,129 +692,57 @@ class FluxFold:
         contents: Sequence[str],
         vectors: Sequence[Any],
         memory_entities: Sequence[list[str]],
+        entities: Sequence[NameEntry],
+        *,
+        episode_id: str,
+        link_attempt_id: str,
     ) -> LinkingOutput:
-        candidates, legal_domain_ids = self._recall_initial_domain_candidates(
-            memory_space_id, vectors, memory_entities
-        )
-        legal_by_memory = {memory_id: set(legal_domain_ids) for memory_id in memory_ids}
-        new_memories = [
-            {
-                "memory_id": memory_id,
-                "content": content,
-                "entities": entities,
-                "link_limit": max(
-                    self.config.memory_active_domain_link_max, len(entities)
-                ),
-            }
-            for memory_id, content, entities in zip(
-                memory_ids, contents, memory_entities, strict=True
-            )
-        ]
-
-        def validate(value: LinkingOutput) -> None:
-            self._validate_linking(
-                value, memory_ids, legal_by_memory, memory_entities, memory_space_id
-            )
-
-        output, _ = await self._structured_output(
-            stage="domain_linking",
-            system_prompt=LINKING_SYSTEM,
-            user_prompt=linking_input(new_memories, candidates),
-            adapter=TypeAdapter(LinkingOutput),
-            temperature=self.config.linking_temperature,
-            validator=validate,
-            sample_kind="link",
-        )
-        return cast(LinkingOutput, output)
-
-    def _recall_initial_domain_candidates(
-        self,
-        memory_space_id: str,
-        vectors: Sequence[Any],
-        memory_entities: Sequence[list[str]],
-    ) -> tuple[list[dict[str, Any]], set[str]]:
-        catalog = self._store.domain_names(memory_space_id)
+        catalog = list(self._store.domain_names(memory_space_id))
         memberships = self._store.domain_entity_names(memory_space_id)
-        pool: dict[str, dict[str, Any]] = {}
-        for vector, entities in zip(vectors, memory_entities, strict=True):
-            for entity in entities:
+        by_name = {normalized_name(entry.name): entry for entry in catalog}
+        for entity in entities:
+            root = by_name.get(normalized_name(entity.name))
+            if root is None:
+                catalog.append(entity)
+                memberships[entity.object_id] = {entity.name}
+            else:
+                memberships.setdefault(root.object_id, set()).add(entity.name)
+        memories = []
+        for memory_id, content, vector, names in zip(
+            memory_ids, contents, vectors, memory_entities, strict=True
+        ):
+            candidates = {}
+            for entity_name in names:
                 ranked = sorted(
                     (
                         (entry, float(entry.vector @ vector))
                         for entry in catalog
-                        if entity in memberships.get(entry.object_id, set())
-                        and normalized_name(entry.name) != normalized_name(entity)
+                        if entity_name in memberships.get(entry.object_id, set())
                     ),
                     key=lambda item: (-item[1], normalized_name(item[0].name)),
-                )
-                for entry, score in ranked[: self.config.entity_domain_candidate_top_k]:
-                    if score >= self.config.domain_candidate_min_similarity:
-                        pool[entry.name] = {
-                            "name": entry.name,
-                            "entities": sorted(memberships[entry.object_id]),
-                        }
-        by_name = {normalized_name(entry.name): entry for entry in catalog}
-        for entity in dict.fromkeys(
-            name for entities in memory_entities for name in entities
-        ):
-            root = by_name.get(normalized_name(entity))
-            name = root.name if root is not None else entity
-            linked_entities = memberships.get(root.object_id, set()) if root else set()
-            pool[name] = {"name": name, "entities": sorted(linked_entities | {entity})}
-        if len(pool) > self.config.linking_candidate_warning_threshold:
-            self._event(
-                "linking_candidate_count_warning",
-                severity="warning",
-                memory_space_id=memory_space_id,
-                candidate_count=len(pool),
+                )[: self.config.entity_domain_candidate_top_k]
+                candidates[entity_name] = [
+                    {"name": entry.name, "similarity": score} for entry, score in ranked
+                ]
+            memories.append(
+                {"memory_id": memory_id, "content": content, "candidates": candidates}
             )
-        return list(pool.values()), set(pool)
-
-    def _validate_linking(
-        self,
-        output: LinkingOutput,
-        memory_ids: Sequence[str],
-        legal_by_memory: dict[str, set[str]],
-        memory_entities: Sequence[list[str]],
-        memory_space_id: str,
-    ) -> None:
-        expected = dict(zip(memory_ids, memory_entities, strict=True))
-        if len(output.memories) != len(expected) or {
-            item.memory_id for item in output.memories
-        } != set(expected):
-            raise ValidationError("return each supplied memory_id exactly once")
-        memberships_by_id = self._store.domain_entity_names(memory_space_id)
-        memberships = {
-            entry.name: memberships_by_id.get(entry.object_id, set())
-            for entry in self._store.domain_names(memory_space_id)
+        name_by_id = {entry.object_id: entry.name for entry in catalog}
+        ancestors = {
+            name_by_id[child]: {name_by_id[parent] for parent in parents}
+            for child, parents in self._store.domain_ancestors(memory_space_id).items()
         }
-        known_names = {normalized_name(name): name for name in memberships}
-        for entity in {name for entities in memory_entities for name in entities}:
-            name = known_names.get(normalized_name(entity), entity)
-            memberships.setdefault(name, set()).add(entity)
-        for memory in output.memories:
-            entities = expected[memory.memory_id]
-            assigned = [item.entity for item in memory.direct_assignments]
-            if len(assigned) != len(entities) or set(assigned) != set(entities):
-                raise ValidationError(
-                    f"{memory.memory_id} needs exactly one direct assignment per supplied entity"
-                )
-            names = {item.domain for item in memory.direct_assignments} | set(
-                memory.contextual_domains
-            )
-            if not names <= legal_by_memory[memory.memory_id]:
-                raise ValidationError(
-                    f"domain was not a candidate for {memory.memory_id}"
-                )
-            for item in memory.direct_assignments:
-                if item.entity not in memberships[item.domain]:
-                    raise ValidationError(
-                        f"domain {item.domain} does not belong to entity {item.entity}"
-                    )
-            if len(names) > max(
-                self.config.memory_active_domain_link_max, len(entities)
-            ):
-                raise ValidationError(f"{memory.memory_id} exceeds its link_limit")
+        linker = Linker(
+            self._decision,
+            self.config,
+            self._event,
+            {
+                "memory_space_id": memory_space_id,
+                "episode_id": episode_id,
+                "link_attempt_id": link_attempt_id,
+            },
+        )
+        return await linker.link(memories, ancestors)
 
     def _prepare_entity_domains(
         self,
@@ -1402,11 +1340,6 @@ class FluxFold:
             if not any(link.basis == "direct" for link in domain.links):
                 raise ValidationError("every split domain requires a direct link")
             membership.update(ids)
-        if any(
-            count > self.config.domain_split_memory_membership_max
-            for count in membership.values()
-        ):
-            raise ValidationError("a memory exceeds split membership maximum")
         moved = set(membership)
         if isinstance(output, FullSplitOutput):
             if moved != input_ids or any(membership[item] < 1 for item in input_ids):
@@ -1420,6 +1353,13 @@ class FluxFold:
             normalized_name(entry.name): entry.object_id
             for entry in self._store.domain_names(memory_space_id)
         }
+        ancestors = self._store.domain_ancestors(memory_space_id).get(
+            snapshot.domain_id, set()
+        )
+        if any(
+            catalog.get(normalized_name(domain.name)) in ancestors for domain in domains
+        ):
+            raise ValidationError("split would create a domain lineage cycle")
         existing_links = self._store.active_link_bases(memory_space_id)
         final_links = {
             pair: basis
@@ -1440,10 +1380,6 @@ class FluxFold:
                 for (linked_memory, _), basis in final_links.items()
                 if linked_memory == memory_id
             ]
-            if len(bases) > self._store.memory_link_limit(memory_id):
-                raise ValidationError(
-                    "split would exceed a memory's active link maximum"
-                )
             if "direct" not in bases:
                 raise ValidationError(
                     f"split would leave memory {memory_id} without a direct link"

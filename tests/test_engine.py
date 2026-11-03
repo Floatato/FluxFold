@@ -25,7 +25,11 @@ from fluxfold.models import (
     ReviewOutput,
 )
 from fluxfold.providers import GenerationRequest, GenerationResponse
-from tests.fakes import FakeEmbeddingProvider, FakeGenerationProvider
+from tests.fakes import (
+    FakeDecisionProvider,
+    FakeEmbeddingProvider,
+    FakeGenerationProvider,
+)
 
 
 def _episode(key: str, content: str, sequence: int = 0) -> NormalizedEpisode:
@@ -53,6 +57,7 @@ def test_review_replacement_content_character_limit(tmp_path) -> None:
         engine = await FluxFold.open(
             db_path=str(tmp_path / "review-limit.sqlite3"),
             generation_provider=FakeGenerationProvider(),
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
         )
         assert engine.config.review_memory_content_max_chars == 800
@@ -109,10 +114,8 @@ def test_review_replacement_provenance_requires_existing_episode(tmp_path) -> No
         engine = await FluxFold.open(
             db_path=str(tmp_path / "review-provenance.sqlite3"),
             generation_provider=FakeGenerationProvider(),
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
-            config=FluxFoldConfig().with_overrides(
-                domain_candidate_min_similarity=-1.0,
-            ),
         )
         space = await engine.create_or_open_space("test:alice")
         await engine.add_episode(
@@ -183,9 +186,9 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
         engine = await FluxFold.open(
             db_path=str(tmp_path / "engine.sqlite3"),
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                domain_candidate_min_similarity=-1.0,
                 search_domain_min_similarity=-1.0,
                 search_memory_min_similarity=-1.0,
             ),
@@ -204,7 +207,9 @@ def test_add_search_replay_and_source_conflict(tmp_path) -> None:
         assert [(domain.name, domain.summary) for domain in bank[0].domains] == [
             ("Alice", " ")
         ]
-        assert bank[0].domains[0].memory_contents == ("Alice likes hiking.",)
+        assert tuple(m.content for m in bank[0].domains[0].memories) == (
+            "Alice likes hiking.",
+        )
         statistics = engine.space_statistics(space.memory_space_id)
         assert statistics["active_domains"] == 1
         assert statistics["episode_count"] == 1
@@ -273,23 +278,21 @@ def test_add_episode_serializes_episodes_within_a_space(tmp_path) -> None:
                 response = await super().generate(request)
                 self.events.append(("extract_completed", content))
                 return response
-            if request.stage == "domain_linking":
-                content = str(payload["new_memories"][0]["content"])
-                self.events.append(("link_started", content))
-                response = await super().generate(request)
-                self.events.append(("link_completed", content))
-                return response
             return await super().generate(request)
 
     async def scenario() -> None:
         generation = ObservedPipelineProvider()
+
+        def observe(event):
+            if event["event_type"] == "link_decision":
+                generation.events.append(("link_completed", event["content"]))
+
         engine = await FluxFold.open(
             db_path=str(tmp_path / "pipeline.sqlite3"),
+            event_sink=observe,
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
-            config=FluxFoldConfig().with_overrides(
-                domain_candidate_min_similarity=-1.0,
-            ),
         )
         space = await engine.create_or_open_space("test:pipeline")
         episodes = (
@@ -327,6 +330,7 @@ def test_add_episode_spaces_remain_independent(tmp_path) -> None:
         engine = await FluxFold.open(
             db_path=str(tmp_path / "independent-spaces.sqlite3"),
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
         )
         first = await engine.create_or_open_space("test:first-space")
@@ -379,9 +383,12 @@ def test_episode_links_all_new_memories_in_one_batch(tmp_path) -> None:
 
     async def scenario() -> None:
         generation = TwoMemoryExtraction()
+        events = []
         engine = await FluxFold.open(
             db_path=str(tmp_path / "batch-linking.sqlite3"),
+            event_sink=events.append,
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
         )
         space = await engine.create_or_open_space("test:batch-linking")
@@ -390,24 +397,17 @@ def test_episode_links_all_new_memories_in_one_batch(tmp_path) -> None:
             space.memory_space_id, _episode("one", "Alice hiking facts.")
         )
 
-        linking_requests = [
-            request
-            for request in generation.requests
-            if request.stage == "domain_linking"
+        decisions = [
+            event for event in events if event["event_type"] == "link_decision"
         ]
-        assert len(linking_requests) == 1
-        payload = json.loads(linking_requests[0].user_prompt)
-        ids = [item["memory_id"] for item in payload["new_memories"]]
-        assert len(set(ids)) == 2
-        assert set(ids) == {
-            memory.memory_id
-            for memory in engine._store.domain_snapshot(
-                space.memory_space_id,
-                engine._store.active_domain_ids(space.memory_space_id)[0],
-            ).memories
-        }
-        assert payload["candidates"] == [{"name": "Alice", "entities": ["Alice"]}]
-        assert set(payload) == {"new_memories", "candidates"}
+        assert len(decisions) == 2
+        assert len({event["memory_id"] for event in decisions}) == 2
+        assert all(
+            event["groups"][0]["selection"] == "single_candidate" for event in decisions
+        )
+        assert not any(
+            request.stage == "domain_linking" for request in generation.requests
+        )
         assert result.memories_created == 2
         assert result.domains_created == 1
         assert result.links_created == 2
@@ -416,46 +416,42 @@ def test_episode_links_all_new_memories_in_one_batch(tmp_path) -> None:
     asyncio.run(scenario())
 
 
-def test_initial_domain_candidates_rank_within_each_entity(
-    tmp_path, monkeypatch
-) -> None:
+def test_initial_domain_candidates_rank_within_each_entity(tmp_path, monkeypatch):
     from fluxfold.names import NameEntry
 
-    async def scenario() -> None:
+    async def scenario():
+        events = []
         engine = await FluxFold.open(
-            db_path=str(tmp_path / "pool.sqlite3"),
+            db_path=str(tmp_path / "pool.db"),
             generation_provider=FakeGenerationProvider(),
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
+            event_sink=events.append,
         )
-        space = await engine.create_or_open_space("test:pool")
+        space = await engine.create_or_open_space("pool")
         entries = tuple(
-            NameEntry(str(index), f"Domain {index}", np.array([1.0, index / 10]))
-            for index in range(8)
+            NameEntry(str(i), f"Domain {i}", np.array([float(i)])) for i in range(12)
         )
-        memberships = {
-            str(index): {"Alice" if index < 4 else "Bob"} for index in range(8)
-        }
-        # Even a highest-scoring root must leave all three ordinary slots available.
-        entries += (NameEntry("alice-root", "Alice", np.array([0.0, 100.0])),)
-        memberships["alice-root"] = {"Alice"}
+        memberships = {str(i): {"Alice" if i < 6 else "Bob"} for i in range(12)}
         monkeypatch.setattr(engine._store, "domain_names", lambda _: entries)
         monkeypatch.setattr(engine._store, "domain_entity_names", lambda _: memberships)
-        candidates, legal = engine._recall_initial_domain_candidates(
+        await engine._link_memories(
             space.memory_space_id,
-            [np.array([0.0, 1.0])] * 3,
-            [["Alice"], ["Bob"], ["Alice"]],
+            ["a", "b"],
+            ["A fact", "B fact"],
+            [np.array([1.0]), np.array([-1.0])],
+            [["Alice"], ["Bob"]],
+            [],
+            episode_id="ep",
+            link_attempt_id="attempt",
         )
-        assert [candidate["name"] for candidate in candidates] == [
-            "Domain 3",
-            "Domain 2",
-            "Domain 1",
-            "Domain 7",
-            "Domain 6",
-            "Domain 5",
-            "Alice",
-            "Bob",
+        results = [e for e in events if e["event_type"] == "link_decision"]
+        assert [x["name"] for x in results[0]["groups"][0]["candidates"]] == [
+            f"Domain {i}" for i in [5, 4, 3, 2, 1]
         ]
-        assert legal == {candidate["name"] for candidate in candidates}
+        assert [x["name"] for x in results[1]["groups"][0]["candidates"]] == [
+            f"Domain {i}" for i in [6, 7, 8, 9, 10]
+        ]
         await engine.close()
 
     asyncio.run(scenario())
@@ -491,33 +487,6 @@ def test_episode_summary_refresh_concurrency_is_capped_at_five(tmp_path) -> None
                     total_tokens=10,
                     request_id="twenty-one-memory-request",
                 )
-            if request.stage == "domain_linking":
-                self.requests.append(request)
-                memories = json.loads(request.user_prompt)["new_memories"]
-                return GenerationResponse(
-                    text=json.dumps(
-                        {
-                            "result": "links",
-                            "memories": [
-                                {
-                                    "memory_id": memory["memory_id"],
-                                    "direct_assignments": [
-                                        {
-                                            "entity": memory["entities"][0],
-                                            "domain": f"Alice group {index // 3}",
-                                        }
-                                    ],
-                                    "contextual_domains": [],
-                                }
-                                for index, memory in enumerate(memories)
-                            ],
-                        }
-                    ),
-                    input_tokens=6,
-                    output_tokens=4,
-                    total_tokens=10,
-                    request_id="seven-domain-request",
-                )
             if request.stage == "domain_summary_refresh":
                 self.active_summaries += 1
                 self.max_active_summaries = max(
@@ -535,6 +504,7 @@ def test_episode_summary_refresh_concurrency_is_capped_at_five(tmp_path) -> None
         engine = await FluxFold.open(
             db_path=str(tmp_path / "summary-concurrency.sqlite3"),
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
         )
         space = await engine.create_or_open_space("test:summary-concurrency")
@@ -576,6 +546,7 @@ def test_add_episode_persists_terminal_failure_and_replays_it(tmp_path) -> None:
         engine = await FluxFold.open(
             db_path=str(tmp_path / "terminal.sqlite3"),
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
             event_sink=events.append,
         )
@@ -613,9 +584,9 @@ def test_existing_domain_link_triggers_review(tmp_path) -> None:
         engine = await FluxFold.open(
             db_path=str(tmp_path / "review.sqlite3"),
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                domain_candidate_min_similarity=-1.0,
                 domain_review_new_memory_threshold=1,
             ),
         )
@@ -644,10 +615,8 @@ def test_small_domain_skips_summary_llm_until_it_has_three_links(
         engine = await FluxFold.open(
             db_path=str(tmp_path / "refresh.sqlite3"),
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
-            config=FluxFoldConfig().with_overrides(
-                domain_candidate_min_similarity=-1.0,
-            ),
         )
         space = await engine.create_or_open_space("test:refresh")
         await engine.add_episode(
@@ -704,9 +673,9 @@ def test_search_groups_domains_and_only_exposes_five_summaries(tmp_path) -> None
         engine = await FluxFold.open(
             db_path=str(tmp_path / "search-groups.sqlite3"),
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                domain_candidate_min_similarity=-1.0,
                 search_domain_min_similarity=-1.0,
                 search_memory_min_similarity=-1.0,
             ),
@@ -726,21 +695,6 @@ def test_search_groups_domains_and_only_exposes_five_summaries(tmp_path) -> None
         rendered = result.render()
         assert rendered.count("- Domain:") == 9
         assert rendered.count("  Summary:") == 5
-        linking_payload = json.loads(
-            [
-                request.user_prompt
-                for request in generation.requests
-                if request.stage == "domain_linking"
-                and "name_resolution" not in request.user_prompt
-            ][-1]
-        )
-        candidates = linking_payload["candidates"]
-        assert candidates == [
-            {
-                "name": "Unique fact number 8 token 136.",
-                "entities": ["Unique fact number 8 token 136."],
-            }
-        ]
         await engine.close()
 
     asyncio.run(scenario())
@@ -769,10 +723,8 @@ def test_failed_summary_refresh_is_recovered_by_episode_replay(tmp_path) -> None
         engine = await FluxFold.open(
             db_path=str(database),
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
-            config=FluxFoldConfig().with_overrides(
-                domain_candidate_min_similarity=-1.0,
-            ),
             event_sink=events.append,
         )
         space = await engine.create_or_open_space("test:resume-refresh")
@@ -809,6 +761,7 @@ def test_failed_summary_refresh_is_recovered_by_episode_replay(tmp_path) -> None
         resumed = await FluxFold.open(
             db_path=str(database),
             generation_provider=resumed_generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
         )
         replay = await resumed.add_episode(space.memory_space_id, episode)
@@ -854,33 +807,6 @@ def test_replay_only_retries_unfinished_summary_refresh_targets(tmp_path) -> Non
                     total_tokens=10,
                     request_id="nine-memory-request",
                 )
-            if request.stage == "domain_linking":
-                self.requests.append(request)
-                memories = json.loads(request.user_prompt)["new_memories"]
-                return GenerationResponse(
-                    text=json.dumps(
-                        {
-                            "result": "links",
-                            "memories": [
-                                {
-                                    "memory_id": memory["memory_id"],
-                                    "direct_assignments": [
-                                        {
-                                            "entity": memory["entities"][0],
-                                            "domain": f"Alice group {index // 3}",
-                                        }
-                                    ],
-                                    "contextual_domains": [],
-                                }
-                                for index, memory in enumerate(memories)
-                            ],
-                        }
-                    ),
-                    input_tokens=6,
-                    output_tokens=4,
-                    total_tokens=10,
-                    request_id="three-domain-request",
-                )
             if request.stage == "domain_summary_refresh":
                 payload = json.loads(request.user_prompt)
                 contents = {
@@ -900,6 +826,7 @@ def test_replay_only_retries_unfinished_summary_refresh_targets(tmp_path) -> Non
         engine = await FluxFold.open(
             db_path=str(database),
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
         )
         space = await engine.create_or_open_space("test:partial-refresh-replay")
@@ -921,6 +848,7 @@ def test_replay_only_retries_unfinished_summary_refresh_targets(tmp_path) -> Non
         resumed = await FluxFold.open(
             db_path=str(database),
             generation_provider=resumed_generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
         )
         replay = await resumed.add_episode(space.memory_space_id, episode)
@@ -946,6 +874,7 @@ def test_rebuild_retrieval_embeddings_switches_model_atomically(tmp_path) -> Non
         first = await FluxFold.open(
             db_path=str(database),
             generation_provider=FakeGenerationProvider(),
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(revision="1"),
         )
         space = await first.create_or_open_space("test:rebuild")
@@ -957,6 +886,7 @@ def test_rebuild_retrieval_embeddings_switches_model_atomically(tmp_path) -> Non
         second = await FluxFold.open(
             db_path=str(database),
             generation_provider=FakeGenerationProvider(),
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(revision="2"),
         )
         rebuilt = await second.rebuild_retrieval_embeddings(space.memory_space_id)
@@ -989,9 +919,9 @@ def test_domain_split_outcomes(
         engine = await FluxFold.open(
             db_path=str(tmp_path / f"{split_result}.sqlite3"),
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                domain_candidate_min_similarity=-1.0,
                 domain_split_memory_count_threshold=episode_count,
                 domain_review_new_memory_threshold=10,
             ),
@@ -1028,9 +958,9 @@ def test_split_retries_when_a_moved_memory_would_lose_its_direct_link(tmp_path) 
         engine = await FluxFold.open(
             db_path=str(tmp_path / "split-direct.sqlite3"),
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                domain_candidate_min_similarity=-1.0,
                 domain_split_memory_count_threshold=3,
                 domain_review_new_memory_threshold=10,
             ),
@@ -1065,9 +995,9 @@ def test_split_retries_when_a_result_domain_exceeds_memory_max(tmp_path) -> None
         engine = await FluxFold.open(
             db_path=str(tmp_path / "split-memory-max.sqlite3"),
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                domain_candidate_min_similarity=-1.0,
                 domain_split_memory_count_threshold=4,
                 domain_split_result_target_memory_max=3,
                 domain_review_new_memory_threshold=10,
@@ -1100,6 +1030,7 @@ def test_no_valuable_memory_is_a_completed_replay(tmp_path) -> None:
         engine = await FluxFold.open(
             db_path=str(tmp_path / "empty.sqlite3"),
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
         )
         space = await engine.create_or_open_space("test:empty")
@@ -1126,9 +1057,9 @@ def test_review_provenance_and_memory_changes(tmp_path, review_mode: str) -> Non
         engine = await FluxFold.open(
             db_path=str(tmp_path / f"review-{review_mode}.sqlite3"),
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                domain_candidate_min_similarity=-1.0,
                 search_domain_min_similarity=-1.0,
                 search_memory_min_similarity=-1.0,
                 domain_review_new_memory_threshold=1,
@@ -1181,9 +1112,9 @@ def test_review_retries_when_replacement_provenance_is_invalid(tmp_path) -> None
         engine = await FluxFold.open(
             db_path=str(tmp_path / "review-invalid-provenance.sqlite3"),
             generation_provider=generation,
+            decision_provider=FakeDecisionProvider(),
             embedding_provider=FakeEmbeddingProvider(),
             config=FluxFoldConfig().with_overrides(
-                domain_candidate_min_similarity=-1.0,
                 domain_review_new_memory_threshold=1,
             ),
             event_sink=events.append,

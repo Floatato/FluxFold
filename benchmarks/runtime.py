@@ -9,6 +9,7 @@ from typing import Literal
 import httpx
 
 from fluxfold.config import FluxFoldConfig
+from fluxfold.decisions import TypeSafeDecisionProvider
 from fluxfold.errors import ValidationError
 from fluxfold.providers import (
     EmbeddingModelInfo,
@@ -146,4 +147,12 @@ def _provider_timeout(config: FluxFoldConfig) -> httpx.Timeout:
         read=config.provider_read_timeout_seconds,
         write=config.provider_write_timeout_seconds,
         pool=config.provider_pool_timeout_seconds,
+    )
+
+
+def decision_provider(config: FluxFoldConfig) -> TypeSafeDecisionProvider:
+    return TypeSafeDecisionProvider(
+        api_key=_required_env("TYPESAFE_API_KEY"),
+        model=os.environ.get("FLUXFOLD_LINK_MODEL", "jev-1.14.0"),
+        timeout=config.provider_read_timeout_seconds,
     )

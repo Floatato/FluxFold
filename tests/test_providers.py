@@ -15,7 +15,7 @@ from fluxfold.providers import (
     LocalMiniLMEmbeddingProvider,
     OpenAICompatibleGenerationProvider,
 )
-from tests.fakes import FakeGenerationProvider
+from tests.fakes import FakeDecisionProvider, FakeGenerationProvider
 
 
 class _FakeSentenceTransformer:
@@ -56,6 +56,7 @@ def test_fluxfold_open_uses_local_embedding_by_default(tmp_path) -> None:
         engine = await FluxFold.open(
             db_path=str(tmp_path / "engine.sqlite3"),
             generation_provider=FakeGenerationProvider(),
+            decision_provider=FakeDecisionProvider(),
         )
         space = await engine.create_or_open_space("default-local")
         assert space.space_key == "default-local"

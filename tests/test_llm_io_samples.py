@@ -6,8 +6,12 @@ import json
 from benchmarks.artifacts import ArtifactWriter, RunPaths
 
 from fluxfold import EpisodeBlock, FluxFold, FluxFoldConfig, NormalizedEpisode, Role
-from fluxfold.models import MemoryBankDomain, MemoryBankSpace
-from tests.fakes import FakeEmbeddingProvider, FakeGenerationProvider
+from fluxfold.models import MemoryBankDomain, MemoryBankMemory, MemoryBankSpace
+from tests.fakes import (
+    FakeDecisionProvider,
+    FakeEmbeddingProvider,
+    FakeGenerationProvider,
+)
 
 
 def _episode(key: str, content: str, sequence: int = 0) -> NormalizedEpisode:
@@ -39,9 +43,9 @@ async def _open(
     return await FluxFold.open(
         db_path=str(tmp_path / f"{name}.sqlite3"),
         generation_provider=generation,
+        decision_provider=FakeDecisionProvider(),
         embedding_provider=FakeEmbeddingProvider(),
         config=FluxFoldConfig().with_overrides(
-            domain_candidate_min_similarity=-1.0,
             **overrides,
         ),
         event_sink=events.append,
@@ -71,14 +75,12 @@ def test_extract_link_and_summary_calls_are_sampled_at_random(
             await engine.add_episode(
                 space.memory_space_id, _episode(str(index), content, index)
             )
-        assert len(_samples(events, "extract")) == 1
-        assert len(_samples(events, "link")) == 1
+        assert len(_samples(events, "extract")) == 2
+        assert len(_samples(events, "link")) == 0
         assert _samples(events, "summary") == []
         first_extract = _samples(events, "extract")[0]
         assert "Alice likes hiking." in str(first_extract["user_prompt"])
         assert json.loads(str(first_extract["output"]))["result"] == "memories"
-        first_link = _samples(events, "link")[0]
-        assert json.loads(str(first_link["output"]))["result"] == "links"
         await engine.close()
 
     asyncio.run(scenario())
@@ -108,8 +110,8 @@ def test_sampling_stops_drawing_after_each_category_reaches_its_quota(
                 _episode(str(index), f"Alice hiking fact {index}.", index),
             )
         assert len(_samples(events, "extract")) == 10
-        assert len(_samples(events, "link")) == 10
-        assert draw_count == 20
+        assert len(_samples(events, "link")) == 0
+        assert draw_count == 10
         await engine.close()
 
     asyncio.run(scenario())
@@ -287,7 +289,7 @@ def test_artifact_writer_overwrites_memory_bank_snapshot(tmp_path) -> None:
                 MemoryBankDomain(
                     "Hiking",
                     "Alice hikes.",
-                    ("Alice likes hiking.",),
+                    (MemoryBankMemory("Alice likes hiking.", "direct"),),
                 ),
             ),
         ),
@@ -299,7 +301,10 @@ def test_artifact_writer_overwrites_memory_bank_snapshot(tmp_path) -> None:
                 MemoryBankDomain(
                     "Hiking",
                     "Alice hikes and owns boots.",
-                    ("Alice likes hiking.", "Alice owns hiking boots."),
+                    (
+                        MemoryBankMemory("Alice likes hiking.", "direct"),
+                        MemoryBankMemory("Alice owns hiking boots.", "contextual"),
+                    ),
                 ),
             ),
         ),
@@ -313,8 +318,8 @@ def test_artifact_writer_overwrites_memory_bank_snapshot(tmp_path) -> None:
     assert "episode `s-1`" not in text
     assert "### Hiking" in text
     assert "Alice hikes and owns boots." in text
-    assert "- Alice likes hiking." in text
-    assert "- Alice owns hiking boots." in text
+    assert "- [direct] Alice likes hiking." in text
+    assert "- [contextual] Alice owns hiking boots." in text
     assert "## `space-b`" in text
     assert "_(no active domains)_" in text
     assert "domain_id" not in text

@@ -302,3 +302,13 @@ CREATE TRIGGER IF NOT EXISTS immutable_effect_delete
 BEFORE DELETE ON memory_operation_effects
 WHEN fluxfold_management_mode() = 0
 BEGIN SELECT RAISE(ABORT, 'memory operation effects are append-only'); END;
+
+CREATE TABLE IF NOT EXISTS domain_lineage (
+    memory_space_id TEXT NOT NULL REFERENCES memory_spaces(memory_space_id) ON DELETE RESTRICT,
+    parent_domain_id TEXT NOT NULL REFERENCES domains(domain_id) ON DELETE RESTRICT,
+    child_domain_id TEXT NOT NULL REFERENCES domains(domain_id) ON DELETE RESTRICT,
+    created_by_operation_id TEXT NOT NULL REFERENCES memory_operations(operation_id) ON DELETE RESTRICT,
+    PRIMARY KEY (parent_domain_id, child_domain_id),
+    CHECK (parent_domain_id != child_domain_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS domain_lineage_child ON domain_lineage(child_domain_id);

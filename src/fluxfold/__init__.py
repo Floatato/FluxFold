@@ -1,6 +1,12 @@
 """FluxFold's experimental, benchmark-oriented memory engine."""
 
 from fluxfold.config import FluxFoldConfig
+from fluxfold.decisions import (
+    DecisionProvider,
+    DecisionQuestion,
+    DecisionResponse,
+    TypeSafeDecisionProvider,
+)
 from fluxfold.engine import FluxFold
 from fluxfold.errors import (
     ConcurrentUpdateError,
@@ -36,6 +42,10 @@ __version__ = "0.1.0"
 
 __all__ = [
     "AddResult",
+    "DecisionProvider",
+    "DecisionQuestion",
+    "DecisionResponse",
+    "TypeSafeDecisionProvider",
     "ConcurrentUpdateError",
     "EmbeddingModelInfo",
     "EmbeddingProvider",

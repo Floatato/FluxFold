@@ -19,6 +19,7 @@ from benchmarks.artifacts import (
 )
 from benchmarks.runtime import (
     dataset_hash,
+    decision_provider,
     embedding_provider,
     generation_provider,
 )
@@ -57,6 +58,7 @@ async def build_run(
 ) -> None:
     writer = ArtifactWriter(run_paths)
     generation = generation_provider(config, stage="build")
+    decision = decision_provider(config)
     embedding = embedding_provider(config)
     selected_ids = [space.source_id for space in spaces]
     existing_manifest = (
@@ -79,6 +81,7 @@ async def build_run(
         "selected_space_ids": selected_ids,
         "config_signature": config.signature,
         "build_model": generation.model_id,
+        "link_model": decision.model_id,
         "embedding_model": asdict(embedding.model_info),
         "benchmark_seed": config.benchmark_seed,
         "source_timezone_convention": "UTC",
@@ -96,6 +99,7 @@ async def build_run(
     engine = await FluxFold.open(
         db_path=str(run_paths.database),
         generation_provider=generation,
+        decision_provider=decision,
         embedding_provider=embedding,
         config=config,
         event_sink=writer.event,
@@ -394,6 +398,7 @@ _RESUME_IDENTITY_FIELDS = (
     "dataset_hash",
     "selected_space_ids",
     "build_model",
+    "link_model",
     "embedding_model",
     "benchmark_seed",
     "source_timezone_convention",

@@ -18,6 +18,7 @@ dependencies = [
     "pydantic>=2.10",
     "socksio>=1.0.0",
     "tokenizers>=0.21",
+    "typesafe-sdk>=0.7.5",
 ]
 
 [build-system]
